@@ -1,0 +1,25 @@
+[package]
+name = "wave-engine"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[features]
+default = []
+candle-backend = ["dep:candle-core", "dep:candle-nn"]
+
+[dependencies]
+# Always available
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+mimalloc = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# FFT for OFDM-inspired ODE acceleration
+rustfft = "6.2"
+
+# Candle backend (optional, with CUDA support)
+candle-core = { version = "0.9", optional = true, features = ["cuda"] }
+candle-nn = { version = "0.9", optional = true }

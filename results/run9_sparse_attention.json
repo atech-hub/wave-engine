@@ -1,0 +1,20 @@
+{
+  "experiment": "phase_hashed_sparse_attention",
+  "date": "2026-03-18",
+  "note": "Phase-bucketed sparse attention (8 buckets, 3 adjacent). At seq_len=64 no speedup — bucket overhead exceeds O(T²) savings. Loss quality identical. Benefit scales with sequence length (T=256+ predicted crossover).",
+  "n_buckets": 8,
+  "seq_len": 64,
+  "result_1024dim": {
+    "iter_ms": 700,
+    "loss_200": [[0, 4.3036], [100, 2.4740], [199, 2.5262]],
+    "comparison_full_attention_loss": 2.4731,
+    "verdict": "same quality, no speedup at T=64"
+  },
+  "result_896dim": {
+    "iter_ms": "499-701 (increases with training)",
+    "loss_50": [[0, 4.3865], [49, 2.8181]],
+    "comparison_full_attention_ms": 500,
+    "verdict": "slower due to bucket management overhead"
+  },
+  "conclusion": "Phase-hashed sparse attention is correct but only beneficial at T>>64. Keep as option for long-sequence mode. Revert to full attention for current benchmarks."
+}

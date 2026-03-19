@@ -1,0 +1,24 @@
+{
+  "experiment": "batched_value_projection",
+  "date": "2026-03-18",
+  "note": "Moved value projection outside attention loop. O(T × head_dim²) once instead of O(T² × head_dim²).",
+  "n_bands": 448,
+  "n_embd": 896,
+  "n_head": 14,
+  "trainable_params": 3518720,
+  "n_iters": 50,
+  "cpu_iter_ms": 1900,
+  "gpu_iter_ms": 1800,
+  "cpu_loss": [[0, 4.3783], [49, 2.7373]],
+  "gpu_loss": [[0, 4.3783], [49, 3.2097]],
+  "total_seconds_cpu": 94.0,
+  "total_seconds_gpu": 89.3,
+  "gpu_overlap_gain_ms": 100,
+  "history": {
+    "run1_128dim_frozen": "342ms/iter",
+    "run3_896dim_before_fix": "7900ms/iter",
+    "run3_896dim_projected_phase": "2500ms/iter",
+    "run4_batched_vprojection": "1800ms/iter (GPU)"
+  },
+  "comparison_kerr_engine": "1200ms/iter at 896-dim"
+}

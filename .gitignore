@@ -416,3 +416,12 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Rust
+/target/
+
+# Data files (download separately)
+data/tokenizer.json
+data/input.txt
+data/children.txt
+data/legal.txt

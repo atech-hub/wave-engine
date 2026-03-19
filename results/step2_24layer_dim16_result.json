@@ -1,0 +1,24 @@
+{
+  "experiment": "24_layer_baseline_maestro16",
+  "date": "2026-03-18",
+  "n_layers": 24,
+  "n_bands": 384,
+  "n_embd": 768,
+  "n_head": 12,
+  "maestro_dim": 16,
+  "rk4_steps": 16,
+  "lr": 0.0001,
+  "batch_size": 4,
+  "seq_len": 64,
+  "trainable_params": 15516672,
+  "gpu": false,
+  "train_loss": [
+    [0, 4.2928], [50, 2.8285], [100, 2.4882], [150, 2.6452], [199, 2.5687]
+  ],
+  "best_loss": 2.4882,
+  "best_iter": 100,
+  "iter_ms": "2300-2500",
+  "total_seconds": 519.9,
+  "nan": false,
+  "status": "PASS — 24 layers stable, loss converges"
+}

@@ -1,0 +1,26 @@
+{
+  "experiment": "batch_parallelism_final",
+  "date": "2026-03-18",
+  "note": "Added thread::scope batch parallelism (4 threads). 896-dim at 500ms/iter — 2.4x faster than kerr-engine.",
+  "n_bands": 448,
+  "n_embd": 896,
+  "n_head": 14,
+  "rk4_steps": 16,
+  "trainable_params": 3518720,
+  "gpu_iter_ms": 500,
+  "cpu_iter_ms": 520,
+  "gpu_loss_50iter": [[0, 4.3783], [49, 3.2097]],
+  "cpu_loss_50iter": [[0, 4.3783], [49, 2.7373]],
+  "total_seconds_gpu_50": 27.6,
+  "total_seconds_cpu_50": 29.0,
+  "comparison_kerr_engine_896dim_ms": 1200,
+  "speedup_vs_kerr": "2.4x faster",
+  "param_reduction_vs_kerr": "3.5M vs 16M (78% fewer)",
+  "optimization_history": [
+    {"version": "per_band_coherence", "iter_ms": 7900},
+    {"version": "projected_phase", "iter_ms": 2500},
+    {"version": "batched_vprojection", "iter_ms": 1800},
+    {"version": "gpu_outproj", "iter_ms": 1500},
+    {"version": "batch_parallelism", "iter_ms": 500}
+  ]
+}
