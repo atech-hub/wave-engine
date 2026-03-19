@@ -3,6 +3,11 @@ name = "wave-engine"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+description = "Training engine for wave-coherent neural architectures — coupled harmonic oscillators replacing MLP layers"
+repository = "https://github.com/atech-hub/wave-engine"
+authors = ["Marco Da Cunha"]
+keywords = ["machine-learning", "neural-network", "wave-coherence", "gpu", "training"]
+categories = ["science", "mathematics"]
 
 [features]
 default = []

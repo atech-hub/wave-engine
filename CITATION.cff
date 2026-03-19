@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "wave-engine: Training Engine for Wave-Coherent Neural Architectures"
+version: 0.1.0
+date-released: 2026-03-19
+url: "https://github.com/atech-hub/wave-engine"
+repository-code: "https://github.com/atech-hub/wave-engine"
+license: Apache-2.0
+authors:
+  - family-names: "Da Cunha"
+    given-names: "Marco"
+    affiliation: "atech-hub"
+keywords:
+  - wave-coherence
+  - neural-architecture
+  - coupled-oscillators
+  - kerr-ode
+  - gpu-training
+  - harmonic-attention
+references:
+  - type: software
+    title: "Wave Coherence as a Computational Primitive"
+    url: "https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive"
+    authors:
+      - family-names: "Da Cunha"
+        given-names: "Marco"
