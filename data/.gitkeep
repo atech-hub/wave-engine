@@ -1,0 +1,3 @@
+# Training data goes here
+# Download Shakespeare: included in repo for quick start
+# For wikitext-103: extract from parquet (see README)
