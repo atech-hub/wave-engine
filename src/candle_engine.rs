@@ -130,16 +130,7 @@ pub mod engine {
                         results.extend_from_slice(&vec![0.0f32; self.n_embd]);
                     } else {
                         // No clamping — match wgpu CPU exactly
-                        let mut ode_out = kerr_ode_cpu(input, &self.params);
-                        // Curriculum: preserve zeros — don't let ODE coupling inject energy into masked bands
-                        let n_bands = self.n_embd / 2;
-                        for k in 0..n_bands {
-                            if input[k * 2] == 0.0 && input[k * 2 + 1] == 0.0 {
-                                ode_out[k * 2] = 0.0;
-                                ode_out[k * 2 + 1] = 0.0;
-                            }
-                        }
-                        results.extend_from_slice(&ode_out);
+                        results.extend_from_slice(&kerr_ode_cpu(input, &self.params));
                     }
                 }
             } else {
@@ -155,15 +146,7 @@ pub mod engine {
                     if input.iter().any(|v| v.is_nan() || v.is_infinite()) {
                         results.extend_from_slice(&vec![0.0f32; self.n_embd]);
                     } else {
-                        let mut ode_out = kerr_ode_cpu(&input, &self.params);
-                        let n_bands = self.n_embd / 2;
-                        for k in 0..n_bands {
-                            if input[k * 2] == 0.0 && input[k * 2 + 1] == 0.0 {
-                                ode_out[k * 2] = 0.0;
-                                ode_out[k * 2 + 1] = 0.0;
-                            }
-                        }
-                        results.extend_from_slice(&ode_out);
+                        results.extend_from_slice(&kerr_ode_cpu(&input, &self.params));
                     }
                 }
             }
@@ -409,13 +392,9 @@ pub mod engine {
         }
 
         pub fn forward(&self, token_ids: &[usize]) -> Result<Tensor> {
-            self.forward_with_curriculum(token_ids, N_BANDS)
-        }
-
-        pub fn forward_with_curriculum(&self, token_ids: &[usize], active_bands: usize) -> Result<Tensor> {
             let n_pos = token_ids.len();
 
-            // Embedding: lookup + positional (NO curriculum masking here — LN needs full vector)
+            // Embedding: lookup + positional
             let mut hidden_vecs = vec![0.0f32; n_pos * N_EMBD];
             let wte_data = self.wte.to_vec2::<f32>()?;
             let wpe_data = self.wpe.to_vec2::<f32>()?;
@@ -442,24 +421,12 @@ pub mod engine {
                     &block.attn_out_proj_w, &block.attn_out_proj_b,
                 )?;
 
-                // FFN (trained) — curriculum masks inactive bands after LN
-                let ffn_input = if active_bands < N_BANDS {
-                    let mut data = normed.to_vec2::<f32>()?;
-                    for pos in 0..data.len() {
-                        for k in active_bands..N_BANDS {
-                            data[pos][k * 2] = 0.0;
-                            data[pos][k * 2 + 1] = 0.0;
-                        }
-                    }
-                    Tensor::from_vec(data.into_iter().flatten().collect::<Vec<f32>>(),
-                        (n_pos, N_EMBD), &self.device)?
-                } else { normed.clone() };
-
+                // FFN (trained)
                 // Maestro in
-                let mae_in = block.mae_in_sq.forward(&ffn_input)?;
+                let mae_in = block.mae_in_sq.forward(&normed)?;
                 let mae_in = mae_in.gelu()?;
                 let mae_in = block.mae_in_pr.forward(&mae_in)?;
-                let precond = (&ffn_input + &mae_in)?;
+                let precond = (&normed + &mae_in)?;
 
                 // Monitor precond max value
                 let precond_vals = precond.to_vec2::<f32>()?;
@@ -472,40 +439,11 @@ pub mod engine {
                 // ODE via CustomOp1 — forward runs RK4 (no clamping), backward is identity
                 let effective_ode_out = kerr_ode_batch(&precond, &block.ode_params)?;
 
-                // Curriculum: re-zero masked bands after ODE
-                // ODE coupling injects energy into zeroed bands from neighbours during RK4.
-                let effective_ode_out = if active_bands < N_BANDS {
-                    let n_pos = effective_ode_out.dim(0)?;
-                    let mut data = effective_ode_out.to_vec2::<f32>()?;
-                    for pos in 0..n_pos {
-                        for k in active_bands..N_BANDS {
-                            data[pos][k * 2] = 0.0;
-                            data[pos][k * 2 + 1] = 0.0;
-                        }
-                    }
-                    Tensor::from_vec(data.into_iter().flatten().collect::<Vec<f32>>(),
-                        (n_pos, N_EMBD), &self.device)?
-                } else { effective_ode_out };
-
                 // Maestro out (operates on effective ODE output — gradients flow through precond)
                 let mae_out = block.mae_out_sq.forward(&effective_ode_out)?;
                 let mae_out = mae_out.gelu()?;
                 let mae_out = block.mae_out_pr.forward(&mae_out)?;
                 let regulated = (&effective_ode_out + &mae_out)?;
-
-                // Curriculum: re-zero after maestro (squeeze/process leaks into masked dims)
-                let regulated = if active_bands < N_BANDS {
-                    let n_pos = regulated.dim(0)?;
-                    let mut data = regulated.to_vec2::<f32>()?;
-                    for pos in 0..n_pos {
-                        for k in active_bands..N_BANDS {
-                            data[pos][k * 2] = 0.0;
-                            data[pos][k * 2 + 1] = 0.0;
-                        }
-                    }
-                    Tensor::from_vec(data.into_iter().flatten().collect::<Vec<f32>>(),
-                        (n_pos, N_EMBD), &self.device)?
-                } else { regulated };
 
                 // Monitor ODE and maestro_out outputs
                 if effective_ode_out.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
@@ -606,16 +544,7 @@ pub mod engine {
         )?;
         let mut rng = crate::rng::Rng::new(1337);
 
-        // Curriculum: progressive band unlocking (+1.46pp validated)
-        let use_curriculum = !std::env::args().any(|a| a == "--no-curriculum");
-        let curriculum = if use_curriculum {
-            crate::train::CurriculumSchedule::default_4stage(N_BANDS)
-        } else {
-            crate::train::CurriculumSchedule::none(N_BANDS)
-        };
-
         println!("\nTraining for {n_iters} iters (batch={batch_size}, seq={seq_len}, lr={lr})");
-        curriculum.describe(n_iters);
         println!("{:>6} {:>10} {:>10} {:>12} {:>12}", "Iter", "Loss", "Time", "Fwd(ms)", "Bwd(ms)");
         println!("{}", "-".repeat(55));
 
@@ -623,7 +552,6 @@ pub mod engine {
 
         for iter in 0..n_iters {
             let iter_start = Instant::now();
-            let active_bands = curriculum.active_bands(iter, n_iters);
             let mut total_loss = 0.0f32;
 
             for _b in 0..batch_size {
@@ -633,7 +561,7 @@ pub mod engine {
 
                 // Forward with timing
                 let t_fwd = Instant::now();
-                let logits = model.forward_with_curriculum(input, active_bands)?;
+                let logits = model.forward(input)?;
                 let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
 
                 // Loss

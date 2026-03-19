@@ -60,12 +60,9 @@ pub struct CurriculumSchedule {
 
 impl CurriculumSchedule {
     pub fn default_4stage(n_bands: usize) -> Self {
-        // Scale stages proportionally: 12.5%, 25%, 50%, 100% of bands
-        // At 64 bands: 8, 16, 32, 64. At 384 bands: 48, 96, 192, 384.
-        let s1 = (n_bands / 8).max(8);
-        let s2 = (n_bands / 4).max(s1);
-        let s3 = (n_bands / 2).max(s2);
-        Self { stages: vec![(s1, 0.20), (s2, 0.25), (s3, 0.25), (n_bands, 0.30)] }
+        let s2 = 24.min(n_bands);
+        let s3 = (n_bands / 4).max(s2);
+        Self { stages: vec![(8.min(n_bands), 0.20), (s2, 0.25), (s3, 0.25), (n_bands, 0.30)] }
     }
 
     pub fn none(n_bands: usize) -> Self {
