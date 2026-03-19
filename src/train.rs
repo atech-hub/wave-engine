@@ -1,0 +1,272 @@
+//! Training loop — batch parallel forward/backward, Adam optimizer, curriculum.
+//!
+//! Extracted from main.rs. Handles the training iteration loop, gradient
+//! accumulation, optimizer step, and checkpoint saving.
+
+use crate::*;
+use crate::wave_checkpoint;
+use crate::rng::Rng;
+
+// ─── Adam optimizer ─────────────────────────────────────────────
+
+pub struct Adam {
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    t: usize,
+    m: Vec<f32>,
+    v: Vec<f32>,
+}
+
+impl Adam {
+    pub fn new(lr: f32, n: usize) -> Self {
+        Self { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, t: 0, m: vec![0.0; n], v: vec![0.0; n] }
+    }
+    pub fn from_checkpoint(lr: f32, t: usize, m: Vec<f32>, v: Vec<f32>) -> Self {
+        Self { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, t, m, v }
+    }
+    pub fn checkpoint_state(&self) -> (usize, &[f32], &[f32]) {
+        (self.t, &self.m, &self.v)
+    }
+    pub fn step(&mut self, params: &mut [f32], grads: &[f32]) {
+        self.t += 1;
+        let bc1 = 1.0 - self.beta1.powi(self.t as i32);
+        let bc2 = 1.0 - self.beta2.powi(self.t as i32);
+        for i in 0..params.len() {
+            self.m[i] = self.beta1 * self.m[i] + (1.0 - self.beta1) * grads[i];
+            self.v[i] = self.beta2 * self.v[i] + (1.0 - self.beta2) * grads[i] * grads[i];
+            let m_hat = self.m[i] / bc1;
+            let v_hat = self.v[i] / bc2;
+            params[i] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+        }
+    }
+}
+
+pub fn clip_grad_norm(grads: &mut [f32], max_norm: f32) {
+    let norm: f32 = grads.iter().map(|g| g * g).sum::<f32>().sqrt();
+    if norm > max_norm {
+        let scale = max_norm / norm;
+        for g in grads.iter_mut() { *g *= scale; }
+    }
+}
+
+// ─── Curriculum schedule ────────────────────────────────────────
+
+/// Progressive band curriculum — starts with fewer bands, opens progressively.
+pub struct CurriculumSchedule {
+    stages: Vec<(usize, f32)>,
+}
+
+impl CurriculumSchedule {
+    pub fn default_4stage(n_bands: usize) -> Self {
+        let s2 = 24.min(n_bands);
+        let s3 = (n_bands / 4).max(s2);
+        Self { stages: vec![(8.min(n_bands), 0.20), (s2, 0.25), (s3, 0.25), (n_bands, 0.30)] }
+    }
+
+    pub fn none(n_bands: usize) -> Self {
+        Self { stages: vec![(n_bands, 1.0)] }
+    }
+
+    pub fn active_bands(&self, iter: usize, n_iters: usize) -> usize {
+        let mut cumulative = 0.0f32;
+        for &(bands, frac) in &self.stages {
+            cumulative += frac;
+            if iter < (cumulative * n_iters as f32) as usize { return bands; }
+        }
+        self.stages.last().unwrap().0
+    }
+
+    pub fn describe(&self, n_iters: usize) {
+        print!("  Curriculum: ");
+        let mut start = 0;
+        for &(bands, frac) in &self.stages {
+            let end = start + (frac * n_iters as f32) as usize;
+            print!("{bands} bands (iters {start}-{end})  ");
+            start = end;
+        }
+        println!();
+    }
+}
+
+// ─── Training loop ──────────────────────────────────────────────
+
+pub struct TrainConfig {
+    pub data_path: String,
+    pub n_iters: usize,
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub n_layers: usize,
+    pub lr: f32,
+    pub use_bpe: bool,
+    pub tokenizer_path: String,
+    pub resume_path: Option<String>,
+    pub use_curriculum: bool,
+    pub use_gpu: bool,
+    pub use_monitor: bool,
+}
+
+pub fn run_training(config: TrainConfig) {
+    // FFT stencil
+    fft_ode::validate_fft_derivative(N_BANDS);
+    let stencil = fft_ode::StencilFft::new(N_BANDS);
+    let gpu_kernel = fft_ode::GpuKernelFft::new(N_BANDS);
+    println!("  FFT stencil precomputed (pad to {})", N_BANDS.next_power_of_two());
+
+    // Load data
+    println!("Loading dataset from {}...", config.data_path);
+    let raw = std::fs::read_to_string(&config.data_path).expect("Failed to read data file");
+
+    let (tokens, vocab_size) = if config.use_bpe {
+        let tokenizer = bpe::BpeTokenizer::from_file(&config.tokenizer_path);
+        let toks = tokenizer.encode(&raw);
+        let vs = tokenizer.vocab_size;
+        println!("  BPE tokens: {}, vocab: {}", toks.len(), vs);
+        (toks, vs)
+    } else {
+        let chars: Vec<char> = raw.chars().collect();
+        let mut vocab: Vec<char> = chars.clone();
+        vocab.sort();
+        vocab.dedup();
+        let vs = vocab.len();
+        let char_to_idx: std::collections::HashMap<char, usize> = vocab.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+        let toks: Vec<usize> = chars.iter().map(|c| *char_to_idx.get(c).unwrap_or(&0)).collect();
+        println!("  Char-level tokens: {}, vocab: {}", toks.len(), vs);
+        (toks, vs)
+    };
+    let split = (tokens.len() as f32 * 0.9) as usize;
+    let train_data = &tokens[..split];
+    println!("  Train tokens: {}", train_data.len());
+
+    // Initialize or resume
+    let (mut model, start_iter, mut optimizer, mut rng);
+    if let Some(ref ckpt) = config.resume_path {
+        println!("Resuming from checkpoint: {ckpt}");
+        let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v) = wave_checkpoint::load_checkpoint(ckpt);
+        assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
+        let mut m = init_model(vocab_size, 42, config.n_layers);
+        unflatten_params(&mut m, &params);
+        model = m;
+        start_iter = ck_iter;
+        optimizer = Adam::from_checkpoint(config.lr, adam_t, adam_m, adam_v);
+        rng = Rng::from_state(ck_rng);
+        println!("  Resuming from iter {start_iter}");
+    } else {
+        println!("Initializing model (seed=42)...");
+        model = init_model(vocab_size, 42, config.n_layers);
+        start_iter = 0;
+        let n_t = count_trainable(&model);
+        optimizer = Adam::new(config.lr, n_t);
+        rng = Rng::new(1337);
+    }
+
+    let n_trainable = count_trainable(&model);
+    println!("  Trainable parameters: {n_trainable} (attention frozen, FFN+LN+lm_head trainable)");
+    println!("  Architecture: {} parallel blocks, {N_HEAD} harmonic heads, {N_BANDS} bands", config.n_layers);
+
+    // GPU
+    let mut monitor = monitor::PipelineMonitor::new(config.use_monitor);
+    if config.use_monitor { PROFILE.store(true, std::sync::atomic::Ordering::Relaxed); }
+    let gpu_backend: Option<gpu_pipelines::GpuBackend> = if config.use_gpu {
+        println!("  GPU: initializing...");
+        let be = gpu_pipelines::GpuBackend::new();
+        println!("  GPU: ready");
+        Some(be)
+    } else { None };
+    let ffn_bufs: Option<ffn_gpu::FfnGpuBuffers> = gpu_backend.as_ref().map(|be| {
+        ffn_gpu::FfnGpuBuffers::new(&be.device, config.seq_len, N_EMBD)
+    });
+    let ffn_full_bufs: Option<ffn_full_gpu::FfnFullBuffers> = None;
+
+    if let Some(ref be) = gpu_backend {
+        diagnose_ode_gpu_vs_cpu(be);
+    }
+
+    // Curriculum
+    let curriculum = if config.use_curriculum {
+        CurriculumSchedule::default_4stage(N_BANDS)
+    } else {
+        CurriculumSchedule::none(N_BANDS)
+    };
+
+    let total_iters = start_iter + config.n_iters;
+    let batch_size = config.batch_size;
+    let seq_len = config.seq_len;
+    let lr = config.lr;
+
+    println!("\nTraining for {} iterations (batch={batch_size}, seq={seq_len}, lr={lr})", config.n_iters);
+    if config.resume_path.is_some() { println!("  Resuming from iter {start_iter}, target iter {total_iters}"); }
+    curriculum.describe(total_iters);
+    println!("{:>6} {:>10} {:>10}", "Iter", "Loss", "Time");
+    println!("{}", "-".repeat(30));
+
+    let train_start = std::time::Instant::now();
+
+    for iter in start_iter..total_iters {
+        let iter_start = std::time::Instant::now();
+
+        let starts: Vec<usize> = (0..batch_size)
+            .map(|_| (rng.next_u64() as usize) % (train_data.len() - seq_len - 1))
+            .collect();
+
+        let t_fwd = monitor.start();
+        let batch_results: Vec<(f32, Vec<f32>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = starts.iter().map(|&start| {
+                let model_ref = &model;
+                let gpu_ref: Option<&(dyn backend::ComputeBackend + Send + Sync)> = gpu_backend.as_ref().map(|be| be as &(dyn backend::ComputeBackend + Send + Sync));
+                let pp_ref: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)> =
+                    match (&ffn_bufs, &gpu_backend) { (Some(b), Some(g)) => Some((b, g)), _ => None };
+                let fg_ref: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)> =
+                    match (&ffn_full_bufs, &gpu_backend) { (Some(b), Some(g)) => Some((b, g)), _ => None };
+                let input = &train_data[start..start + seq_len];
+                let target = &train_data[start + 1..start + seq_len + 1];
+                let st_ref = Some(&stencil);
+                let gk_ref: Option<(&fft_ode::GpuKernelFft, &gpu_pipelines::GpuBackend)> =
+                    gpu_backend.as_ref().map(|be| (&gpu_kernel, be));
+                s.spawn(move || {
+                    let cache = forward_with_cache(model_ref, input, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref);
+                    let (loss, grads) = backward(model_ref, &cache, target, gpu_ref, pp_ref, fg_ref);
+                    (loss, flatten_grads(&grads))
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        monitor.record("fwd+bwd (batch)", t_fwd);
+
+        let t_reduce = monitor.start();
+        let mut total_loss = 0.0f32;
+        let mut total_grads = vec![0.0f32; n_trainable];
+        for (loss, fg) in &batch_results {
+            total_loss += loss;
+            for (a, g) in total_grads.iter_mut().zip(fg.iter()) { *a += g; }
+        }
+        total_loss /= batch_size as f32;
+        for g in total_grads.iter_mut() { *g /= batch_size as f32; }
+        monitor.record("reduce", t_reduce);
+
+        let t_optim = monitor.start();
+        clip_grad_norm(&mut total_grads, 1.0);
+        let mut params = flatten_params(&model);
+        optimizer.step(&mut params, &total_grads);
+        unflatten_params(&mut model, &params);
+        monitor.record("optimizer", t_optim);
+
+        let grad_norm: f32 = total_grads.iter().map(|g| g * g).sum::<f32>().sqrt();
+
+        if iter % 10 == 0 || iter == total_iters - 1 {
+            println!("{:>6} {:>10.4} {:>10.1?}  gnorm={:.2}", iter, total_loss, iter_start.elapsed(), grad_norm);
+            if monitor.enabled() {
+                monitor.report(if iter == 0 { 1 } else { 50.min(iter) });
+                monitor.reset();
+            }
+        }
+    }
+
+    println!("\nTraining complete. Total time: {:.1?}", train_start.elapsed());
+
+    // Save checkpoint
+    let params = flatten_params(&model);
+    wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), total_iters, lr, &optimizer, rng.state(), "checkpoint.bin");
+    println!("Checkpoint saved to checkpoint.bin");
+}

@@ -56,6 +56,8 @@ mod candle_engine;
 mod ffn_backend;
 mod fft_ode;
 mod rng;
+mod train;
+mod wave_checkpoint;
 
 use wave_embed::*;
 use wave_attn::*;
@@ -820,49 +822,8 @@ fn unflatten_params(model: &mut WavePacketModel, params: &[f32]) {
     assert_eq!(idx, params.len());
 }
 
-// ─── Adam ───────────────────────────────────────────────────────
-
-struct Adam {
-    lr: f32,
-    beta1: f32,
-    beta2: f32,
-    eps: f32,
-    t: usize,
-    m: Vec<f32>,
-    v: Vec<f32>,
-}
-
-impl Adam {
-    fn new(lr: f32, n: usize) -> Self {
-        Self { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, t: 0, m: vec![0.0; n], v: vec![0.0; n] }
-    }
-    fn from_checkpoint(lr: f32, t: usize, m: Vec<f32>, v: Vec<f32>) -> Self {
-        Self { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, t, m, v }
-    }
-    fn checkpoint_state(&self) -> (usize, &[f32], &[f32]) {
-        (self.t, &self.m, &self.v)
-    }
-    fn step(&mut self, params: &mut [f32], grads: &[f32]) {
-        self.t += 1;
-        let bc1 = 1.0 - self.beta1.powi(self.t as i32);
-        let bc2 = 1.0 - self.beta2.powi(self.t as i32);
-        for i in 0..params.len() {
-            self.m[i] = self.beta1 * self.m[i] + (1.0 - self.beta1) * grads[i];
-            self.v[i] = self.beta2 * self.v[i] + (1.0 - self.beta2) * grads[i] * grads[i];
-            let m_hat = self.m[i] / bc1;
-            let v_hat = self.v[i] / bc2;
-            params[i] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
-        }
-    }
-}
-
-fn clip_grad_norm(grads: &mut [f32], max_norm: f32) {
-    let norm: f32 = grads.iter().map(|g| g * g).sum::<f32>().sqrt();
-    if norm > max_norm {
-        let scale = max_norm / norm;
-        for g in grads.iter_mut() { *g *= scale; }
-    }
-}
+// Adam, CurriculumSchedule, clip_grad_norm moved to train.rs
+// Checkpoint save/load moved to wave_checkpoint.rs
 
 // ─── Main ───────────────────────────────────────────────────────
 
@@ -945,326 +906,26 @@ fn main() {
         }
     }
 
-    // Gate 1: FFT ODE validation (runs every startup, fast)
-    fft_ode::validate_fft_derivative(N_BANDS);
-
-    // Precompute FFT stencil for ODE acceleration (OFDM-inspired)
-    let stencil = fft_ode::StencilFft::new(N_BANDS);
-    let gpu_kernel = fft_ode::GpuKernelFft::new(N_BANDS);
-    println!("  FFT stencil precomputed (pad to {})", N_BANDS.next_power_of_two());
-
     // ─── CLI flag parser ───
     fn parse_flag<T: std::str::FromStr>(name: &str, default: T) -> T {
         std::env::args().skip_while(|a| a != name).nth(1)
             .and_then(|s| s.parse().ok()).unwrap_or(default)
     }
-    let data_path = std::env::args().nth(1).unwrap_or("data/input.txt".to_string());
-    let n_iters: usize = parse_flag("--iters", 500);
-    let batch_size: usize = parse_flag("--batch", 4);
-    let seq_len: usize = parse_flag("--seq", 256);
-    let n_layers: usize = parse_flag("--layers", N_LAYERS);
-    let lr: f32 = parse_flag("--lr", if N_BANDS > 256 { 1e-4 } else { 3e-4 });
-    let use_bpe = std::env::args().any(|a| a == "--bpe");
-    let tokenizer_path: String = parse_flag("--tokenizer", "data/tokenizer.json".to_string());
-    let resume_path: Option<String> = std::env::args().skip_while(|a| a != "--resume").nth(1);
-    let use_curriculum = !std::env::args().any(|a| a == "--no-curriculum");
 
-    println!("Loading dataset from {data_path}...");
-    let raw = std::fs::read_to_string(&data_path).expect("Failed to read data file");
-
-    // Tokenize: BPE (--bpe) or character-level (default)
-    let (tokens, vocab_size) = if use_bpe {
-        let tokenizer = bpe::BpeTokenizer::from_file(&tokenizer_path);
-        let toks = tokenizer.encode(&raw);
-        let vs = tokenizer.vocab_size;
-        println!("  BPE tokens: {}, vocab: {}", toks.len(), vs);
-        (toks, vs)
-    } else {
-        let chars: Vec<char> = raw.chars().collect();
-        let mut vocab: Vec<char> = chars.clone();
-        vocab.sort();
-        vocab.dedup();
-        let vs = vocab.len();
-        let char_to_idx: std::collections::HashMap<char, usize> = vocab.iter().enumerate().map(|(i, &c)| (c, i)).collect();
-        let toks: Vec<usize> = chars.iter().map(|c| *char_to_idx.get(c).unwrap_or(&0)).collect();
-        println!("  Char-level tokens: {}, vocab: {}", toks.len(), vs);
-        (toks, vs)
-    };
-    let split = (tokens.len() as f32 * 0.9) as usize;
-    let train_data = &tokens[..split];
-    println!("  Train tokens: {}", train_data.len());
-
-    // Initialize or resume model + optimizer
-    let (mut model, mut start_iter, mut optimizer, mut rng);
-    if let Some(ref ckpt) = resume_path {
-        println!("Resuming from checkpoint: {ckpt}");
-        let (params, ck_vocab, ck_iter, ck_lr, ck_rng, adam_t, adam_m, adam_v) = load_checkpoint(ckpt);
-        assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
-        let mut m = init_model(vocab_size, 42, n_layers);
-        unflatten_params(&mut m, &params);
-        model = m;
-        start_iter = ck_iter;
-        optimizer = Adam::from_checkpoint(lr, adam_t, adam_m, adam_v);
-        rng = Rng::from_state(ck_rng);
-        println!("  Resuming from iter {start_iter}");
-    } else {
-        println!("Initializing model (seed=42)...");
-        model = init_model(vocab_size, 42, n_layers);
-        start_iter = 0;
-        let n_t = count_trainable(&model);
-        optimizer = Adam::new(lr, n_t);
-        rng = Rng::new(1337);
-    }
-
-    let n_trainable = count_trainable(&model);
-    println!("  Trainable parameters: {n_trainable} (attention frozen, FFN+LN+lm_head trainable)");
-    println!("  Architecture: {n_layers} parallel blocks, {N_HEAD} harmonic heads, {N_BANDS} bands");
-
-    // Flags
-    let use_gpu = std::env::args().any(|a| a == "--gpu");
-    let use_monitor = std::env::args().any(|a| a == "--monitor");
-    let mut monitor = monitor::PipelineMonitor::new(use_monitor);
-    if use_monitor { PROFILE.store(true, std::sync::atomic::Ordering::Relaxed); }
-    // GPU backend + ping-pong buffers for FFN out_proj
-    let gpu_backend: Option<gpu_pipelines::GpuBackend> = if use_gpu {
-        println!("  GPU: initializing...");
-        let be = gpu_pipelines::GpuBackend::new();
-        println!("  GPU: ready");
-        Some(be)
-    } else {
-        None
-    };
-    let ffn_bufs: Option<ffn_gpu::FfnGpuBuffers> = gpu_backend.as_ref().map(|be| {
-        ffn_gpu::FfnGpuBuffers::new(&be.device, seq_len, N_EMBD)
+    train::run_training(train::TrainConfig {
+        data_path: std::env::args().nth(1).unwrap_or("data/input.txt".to_string()),
+        n_iters: parse_flag("--iters", 500),
+        batch_size: parse_flag("--batch", 4),
+        seq_len: parse_flag("--seq", 256),
+        n_layers: parse_flag("--layers", N_LAYERS),
+        lr: parse_flag("--lr", if N_BANDS > 256 { 1e-4 } else { 3e-4 }),
+        use_bpe: std::env::args().any(|a| a == "--bpe"),
+        tokenizer_path: parse_flag("--tokenizer", "data/tokenizer.json".to_string()),
+        resume_path: std::env::args().skip_while(|a| a != "--resume").nth(1),
+        use_curriculum: !std::env::args().any(|a| a == "--no-curriculum"),
+        use_gpu: std::env::args().any(|a| a == "--gpu"),
+        use_monitor: std::env::args().any(|a| a == "--monitor"),
     });
-    // Full FFN GPU disabled — maestro dim=16 GPU dispatches add FP noise
-    // that degrades loss by ~0.5. CPU maestro + GPU ping-pong out_proj is better.
-    let ffn_full_bufs: Option<ffn_full_gpu::FfnFullBuffers> = None;
-
-    // ODE diagnostic: compare GPU vs CPU output + GPU FFT validation
-    if let Some(ref be) = gpu_backend {
-        diagnose_ode_gpu_vs_cpu(be);
-    }
-
-    // Curriculum schedule
-    let curriculum = if use_curriculum {
-        CurriculumSchedule::default_4stage(N_BANDS)
-    } else {
-        CurriculumSchedule::none(N_BANDS)
-    };
-
-    let total_iters = start_iter + n_iters;
-    println!("\nTraining for {n_iters} iterations (batch={batch_size}, seq={seq_len}, lr={lr})");
-    if resume_path.is_some() { println!("  Resuming from iter {start_iter}, target iter {total_iters}"); }
-    curriculum.describe(total_iters);
-    println!("{:>6} {:>10} {:>10}", "Iter", "Loss", "Time");
-    println!("{}", "-".repeat(30));
-
-    let train_start = std::time::Instant::now();
-
-    for iter in start_iter..total_iters {
-        let iter_start = std::time::Instant::now();
-
-        // Sample batch starts
-        let starts: Vec<usize> = (0..batch_size)
-            .map(|_| (rng.next_u64() as usize) % (train_data.len() - seq_len - 1))
-            .collect();
-
-        // Forward+backward — parallel across batch elements
-        let t_fwd = monitor.start();
-        let batch_results: Vec<(f32, Vec<f32>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = starts.iter().map(|&start| {
-                let model_ref = &model;
-                let gpu_ref: Option<&(dyn backend::ComputeBackend + Send + Sync)> = gpu_backend.as_ref().map(|be| be as &(dyn backend::ComputeBackend + Send + Sync));
-                let pp_ref: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)> =
-                    match (&ffn_bufs, &gpu_backend) {
-                        (Some(b), Some(g)) => Some((b, g)),
-                        _ => None,
-                    };
-                let fg_ref: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)> =
-                    match (&ffn_full_bufs, &gpu_backend) {
-                        (Some(b), Some(g)) => Some((b, g)),
-                        _ => None,
-                    };
-                let input = &train_data[start..start + seq_len];
-                let target = &train_data[start + 1..start + seq_len + 1];
-                let st_ref = Some(&stencil);
-                let gk_ref: Option<(&fft_ode::GpuKernelFft, &gpu_pipelines::GpuBackend)> =
-                    gpu_backend.as_ref().map(|be| (&gpu_kernel, be));
-                s.spawn(move || {
-                    let cache = forward_with_cache(model_ref, input, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref);
-                    let (loss, grads) = backward(model_ref, &cache, target, gpu_ref, pp_ref, fg_ref);
-                    (loss, flatten_grads(&grads))
-                })
-            }).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        monitor.record("fwd+bwd (batch)", t_fwd);
-
-        let t_reduce = monitor.start();
-        let mut total_loss = 0.0f32;
-        let mut total_grads = vec![0.0f32; n_trainable];
-        for (loss, fg) in &batch_results {
-            total_loss += loss;
-            for (a, g) in total_grads.iter_mut().zip(fg.iter()) { *a += g; }
-        }
-        total_loss /= batch_size as f32;
-        for g in total_grads.iter_mut() { *g /= batch_size as f32; }
-        monitor.record("reduce", t_reduce);
-
-        let t_optim = monitor.start();
-        clip_grad_norm(&mut total_grads, 1.0);
-        let mut params = flatten_params(&model);
-        optimizer.step(&mut params, &total_grads);
-        unflatten_params(&mut model, &params);
-        monitor.record("optimizer", t_optim);
-
-        // Gradient norm (before clipping — raw magnitude)
-        let grad_norm: f32 = total_grads.iter().map(|g| g * g).sum::<f32>().sqrt();
-        // Note: clip_grad_norm will scale this to 1.0 if > 1.0
-
-        if iter % 10 == 0 || iter == total_iters - 1 {
-            println!("{:>6} {:>10.4} {:>10.1?}  gnorm={:.2}", iter, total_loss, iter_start.elapsed(), grad_norm);
-            if monitor.enabled() {
-                monitor.report(if iter == 0 { 1 } else { 50.min(iter) });
-                monitor.reset();
-            }
-        }
-    }
-
-    println!("\nTraining complete. Total time: {:.1?}", train_start.elapsed());
-
-    // Save checkpoint (WCHK format — includes optimizer for resume)
-    let checkpoint_path = "checkpoint.bin";
-    save_checkpoint(&model, total_iters, lr, &optimizer, rng.state(), checkpoint_path);
-    println!("Checkpoint saved to {checkpoint_path}");
-}
-
-/// Save model checkpoint in WCHK format (includes optimizer state for resume).
-fn save_checkpoint(model: &WavePacketModel, iter: usize, lr: f32, optimizer: &Adam, rng_state: u64, path: &str) {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path).expect("Failed to create checkpoint file");
-    let n_layers = model.blocks.len();
-
-    // Magic + version
-    f.write_all(b"WCHK").unwrap();
-    f.write_all(&1u32.to_le_bytes()).unwrap();
-
-    // Config (self-describing)
-    f.write_all(&(N_BANDS as u32).to_le_bytes()).unwrap();
-    f.write_all(&(N_HEAD as u32).to_le_bytes()).unwrap();
-    f.write_all(&(n_layers as u32).to_le_bytes()).unwrap();
-    f.write_all(&(MAESTRO_DIM as u32).to_le_bytes()).unwrap();
-    f.write_all(&(BLOCK_SIZE as u32).to_le_bytes()).unwrap();
-    f.write_all(&(RK4_STEPS as u32).to_le_bytes()).unwrap();
-
-    // Metadata
-    f.write_all(&(model.vocab_size as u64).to_le_bytes()).unwrap();
-    f.write_all(&(iter as u64).to_le_bytes()).unwrap();
-    f.write_all(&lr.to_le_bytes()).unwrap();
-    f.write_all(&rng_state.to_le_bytes()).unwrap();
-
-    // Optimizer state (real — enables resume)
-    let (adam_t, adam_m, adam_v) = optimizer.checkpoint_state();
-    f.write_all(&(adam_t as u64).to_le_bytes()).unwrap();
-    for &v in adam_m { f.write_all(&v.to_le_bytes()).unwrap(); }
-    for &v in adam_v { f.write_all(&v.to_le_bytes()).unwrap(); }
-
-    // Parameters
-    let params = flatten_params(model);
-    let n = params.len();
-    for &v in &params { f.write_all(&v.to_le_bytes()).unwrap(); }
-
-    let file_size = 4 + 4 + 6*4 + 8 + 8 + 4 + 8 + 8 + n*4*2 + n*4;
-    println!("  WCHK: {n} params, {n_layers} layers, {:.1}MB", file_size as f64 / 1e6);
-}
-
-/// Load checkpoint for resume. Returns (params, vocab_size, iter, lr, rng_state, adam_t, adam_m, adam_v).
-fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, Vec<f32>, Vec<f32>) {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).unwrap_or_else(|e| panic!("Failed to open {path}: {e}"));
-
-    let mut magic = [0u8; 4];
-    f.read_exact(&mut magic).unwrap();
-    assert_eq!(&magic, b"WCHK", "Not a WCHK checkpoint");
-
-    let read_u32 = |f: &mut std::fs::File| -> u32 { let mut b=[0u8;4]; f.read_exact(&mut b).unwrap(); u32::from_le_bytes(b) };
-    let read_u64 = |f: &mut std::fs::File| -> u64 { let mut b=[0u8;8]; f.read_exact(&mut b).unwrap(); u64::from_le_bytes(b) };
-    let read_f32 = |f: &mut std::fs::File| -> f32 { let mut b=[0u8;4]; f.read_exact(&mut b).unwrap(); f32::from_le_bytes(b) };
-
-    let version = read_u32(&mut f);
-    assert_eq!(version, 1, "Unknown WCHK version");
-
-    let ck_bands = read_u32(&mut f) as usize;
-    let ck_head = read_u32(&mut f) as usize;
-    let ck_layers = read_u32(&mut f) as usize;
-    let ck_maestro = read_u32(&mut f) as usize;
-    let _ck_block_size = read_u32(&mut f) as usize;
-    let _ck_rk4 = read_u32(&mut f) as usize;
-
-    assert_eq!(ck_bands, N_BANDS, "Checkpoint bands mismatch");
-    assert_eq!(ck_head, N_HEAD, "Checkpoint heads mismatch");
-    assert_eq!(ck_maestro, MAESTRO_DIM, "Checkpoint maestro_dim mismatch");
-
-    let vocab_size = read_u64(&mut f) as usize;
-    let iter = read_u64(&mut f) as usize;
-    let lr = read_f32(&mut f);
-    let rng_state = read_u64(&mut f);
-
-    // Compute param count for this architecture
-    let per_block = N_EMBD*2 + N_EMBD*2 + MAESTRO_DIM*N_EMBD + MAESTRO_DIM + N_EMBD*MAESTRO_DIM + N_EMBD
-        + MAESTRO_DIM*N_EMBD + MAESTRO_DIM + N_EMBD*MAESTRO_DIM + N_EMBD + N_EMBD*N_EMBD + N_EMBD;
-    let n_params = ck_layers * per_block + N_EMBD*2 + vocab_size*N_EMBD;
-
-    let adam_t = read_u64(&mut f) as usize;
-    let read_f32_vec = |f: &mut std::fs::File, n: usize| -> Vec<f32> {
-        let mut buf = vec![0u8; n * 4];
-        f.read_exact(&mut buf).unwrap();
-        buf.chunks(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect()
-    };
-    let adam_m = read_f32_vec(&mut f, n_params);
-    let adam_v = read_f32_vec(&mut f, n_params);
-    let params = read_f32_vec(&mut f, n_params);
-
-    println!("  Resumed: iter {iter}, lr {lr:.6}, {n_params} params, {ck_layers} layers");
-    (params, vocab_size, iter, lr, rng_state, adam_t, adam_m, adam_v)
-}
-
-/// Progressive curriculum schedule — starts with fewer bands, opens progressively.
-struct CurriculumSchedule {
-    stages: Vec<(usize, f32)>, // (bands, fraction_of_training)
-}
-
-impl CurriculumSchedule {
-    fn default_4stage(n_bands: usize) -> Self {
-        let s2 = 24.min(n_bands);
-        let s3 = (n_bands / 4).max(s2);
-        Self { stages: vec![(8.min(n_bands), 0.20), (s2, 0.25), (s3, 0.25), (n_bands, 0.30)] }
-    }
-
-    fn none(n_bands: usize) -> Self {
-        Self { stages: vec![(n_bands, 1.0)] }
-    }
-
-    fn active_bands(&self, iter: usize, n_iters: usize) -> usize {
-        let mut cumulative = 0.0f32;
-        for &(bands, frac) in &self.stages {
-            cumulative += frac;
-            if iter < (cumulative * n_iters as f32) as usize { return bands; }
-        }
-        self.stages.last().unwrap().0
-    }
-
-    fn describe(&self, n_iters: usize) {
-        print!("  Curriculum: ");
-        let mut start = 0;
-        for &(bands, frac) in &self.stages {
-            let end = start + (frac * n_iters as f32) as usize;
-            print!("{bands} bands (iters {start}-{end})  ", );
-            start = end;
-        }
-        println!();
-    }
 }
 
 // Diagnostic: compare GPU vs CPU ODE
