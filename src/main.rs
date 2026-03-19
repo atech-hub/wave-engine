@@ -860,7 +860,66 @@ fn clip_grad_norm(grads: &mut [f32], max_norm: f32) {
 
 // ─── Main ───────────────────────────────────────────────────────
 
+fn print_help() {
+    println!("wave-engine v0.1.0 — training engine for wave-coherent neural architectures");
+    println!();
+    println!("USAGE:");
+    println!("    wave-engine <DATA> [OPTIONS]");
+    println!();
+    println!("ARGUMENTS:");
+    println!("    DATA              Path to training data file (e.g. data/input.txt)");
+    println!();
+    println!("TRAINING:");
+    println!("    --iters N         Training iterations                    [default: 500]");
+    println!("    --batch N         Batch size                             [default: 4]");
+    println!("    --seq N           Sequence length (context window)       [default: 256]");
+    println!("    --lr F            Learning rate                          [default: 1e-4]");
+    println!("    --layers N        Number of transformer blocks           [default: 24]");
+    println!();
+    println!("TOKENIZER:");
+    println!("    --bpe             Use BPE tokenizer (GPT-2 style)");
+    println!("    --tokenizer FILE  Path to tokenizer.json                 [default: data/tokenizer.json]");
+    println!("    (default)         Character-level tokenization");
+    println!();
+    println!("ACCELERATION:");
+    println!("    --gpu             Enable wgpu GPU (Vulkan/Metal/DX12)");
+    println!("    --candle          Use Candle CUDA backend (requires --features candle-backend)");
+    println!("    --monitor         Enable per-section pipeline timing");
+    println!();
+    println!("ARCHITECTURE (compile-time, change in source):");
+    println!("    N_BANDS = 384     Harmonic frequency bands (768-dim embedding)");
+    println!("    N_HEAD = 12       Attention heads");
+    println!("    MAESTRO_DIM = 16  Maestro bottleneck width (48:1 compression)");
+    println!("    RK4_STEPS = 16    ODE integration steps per layer");
+    println!();
+    println!("OUTPUT:");
+    println!("    checkpoint.bin    WCHK format, loadable by wave-server");
+    println!();
+    println!("EXAMPLES:");
+    println!("    # Quick test (4 layers, char-level, 64 context)");
+    println!("    wave-engine data/input.txt --layers 4 --iters 100 --seq 64");
+    println!();
+    println!("    # Full BPE training with GPU");
+    println!("    wave-engine data/input.txt --bpe --gpu --iters 3000");
+    println!();
+    println!("    # Candle CUDA backend");
+    println!("    wave-engine data/input.txt --candle --bpe --iters 3000");
+    println!();
+    println!("THREE TIERS:");
+    println!("    CPU       Any hardware, gold standard precision");
+    println!("    wgpu GPU  Any GPU via Vulkan/Metal/DX12 (--gpu)");
+    println!("    Candle    NVIDIA CUDA via cuBLAS (--candle --features candle-backend)");
+    println!();
+    println!("SOURCE: https://github.com/atech-hub/wave-engine");
+    println!("SERVER: https://github.com/atech-hub/wave-server");
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
+    }
+
     println!("wave-engine v0.1.0\n");
 
     // Check for --candle flag first — routes to entirely different training path
