@@ -19,6 +19,9 @@ cargo run --release -- data/input.txt --iters 200 --gpu
 # Train with NVIDIA CUDA (requires --features candle-backend)
 cargo run --release --features candle-backend -- data/input.txt --iters 200 --candle
 
+# Train with BPE tokenizer
+cargo run --release -- data/input.txt --iters 200 --bpe --tokenizer data/tokenizer.json
+
 # See all options
 cargo run --release -- --help
 ```
@@ -67,6 +70,23 @@ Monitoring:
   --monitor           Enable always-on pipeline timing (per-section FFN breakdown)
 ```
 
+## Features
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| Three training tiers | ✓ | CPU, wgpu (any GPU), Candle/CUDA (NVIDIA) |
+| BPE tokenizer | ✓ | HuggingFace tokenizer.json format, tested with 50K vocab |
+| Checkpoint save/load | ✓ | WCHK format with optimizer state, iteration count, resume support |
+| Text generation | ✓ | Temperature, top-k, top-p, repetition penalty sampling |
+| Curriculum training | ✓ | Band unlocking over first 20% of iterations (+1.46pp validated) |
+| GPU fused ODE | ✓ | One submit, 192 dispatches, zero CPU readbacks between RK4 steps |
+| Candle ODE | ✓ | CustomOp1 with identity backward, matching GELU and init |
+| FFT ODE | ✓ | OFDM-inspired stencil convolution, validated at 1.19e-7 precision |
+| GPU FFT shader | ✓ | 512-point radix-2 Cooley-Tukey in WGSL, compiled and validated |
+| Ping-pong buffers | ✓ | Forward/backward read same GPU bits, eliminates precision mismatch |
+| Pipeline monitor | ✓ | Per-section FFN timing (mae_in, ODE, mae_out, out_proj) |
+| 256-thread Kahan shaders | ✓ | Compensated tree reduction, 0.19 gap (f32 non-associativity floor) |
+
 ## Architecture
 
 Wave-engine implements a novel neural architecture where standard MLP feed-forward layers are replaced with coupled harmonic oscillators integrated via a fourth-order Runge-Kutta solver.
@@ -110,14 +130,14 @@ The `--gpu` flag enables GPU acceleration via wgpu, which works on any GPU suppo
 What runs on GPU:
 - Frozen attention output projection (zero quality cost)
 - Trained FFN output projection via ping-pong buffers (0.19 quality trade for 2.8x speedup)
+- Fused ODE integration (one submit, 192 dispatches, all buffers VRAM-resident)
 
 What stays on CPU:
 - Maestro layers (dim=16, too small for GPU dispatch overhead)
-- Kerr-ODE integration (sequential band coupling, OFDM-inspired FFT validated but CPU is faster at 384 bands)
 - Attention scoring (phase-based, frozen)
 - Layer normalization
 
-The engine includes 32 WGSL compute shaders covering matvec, outer product, attention backward, layer norm, FFT convolution, and ODE integration. An always-on pipeline monitor (`--monitor`) shows per-section timing so you can see exactly where every millisecond goes.
+The engine includes 32+ WGSL compute shaders covering matvec, outer product, attention backward, layer norm, FFT convolution, ODE integration, and RK4 stepping. An always-on pipeline monitor (`--monitor`) shows per-section timing so you can see exactly where every millisecond goes.
 
 ### Candle/CUDA (NVIDIA)
 
@@ -146,14 +166,14 @@ These are validated through testing and documented honestly:
 - **ODE is 28% of FFN time, not 80%.** The output projection (768×768 matmul) dominates at 66%. Per-section monitors revealed this.
 - **GPU fast mode reaches CPU quality in the same wall-clock time.** CPU hits loss 2.50 at 36 seconds. GPU hits 2.54 at 36 seconds. Then GPU keeps going — more iterations in the same time.
 - **The 0.19 GPU quality gap is f32 non-associativity.** Different addition order on GPU vs CPU gives a different but equally valid result. Proven by identical error at 64 and 256 GPU threads.
-- **FFT-based ODE derivative matches sequential at 384 bands on CPU.** OFDM-inspired stencil convolution validated at 1.19e-7 precision. GPU FFT shader written (fft_512.wgsl) for future acceleration.
+- **FFT-based ODE derivative matches sequential at 384 bands on CPU.** OFDM-inspired stencil convolution validated at 1.19e-7 precision. GPU FFT shader written and validated.
 - **Frozen attention loses nothing on tested datasets.** Harmonic coherence scoring produces equivalent quality without training attention weights.
 
 ## OFDM-Inspired ODE Acceleration
 
 The Kerr-ODE's nearest-neighbour coupling is structurally identical to OFDM subcarrier interference in MIMO wireless systems. The stencil sum `ns[k] = mag²[k-2] + mag²[k-1] + mag²[k+1] + mag²[k+2]` is a convolution with kernel [1,1,0,1,1], which maps to FFT → multiply → IFFT in the frequency domain.
 
-This connection is implemented in `fft_ode.rs` using rustfft, with a GPU FFT shader (`shaders/fft_512.wgsl`) compiled and validated. At 384 bands, CPU FFT matches sequential speed (cache-friendly simple loop is hard to beat). The GPU FFT path will provide acceleration when the entire RK4 loop is fused on GPU.
+This connection is implemented in `fft_ode.rs` using rustfft, with a GPU FFT shader (`shaders/fft_512.wgsl`) compiled and validated at 1.67e-6 precision vs CPU. At 384 bands, CPU FFT matches sequential speed. The GPU fused ODE path chains all RK4 dispatches in a single command encoder submit with zero CPU readbacks between steps.
 
 ## Project Structure
 
@@ -171,19 +191,20 @@ src/
 ├── backend.rs           ComputeBackend trait (CPU/GPU abstraction)
 ├── gpu_pipelines.rs     wgpu pipeline + shader compilation
 ├── gpu_dispatch.rs      GPU ComputeBackend implementation
-├── gpu_ops_forward.rs   GPU forward operations
+├── gpu_ops_forward.rs   GPU forward operations (including fused ODE)
 ├── gpu_ops_backward.rs  GPU backward operations
 ├── optim.rs             Adam optimizer
 ├── bpe.rs               BPE tokenizer (HuggingFace format)
+├── checkpoint.rs        WCHK checkpoint save/load with resume
 └── rng.rs               Deterministic PRNG
 
-shaders/                 32 WGSL compute shaders
+shaders/                 32+ WGSL compute shaders
 ├── matvec_batch_tiled_kahan.wgsl    Forward matmul (256-thread, Kahan compensated)
 ├── matvec_backward_batch_tiled_kahan.wgsl  Backward d_x
 ├── outer_product.wgsl               Backward d_W (Kahan compensated)
 ├── fft_512.wgsl                     512-point radix-2 FFT
 ├── kerr_step_batch.wgsl             Fused ODE forward
-└── ...                              Layer norm, GELU, attention, etc.
+└── ...                              Layer norm, GELU, attention, RK4, etc.
 
 data/
 ├── input.txt            Shakespeare training data
@@ -213,7 +234,7 @@ The maintainer ([Marco Da Cunha](https://github.com/atech-hub)) is an IT systems
 What this means for contributions:
 
 - **Main branch is protected.** All changes go through pull requests.
-- **Fork and branch.** Want to add KV-cache, improve shaders, add new backends? Fork the repo, create a branch, do your work, submit a PR.
+- **Fork and branch.** Want to improve shaders, add new backends, optimize training? Fork the repo, create a branch, do your work, submit a PR.
 - **The validation gate is test results.** Every PR must show that training still converges to baseline quality on at least one tier.
 - **The maintainer merges based on testing and description, not code review.** Be clear about what you changed and why.
 
@@ -221,20 +242,19 @@ What this means for contributions:
 
 | Target | Impact | Difficulty |
 |--------|--------|------------|
-| KV-cache for inference | 100x faster text generation | Medium |
-| Word-level / BPE tokenizer wiring | Required for real-corpus training | Medium |
-| Checkpoint save/load with resume | Overnight training support | Medium |
-| Text generation (sampling) | See model output | Small |
-| Curriculum training integration | +1.46pp validated improvement | Small |
-| GPU fused ODE (RK4 loop resident in VRAM) | Moves 28% FFN bottleneck to GPU | Large |
-| Continuous batching | Multi-user serving | Large |
+| Wikitext-103 training pipeline | Validate architecture on real English | Medium |
+| Tied embeddings / vocab adapter | Solve 50K vocab lm_head explosion (38.6M → 590K params) | Medium |
+| Stochastic resonance integration | Validated -8.8% perplexity improvement (α=0.05) | Small |
+| Batched inference dispatch | Use engine's existing batch patterns in wave-server | Medium |
+| fp16 for linear ops | Halve memory and PCIe transfer size | Medium |
+| Speculative decoding | Lower per-token latency for serving | Large |
 
 ## Related
 
 - [Wave Coherence as a Computational Primitive](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive) — The parent research project (public, MIT, 1000+ cloners)
-- [kerr-engine](https://github.com/atech-hub/kerr-engine) — First implementation, historical reference (public, Apache 2.0, frozen)
-- [kerr-server](https://github.com/atech-hub/kerr-server) — OpenAI-compatible inference server (public, Apache 2.0)
+- [wave-server](https://github.com/atech-hub/wave-server) — OpenAI-compatible inference server with KV-cache and wave memory (public, Apache 2.0)
 - [kerr-memory](https://github.com/atech-hub/kerr-memory) — Persistent wave memory state (public, Apache 2.0)
+- [kerr-engine](https://github.com/atech-hub/kerr-engine) — First implementation, historical reference (public, Apache 2.0)
 
 ## License
 

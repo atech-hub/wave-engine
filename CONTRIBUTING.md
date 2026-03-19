@@ -19,32 +19,42 @@ This is stated openly because it matters for how contributions work:
    # CPU baseline (must match: loss ~2.81 at iter 99)
    cargo run --release -- data/input.txt --iters 100
 
-   # GPU tier (must match: loss ~2.81 at iter 99 for --gpu safe, ~3.06 for fast)
+   # GPU tier (must converge, loss descending)
    cargo run --release -- data/input.txt --iters 100 --gpu
    ```
 4. **Submit a PR** with your results and a clear description.
 
-## What needs building (priority order)
+## What's already built
 
-### Critical for real training
+These features are complete and should not be broken by contributions:
 
-**Wikitext-103 data pipeline** — The engine currently trains on Shakespeare (65-character vocab, 1MB). Real training needs word-level or BPE tokenization of wikitext-103. The parquet files exist, BPE code exists in `bpe.rs`, but the pipeline isn't wired together. This is the #1 blocker for validating the architecture on real English.
+- **Three training tiers** — CPU, wgpu (any GPU), Candle/CUDA (NVIDIA)
+- **BPE tokenizer** — HuggingFace tokenizer.json format, tested with 50K vocab
+- **Checkpoint save/load** — WCHK format with optimizer state and resume
+- **Text generation** — Autoregressive sampling with temperature/top-k/top-p
+- **Curriculum training** — Band unlocking, validated +1.46pp improvement
+- **GPU fused ODE** — One submit, 192 dispatches, zero CPU readbacks
+- **Pipeline monitor** — Per-section FFN timing (mae_in, ODE, mae_out, out_proj)
+- **Ping-pong buffers** — Forward/backward GPU consistency for out_proj
+- **FFT ODE** — OFDM-inspired stencil convolution, validated at 1.19e-7
 
-**Checkpoint save/load with resume** — `checkpoint.rs` exists but may not match the current model format. Overnight training requires saving weights + optimizer state + iteration count and resuming cleanly.
+## What needs building
 
-**Text generation** — The engine trains but can't generate text. Needs an autoregressive sampling loop (temperature, top-k, top-p). The inference code exists in [kerr-server](https://github.com/atech-hub/kerr-server)'s `inference.rs` as a reference. Without this, you train blind and can't see what the model produces.
+### Real data validation (highest priority)
+
+**Wikitext-103 training pipeline** — The engine currently trains on Shakespeare (65-character vocab, 1MB). Real training needs wikitext-103 with word-level or BPE tokenization. The BPE code works, the checkpoint saves, the pipeline is proven — but the architecture hasn't been validated on real English yet. This is the most important next step.
+
+**Tied embeddings / vocab adapter** — At 50K BPE vocab, the lm_head is 38.6M parameters — bigger than the entire 24-layer model (15.5M). A learned adapter (768×768 = 590K params) mapping hidden states into the frozen harmonic embedding space would solve this.
 
 ### Proven improvements to integrate
 
-**Curriculum training** — Start at 192 bands, unlock to 384 over first 20% of iterations. Validated at +1.46 percentage points improvement on kerr-engine. The mechanism is known, needs wiring into the training loop.
+**Stochastic resonance** — Add α=0.05 noise to ODE initial conditions. Validated at -8.8% perplexity improvement on kerr-engine. A few lines of code.
 
-**Stochastic resonance** — Add α=0.05 noise to ODE initial conditions. Validated at -8.8% perplexity improvement. A few lines of code.
+### Performance
 
-### GPU acceleration
+**fp16 for linear ops** — Matvecs at fp16 would halve memory and PCIe transfer size. Keep ODE at fp32 (nonlinear dynamics are precision-sensitive). Test on out_proj first.
 
-**Fused GPU ODE** — The ODE currently runs on CPU (5.5ms/block). The FFT shader (`fft_512.wgsl`) is compiled and validated. Making the entire RK4 loop GPU-resident (all buffers in VRAM, no CPU roundtrips) would eliminate per-step dispatch overhead. This is the path to moving the remaining 28% FFN bottleneck to GPU.
-
-**GPU backward buffer reuse** — The backward `out_proj` creates fresh buffers each call (transpose upload, zero d_w/d_b). Caching transposed weights and reusing zeroed buffers would cut backward time in half.
+**Speculative decoding** — Generate multiple candidate tokens in parallel, verify against full model. Reduces per-token latency for serving.
 
 ## Architecture notes
 
