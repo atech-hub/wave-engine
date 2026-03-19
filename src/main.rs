@@ -1034,6 +1034,50 @@ fn main() {
     }
 
     println!("\nTraining complete. Total time: {:.1?}", train_start.elapsed());
+
+    // Save checkpoint (WCHK format)
+    let checkpoint_path = "checkpoint.bin";
+    save_checkpoint(&model, n_iters, lr, checkpoint_path);
+    println!("Checkpoint saved to {checkpoint_path}");
+}
+
+/// Save model checkpoint in WCHK format for wave-server.
+fn save_checkpoint(model: &WavePacketModel, iter: usize, lr: f32, path: &str) {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).expect("Failed to create checkpoint file");
+    let n_layers = model.blocks.len();
+
+    // Magic + version
+    f.write_all(b"WCHK").unwrap();
+    f.write_all(&1u32.to_le_bytes()).unwrap();
+
+    // Config (self-describing)
+    f.write_all(&(N_BANDS as u32).to_le_bytes()).unwrap();
+    f.write_all(&(N_HEAD as u32).to_le_bytes()).unwrap();
+    f.write_all(&(n_layers as u32).to_le_bytes()).unwrap();
+    f.write_all(&(MAESTRO_DIM as u32).to_le_bytes()).unwrap();
+    f.write_all(&(BLOCK_SIZE as u32).to_le_bytes()).unwrap();
+    f.write_all(&(RK4_STEPS as u32).to_le_bytes()).unwrap();
+
+    // Metadata
+    f.write_all(&(model.vocab_size as u64).to_le_bytes()).unwrap();
+    f.write_all(&(iter as u64).to_le_bytes()).unwrap();
+    f.write_all(&lr.to_le_bytes()).unwrap();
+    f.write_all(&0u64.to_le_bytes()).unwrap(); // rng_state placeholder
+
+    // Optimizer state (zeros — server doesn't need it, but format expects it)
+    let params = flatten_params(model);
+    let n = params.len();
+    f.write_all(&0u64.to_le_bytes()).unwrap(); // adam_t = 0
+    let zeros = vec![0u8; n * 4];
+    f.write_all(&zeros).unwrap(); // m
+    f.write_all(&zeros).unwrap(); // v
+
+    // Parameters
+    for &v in &params { f.write_all(&v.to_le_bytes()).unwrap(); }
+
+    let file_size = 4 + 4 + 6*4 + 8 + 8 + 4 + 8 + 8 + n*4*2 + n*4;
+    println!("  WCHK: {n} params, {n_layers} layers, {:.1}MB", file_size as f64 / 1e6);
 }
 
 // Diagnostic: compare GPU vs CPU ODE
