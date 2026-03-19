@@ -58,6 +58,7 @@ mod fft_ode;
 mod rng;
 mod train;
 mod wave_checkpoint;
+mod token_cache;
 
 use wave_embed::*;
 use wave_attn::*;

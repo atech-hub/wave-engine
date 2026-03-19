@@ -114,25 +114,31 @@ pub fn run_training(config: TrainConfig) {
     let gpu_kernel = fft_ode::GpuKernelFft::new(N_BANDS);
     println!("  FFT stencil precomputed (pad to {})", N_BANDS.next_power_of_two());
 
-    // Load data
+    // Load data (with token cache — encode once, load instantly on repeat runs)
     println!("Loading dataset from {}...", config.data_path);
-    let raw = std::fs::read_to_string(&config.data_path).expect("Failed to read data file");
 
-    let (tokens, vocab_size) = if config.use_bpe {
-        let tokenizer = bpe::BpeTokenizer::from_file(&config.tokenizer_path);
-        let toks = tokenizer.encode(&raw);
-        let vs = tokenizer.vocab_size;
-        println!("  BPE tokens: {}, vocab: {}", toks.len(), vs);
-        (toks, vs)
+    let (tokens, vocab_size) = if let Some((cached_toks, cached_vs)) = token_cache::load_cache(&config.data_path, config.use_bpe) {
+        (cached_toks, cached_vs)
     } else {
-        let chars: Vec<char> = raw.chars().collect();
-        let mut vocab: Vec<char> = chars.clone();
-        vocab.sort();
-        vocab.dedup();
-        let vs = vocab.len();
-        let char_to_idx: std::collections::HashMap<char, usize> = vocab.iter().enumerate().map(|(i, &c)| (c, i)).collect();
-        let toks: Vec<usize> = chars.iter().map(|c| *char_to_idx.get(c).unwrap_or(&0)).collect();
-        println!("  Char-level tokens: {}, vocab: {}", toks.len(), vs);
+        let raw = std::fs::read_to_string(&config.data_path).expect("Failed to read data file");
+        let (toks, vs) = if config.use_bpe {
+            let tokenizer = bpe::BpeTokenizer::from_file(&config.tokenizer_path);
+            let t = tokenizer.encode(&raw);
+            let v = tokenizer.vocab_size;
+            println!("  BPE tokens: {}, vocab: {}", t.len(), v);
+            (t, v)
+        } else {
+            let chars: Vec<char> = raw.chars().collect();
+            let mut vocab: Vec<char> = chars.clone();
+            vocab.sort();
+            vocab.dedup();
+            let v = vocab.len();
+            let char_to_idx: std::collections::HashMap<char, usize> = vocab.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+            let t: Vec<usize> = chars.iter().map(|c| *char_to_idx.get(c).unwrap_or(&0)).collect();
+            println!("  Char-level tokens: {}, vocab: {}", t.len(), v);
+            (t, v)
+        };
+        token_cache::save_cache(&config.data_path, config.use_bpe, &toks, vs);
         (toks, vs)
     };
     let split = (tokens.len() as f32 * 0.9) as usize;
