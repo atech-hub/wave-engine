@@ -34,11 +34,14 @@ pub fn ffn_forward_via_backend(
     let precond = cpu.vec_add_batch(x, &mae_in_out);
     let _mae_in_dur = _t_mae_in.elapsed();
 
-    // 3. ODE: CPU FFT (fastest at 384 bands — no dispatch overhead), sequential fallback
-    // GPU FFT shader validated but per-dispatch overhead (64 round-trips) makes it slower
-    // than CPU FFT at this scale. GPU FFT wins when entire RK4 is fused on GPU.
+    // 3. ODE: GPU fused when available (one submit, zero readbacks between steps),
+    //    CPU FFT fallback, sequential last resort
     let _t_ode = std::time::Instant::now();
-    let (kerr_out, ode_device): (Vec<Vec<f32>>, &str) = if let Some(st) = stencil {
+    let (kerr_out, ode_device): (Vec<Vec<f32>>, &str) = if let Some((_bufs, gpu_be)) = ping_pong {
+        // GPU fused: entire RK4 loop in one command encoder submit
+        let out = gpu_be.gpu_kerr_ode_batch_fused(&weights.kerr, &precond);
+        (out, "GPU-fused")
+    } else if let Some(st) = stencil {
         let out = precond.iter().map(|p| {
             crate::fft_ode::kerr_ode_fft(p, &weights.kerr.gamma_raw, &weights.kerr.omega,
                 weights.kerr.alpha, weights.kerr.beta, weights.kerr.rk4_n_steps, st)

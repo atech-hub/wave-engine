@@ -745,3 +745,7 @@ impl GpuBackend {
         self.readback(&output_buf, n_positions * n_bands)
     }
 }
+
+// NOTE: gpu_kerr_ode_batch_fused already exists above (line ~405).
+// It chains all RK4 steps in ONE command encoder submit with zero CPU readbacks.
+// The ffn_backend.rs calls it via gpu_be.gpu_kerr_ode_batch_fused() when --gpu is active.
