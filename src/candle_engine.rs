@@ -392,21 +392,22 @@ pub mod engine {
         }
 
         pub fn forward(&self, token_ids: &[usize]) -> Result<Tensor> {
-            self.forward_with_curriculum(token_ids, N_BANDS)
+            self.forward_with_curriculum(token_ids, &vec![1.0f32; N_BANDS])
         }
 
         /// Forward with curriculum: soft-mask inactive bands on FFN path only.
-        /// Mask: 1.0 for active bands, 0.001 for inactive. Applied after LN, before FFN.
-        /// Attention sees full vector (frozen, doesn't learn). FFN sees masked vector (trains on active bands).
-        pub fn forward_with_curriculum(&self, token_ids: &[usize], active_bands: usize) -> Result<Tensor> {
+        /// `band_masks[k]` is the mask value for band k (0.01 for suppressed, 1.0 for active,
+        /// intermediate values during ramp transitions).
+        /// Attention sees full vector (frozen). FFN sees masked vector (trains on active bands).
+        pub fn forward_with_curriculum(&self, token_ids: &[usize], band_masks: &[f32]) -> Result<Tensor> {
             let n_pos = token_ids.len();
 
-            // Build soft mask (GPU-resident, created once per call — cheap)
-            let ffn_mask = if active_bands < N_BANDS {
-                let mut mask_data = vec![1.0f32; N_EMBD];
-                for k in active_bands..N_BANDS {
-                    mask_data[k * 2] = 0.01;
-                    mask_data[k * 2 + 1] = 0.01;
+            // Build GPU-resident mask from per-band values
+            let ffn_mask = if band_masks.iter().any(|&v| v < 1.0) {
+                let mut mask_data = vec![0.0f32; N_EMBD];
+                for k in 0..N_BANDS {
+                    mask_data[k * 2] = band_masks[k];
+                    mask_data[k * 2 + 1] = band_masks[k];
                 }
                 Some(Tensor::from_vec(mask_data, (1, N_EMBD), &self.device)?)
             } else {
@@ -586,7 +587,7 @@ pub mod engine {
         let train_start = Instant::now();
 
         for iter in 0..n_iters {
-            let active_bands = curriculum.active_bands(iter, n_iters);
+            let band_masks = curriculum.band_masks(iter, n_iters, N_BANDS);
             let iter_start = Instant::now();
             let mut total_loss = 0.0f32;
 
@@ -597,7 +598,7 @@ pub mod engine {
 
                 // Forward with timing
                 let t_fwd = Instant::now();
-                let logits = model.forward_with_curriculum(input, active_bands)?;
+                let logits = model.forward_with_curriculum(input, &band_masks)?;
                 let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
 
                 // Loss
