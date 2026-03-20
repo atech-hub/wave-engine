@@ -687,18 +687,23 @@ pub mod engine {
             total_loss /= batch_size as f32;
             let iter_time = iter_start.elapsed();
 
+            // VRAM monitoring via cudarc (direct CUDA query — shows ALL GPU memory)
+            let vram_used_mb = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
+                .map(|(free, total)| (total - free) / (1024 * 1024))
+                .unwrap_or(0);
+
             // JSONL telemetry (survives crashes)
             if let Some(ref log) = log_file {
                 use std::io::Write;
                 let entry = format!(
-                    "{{\"iter\":{},\"loss\":{:.4},\"lr\":{:.6},\"grad_norm\":{:.4},\"time_ms\":{},\"nan_skips\":{}}}\n",
-                    iter, total_loss, current_lr, 0.0, iter_time.as_millis(), nan_skip_count
+                    "{{\"iter\":{},\"loss\":{:.4},\"lr\":{:.6},\"time_ms\":{},\"vram_mb\":{},\"nan_skips\":{}}}\n",
+                    iter, total_loss, current_lr, iter_time.as_millis(), vram_used_mb, nan_skip_count
                 );
                 let _ = (&*log).write_all(entry.as_bytes());
             }
 
             if iter % 50 == 0 || iter == total_iters - 1 {
-                println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}", iter, total_loss, iter_time, current_lr);
+                println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  vram={}MB", iter, total_loss, iter_time, current_lr, vram_used_mb);
             }
 
             // Periodic checkpoint: save every 100 iters until leak is confirmed fixed

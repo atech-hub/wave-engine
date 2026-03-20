@@ -11,7 +11,7 @@ categories = ["science", "mathematics"]
 
 [features]
 default = []
-candle-backend = ["dep:candle-core", "dep:candle-nn"]
+candle-backend = ["dep:candle-core", "dep:candle-nn", "dep:candle-cuda-vmm"]
 
 [dependencies]
 # Always available
@@ -28,3 +28,4 @@ rustfft = "6.2"
 # Candle backend (optional, with CUDA support)
 candle-core = { version = "0.9", optional = true, features = ["cuda"] }
 candle-nn = { version = "0.9", optional = true }
+candle-cuda-vmm = { version = "0.1", optional = true }
