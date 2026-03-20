@@ -604,6 +604,23 @@ pub mod engine {
         println!("{:>6} {:>10} {:>10}", "Iter", "Loss", "Time");
         println!("{}", "-".repeat(35));
 
+        // JSONL telemetry log (persists across crashes)
+        let log_file = std::fs::File::create("training_log.jsonl").ok();
+        let mut nan_skip_count = 0usize;
+
+        // Cosine LR schedule with warmup
+        let warmup_iters = 200usize;
+        let min_lr_ratio = 0.1;
+        let cosine_lr = |iter: usize| -> f64 {
+            if iter < warmup_iters {
+                lr * (iter + 1) as f64 / warmup_iters as f64
+            } else {
+                let progress = (iter - warmup_iters) as f64 / (total_iters - warmup_iters).max(1) as f64;
+                let decay = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+                lr * (min_lr_ratio + (1.0 - min_lr_ratio) * decay)
+            }
+        };
+
         let train_start = Instant::now();
 
         for iter in start_iter..total_iters {
@@ -611,75 +628,83 @@ pub mod engine {
             let iter_start = Instant::now();
             let mut total_loss = 0.0f32;
 
+            let current_lr = cosine_lr(iter);
+            optimizer.set_learning_rate(current_lr);
+
             for _b in 0..batch_size {
                 let start = (rng.next_u64() as usize) % (train_data.len() - seq_len - 1);
                 let input = &train_data[start..start + seq_len];
                 let target = &train_data[start + 1..start + seq_len + 1];
 
-                // Forward with timing
-                let t_fwd = Instant::now();
-                let logits = model.forward_with_curriculum(input, &band_masks)?;
-                let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
+                // Explicit scope: all tensors dropped at block exit → GPU memory freed
+                let loss_val = {
+                    let logits = model.forward_with_curriculum(input, &band_masks)?;
+                    let target_tensor = Tensor::from_vec(
+                        target.to_vec().iter().map(|&t| t as u32).collect::<Vec<u32>>(),
+                        (seq_len,), &device,
+                    )?;
+                    // Plain cross-entropy (no label smoothing — it leaked tensor graph)
+                    let loss = candle_nn::loss::cross_entropy(&logits, &target_tensor)?;
+                    let lv = loss.to_scalar::<f32>()?;
 
-                // Loss
-                let target_tensor = Tensor::from_vec(
-                    target.to_vec().iter().map(|&t| t as u32).collect::<Vec<u32>>(),
-                    (seq_len,), &device,
-                )?;
-                let loss = candle_nn::loss::cross_entropy(&logits, &target_tensor)?;
-                let loss_val = loss.to_scalar::<f32>()?;
-                total_loss += loss_val;
+                    if lv.is_nan() || lv.is_infinite() {
+                        nan_skip_count += 1;
+                        eprintln!("  [NaN skip] iter {iter} batch {_b} (total skips: {nan_skip_count})");
+                        lv // return NaN — will be skipped below
+                    } else {
+                        // Backward
+                        let grads = loss.backward()?;
 
-                // Backward + clip + step
-                let t_bwd = Instant::now();
-                let grads = loss.backward()?;
-                // Gradient clipping: compute total norm, scale if > 1.0
-                let mut total_norm_sq = 0.0f64;
-                for var in &varmap.all_vars() {
-                    if let Some(grad) = grads.get(var) {
-                        let flat = grad.flatten_all()?.to_vec1::<f32>()?;
-                        for &g in &flat { total_norm_sq += (g as f64) * (g as f64); }
+                        // Grad norm: compute on GPU as scalar, no flatten_all intermediate tensor
+                        let mut total_norm_sq = 0.0f64;
+                        for var in &varmap.all_vars() {
+                            if let Some(grad) = grads.get(var) {
+                                let norm_sq = grad.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+                                total_norm_sq += norm_sq;
+                            }
+                        }
+                        let total_norm = total_norm_sq.sqrt();
+
+                        // Clip + step
+                        if total_norm > 1.0 {
+                            let scale = 1.0 / total_norm;
+                            optimizer.set_learning_rate(current_lr * scale);
+                            optimizer.step(&grads)?;
+                            optimizer.set_learning_rate(current_lr);
+                        } else {
+                            optimizer.step(&grads)?;
+                        }
+                        lv
                     }
-                }
-                let total_norm = total_norm_sq.sqrt();
-                if total_norm > 1.0 {
-                    // Scale gradients down — modify the GradStore isn't possible,
-                    // so we reduce lr proportionally for this step
-                    let scale = 1.0 / total_norm;
-                    optimizer.set_learning_rate(lr as f64 * scale);
-                    optimizer.step(&grads)?;
-                    optimizer.set_learning_rate(lr as f64);
-                } else {
-                    optimizer.step(&grads)?;
-                }
-                let bwd_ms = t_bwd.elapsed().as_secs_f64() * 1000.0;
+                    // logits, target_tensor, loss, grads ALL dropped here
+                };
 
-                // Monitor: print timing for first batch element every 10 iters
-                if _b == 0 && (iter % 10 == 0 || iter == n_iters - 1) {
-                    let _ = (fwd_ms, bwd_ms); // used in print below
+                if !loss_val.is_nan() {
+                    total_loss += loss_val;
                 }
             }
 
             total_loss /= batch_size as f32;
+            let iter_time = iter_start.elapsed();
 
-            // Monitor: grad norm for NaN debugging
-            let grad_norm: f64 = varmap.all_vars().iter().map(|v| {
-                v.to_vec1::<f32>().unwrap_or_default().iter().map(|&g| (g as f64) * (g as f64)).sum::<f64>()
-            }).sum::<f64>().sqrt();
-
-            if iter % 50 == 0 || iter == total_iters - 1 || total_loss.is_nan() {
-                println!("{:>6} {:>10.4} {:>10.1?}  grad_norm={:.4}", iter, total_loss, iter_start.elapsed(), grad_norm);
-                if total_loss.is_nan() {
-                    eprintln!("  NaN detected at iter {iter}. Stopping.");
-                    break;
-                }
+            // JSONL telemetry (survives crashes)
+            if let Some(ref log) = log_file {
+                use std::io::Write;
+                let entry = format!(
+                    "{{\"iter\":{},\"loss\":{:.4},\"lr\":{:.6},\"grad_norm\":{:.4},\"time_ms\":{},\"nan_skips\":{}}}\n",
+                    iter, total_loss, current_lr, 0.0, iter_time.as_millis(), nan_skip_count
+                );
+                let _ = (&*log).write_all(entry.as_bytes());
             }
 
-            // Periodic checkpoint: save every 500 iters (both safetensors + WCHK)
-            if (iter + 1) % 500 == 0 || iter == total_iters - 1 {
-                // Safetensors (for Candle resume)
+            if iter % 50 == 0 || iter == total_iters - 1 {
+                println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}", iter, total_loss, iter_time, current_lr);
+            }
+
+            // Periodic checkpoint: save every 100 iters until leak is confirmed fixed
+            if (iter + 1) % 100 == 0 || iter == total_iters - 1 {
                 let st_path = format!("candle_checkpoint_iter{}.safetensors", iter + 1);
-                let meta = format!("iter={}\nloss={}\nlr={}\nvocab_size={}\n", iter + 1, total_loss, lr, vocab_size);
+                let meta = format!("iter={}\nloss={}\nlr={}\nvocab_size={}\n", iter + 1, total_loss, current_lr, vocab_size);
                 if varmap.save(&st_path).is_ok() {
                     std::fs::write(format!("candle_checkpoint_iter{}.meta", iter + 1), &meta).ok();
                     println!("  Checkpoint: {st_path}");
@@ -687,7 +712,6 @@ pub mod engine {
                 let _ = varmap.save("candle_checkpoint_latest.safetensors");
                 std::fs::write("candle_checkpoint_latest.meta", &meta).ok();
 
-                // WCHK (for wave-server + cross-tier resume)
                 let params = extract_wchk_params(&varmap, N_LAYERS, N_EMBD, MAESTRO_DIM, vocab_size);
                 let dummy_adam = crate::train::Adam::new(lr as f32, params.len());
                 crate::wave_checkpoint::save_checkpoint(
@@ -697,6 +721,9 @@ pub mod engine {
             }
         }
 
+        if nan_skip_count > 0 {
+            println!("  Warning: {nan_skip_count} NaN steps skipped during training");
+        }
         println!("\nTraining complete. Total: {:.1?}", train_start.elapsed());
         Ok(())
     }
