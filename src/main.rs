@@ -845,9 +845,9 @@ fn print_help() {
     println!("    --layers N        Number of transformer blocks           [default: 24]");
     println!();
     println!("RESUME:");
-    println!("    --resume FILE     Resume training from a WCHK checkpoint. Restores model");
-    println!("                      weights, optimizer state (Adam m/v/t), and RNG state.");
-    println!("                      Training continues from saved iteration count.");
+    println!("    --resume FILE     Resume training from checkpoint.");
+    println!("                      CPU/wgpu: WCHK .bin file (restores weights + Adam + RNG)");
+    println!("                      Candle:   .safetensors file (restores weights only)");
     println!("    --no-curriculum   Disable progressive band curriculum (all bands from start)");
     println!();
     println!("TOKENIZER:");
@@ -866,8 +866,10 @@ fn print_help() {
     println!("    MAESTRO_DIM = 16  Maestro bottleneck width (48:1 compression)");
     println!("    RK4_STEPS = 16    ODE integration steps per layer");
     println!();
-    println!("OUTPUT:");
-    println!("    checkpoint.bin    WCHK format, loadable by wave-server");
+    println!("CHECKPOINTS (saved every 500 iters):");
+    println!("    checkpoint.bin                       WCHK — wave-server compatible, all tiers");
+    println!("    candle_checkpoint_iter500.safetensors Candle resume format");
+    println!("    checkpoint_iter500.bin                CPU/wgpu resume format");
     println!();
     println!("EXAMPLES:");
     println!("    # Quick test (4 layers, char-level, 64 context)");
@@ -878,6 +880,12 @@ fn print_help() {
     println!();
     println!("    # Candle CUDA backend");
     println!("    wave-engine data/input.txt --candle --bpe --iters 3000");
+    println!();
+    println!("    # Resume from checkpoint (CPU/wgpu)");
+    println!("    wave-engine data/input.txt --resume checkpoint_iter2000.bin --iters 1000");
+    println!();
+    println!("    # Resume from checkpoint (Candle)");
+    println!("    wave-engine data/input.txt --candle --bpe --resume candle_checkpoint_iter2000.safetensors --iters 1000");
     println!();
     println!("THREE TIERS:");
     println!("    CPU       Any hardware, gold standard precision");
