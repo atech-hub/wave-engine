@@ -548,11 +548,29 @@ pub mod engine {
         println!("  Train tokens: {}", train_data.len());
 
         // Model
-        let varmap = VarMap::new();
+        let mut varmap = VarMap::new();
         let model = CandleWaveModel::new(&varmap, vocab_size, &device)?;
         let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
         println!("  Trainable params: {n_params}");
         println!("  Architecture: {N_LAYERS} layers, {N_HEAD} heads, {N_BANDS} bands");
+
+        // Resume from checkpoint if --resume flag
+        let resume_path: Option<String> = std::env::args().skip_while(|a| a != "--resume").nth(1);
+        let mut start_iter = 0usize;
+        if let Some(ref ckpt) = resume_path {
+            println!("  Resuming from: {ckpt}");
+            varmap.load(ckpt)?;
+            // Read iter from .meta file
+            let meta_path = ckpt.replace(".safetensors", ".meta");
+            if let Ok(meta) = std::fs::read_to_string(&meta_path) {
+                for line in meta.lines() {
+                    if let Some(v) = line.strip_prefix("iter=") {
+                        start_iter = v.parse().unwrap_or(0);
+                    }
+                }
+            }
+            println!("  Resumed at iter {start_iter}");
+        }
 
         // CLI flag parsing for Candle path
         fn parse_flag_c<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -579,15 +597,17 @@ pub mod engine {
             crate::train::CurriculumSchedule::none(N_BANDS)
         };
 
+        let total_iters = start_iter + n_iters;
         println!("\nTraining for {n_iters} iters (batch={batch_size}, seq={seq_len}, lr={lr})");
-        curriculum.describe(n_iters);
+        if start_iter > 0 { println!("  Resuming from iter {start_iter}, target {total_iters}"); }
+        curriculum.describe(total_iters);
         println!("{:>6} {:>10} {:>10}", "Iter", "Loss", "Time");
         println!("{}", "-".repeat(35));
 
         let train_start = Instant::now();
 
-        for iter in 0..n_iters {
-            let band_masks = curriculum.band_masks(iter, n_iters, N_BANDS);
+        for iter in start_iter..total_iters {
+            let band_masks = curriculum.band_masks(iter, total_iters, N_BANDS);
             let iter_start = Instant::now();
             let mut total_loss = 0.0f32;
 
@@ -647,17 +667,80 @@ pub mod engine {
                 v.to_vec1::<f32>().unwrap_or_default().iter().map(|&g| (g as f64) * (g as f64)).sum::<f64>()
             }).sum::<f64>().sqrt();
 
-            if iter % 50 == 0 || iter == n_iters - 1 || total_loss.is_nan() {
+            if iter % 50 == 0 || iter == total_iters - 1 || total_loss.is_nan() {
                 println!("{:>6} {:>10.4} {:>10.1?}  grad_norm={:.4}", iter, total_loss, iter_start.elapsed(), grad_norm);
                 if total_loss.is_nan() {
                     eprintln!("  NaN detected at iter {iter}. Stopping.");
                     break;
                 }
             }
+
+            // Periodic checkpoint: save every 500 iters (both safetensors + WCHK)
+            if (iter + 1) % 500 == 0 || iter == total_iters - 1 {
+                // Safetensors (for Candle resume)
+                let st_path = format!("candle_checkpoint_iter{}.safetensors", iter + 1);
+                let meta = format!("iter={}\nloss={}\nlr={}\nvocab_size={}\n", iter + 1, total_loss, lr, vocab_size);
+                if varmap.save(&st_path).is_ok() {
+                    std::fs::write(format!("candle_checkpoint_iter{}.meta", iter + 1), &meta).ok();
+                    println!("  Checkpoint: {st_path}");
+                }
+                let _ = varmap.save("candle_checkpoint_latest.safetensors");
+                std::fs::write("candle_checkpoint_latest.meta", &meta).ok();
+
+                // WCHK (for wave-server + cross-tier resume)
+                let params = extract_wchk_params(&varmap, N_LAYERS, N_EMBD, MAESTRO_DIM, vocab_size);
+                let dummy_adam = crate::train::Adam::new(lr as f32, params.len());
+                crate::wave_checkpoint::save_checkpoint(
+                    &params, vocab_size, N_LAYERS, iter + 1, lr as f32,
+                    &dummy_adam, 0, "checkpoint.bin",
+                );
+            }
         }
 
         println!("\nTraining complete. Total: {:.1?}", train_start.elapsed());
         Ok(())
+    }
+
+    /// Extract params from VarMap in WCHK flatten_params order.
+    /// Order: per block (ln_w, ln_b, ln_ffn_w, ln_ffn_b, mae_in_sq, mae_in_pr,
+    ///   mae_out_sq, mae_out_pr, out_proj), then ln_f_w, ln_f_b, lm_head.
+    fn extract_wchk_params(varmap: &VarMap, n_layers: usize, n_embd: usize, maestro_dim: usize, vocab_size: usize) -> Vec<f32> {
+        let mut params = Vec::new();
+
+        let get_flat = |name: &str| -> Vec<f32> {
+            let data = varmap.data().lock().unwrap();
+            data.get(name).map(|t| t.flatten_all().unwrap().to_vec1::<f32>().unwrap()).unwrap_or_default()
+        };
+
+        for i in 0..n_layers {
+            let p = format!("block.{i}");
+            // LN weights (trained)
+            params.extend(get_flat(&format!("{p}.ln_w")));
+            params.extend(get_flat(&format!("{p}.ln_b")));
+            // LN FFN — Candle doesn't have separate ln_ffn, use ones/zeros as placeholder
+            params.extend(vec![1.0f32; n_embd]); // ln_ffn weight
+            params.extend(vec![0.0f32; n_embd]); // ln_ffn bias
+            // Maestro in: squeeze (n_embd → maestro_dim), process (maestro_dim → n_embd)
+            params.extend(get_flat(&format!("{p}.mae_in_sq.weight")));
+            params.extend(get_flat(&format!("{p}.mae_in_sq.bias")));
+            params.extend(get_flat(&format!("{p}.mae_in_pr.weight")));
+            params.extend(get_flat(&format!("{p}.mae_in_pr.bias")));
+            // Maestro out
+            params.extend(get_flat(&format!("{p}.mae_out_sq.weight")));
+            params.extend(get_flat(&format!("{p}.mae_out_sq.bias")));
+            params.extend(get_flat(&format!("{p}.mae_out_pr.weight")));
+            params.extend(get_flat(&format!("{p}.mae_out_pr.bias")));
+            // Out proj
+            params.extend(get_flat(&format!("{p}.out_proj.weight")));
+            params.extend(get_flat(&format!("{p}.out_proj.bias")));
+        }
+        // ln_f
+        params.extend(get_flat("ln_f_w"));
+        params.extend(get_flat("ln_f_b"));
+        // lm_head
+        params.extend(get_flat("lm_head"));
+
+        params
     }
 }
 

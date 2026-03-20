@@ -304,11 +304,19 @@ pub fn run_training(config: TrainConfig) {
                 monitor.reset();
             }
         }
+
+        // Periodic checkpoint: save every 500 iters (all tiers)
+        if (iter + 1) % 500 == 0 {
+            let params = flatten_params(&model);
+            let path = format!("checkpoint_iter{}.bin", iter + 1);
+            wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), iter + 1, lr, &optimizer, rng.state(), &path);
+            println!("  Checkpoint: {path}");
+        }
     }
 
     println!("\nTraining complete. Total time: {:.1?}", train_start.elapsed());
 
-    // Save checkpoint
+    // Final checkpoint
     let params = flatten_params(&model);
     wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), total_iters, lr, &optimizer, rng.state(), "checkpoint.bin");
     println!("Checkpoint saved to checkpoint.bin");
