@@ -392,9 +392,28 @@ pub mod engine {
         }
 
         pub fn forward(&self, token_ids: &[usize]) -> Result<Tensor> {
+            self.forward_with_curriculum(token_ids, N_BANDS)
+        }
+
+        /// Forward with curriculum: soft-mask inactive bands on FFN path only.
+        /// Mask: 1.0 for active bands, 0.001 for inactive. Applied after LN, before FFN.
+        /// Attention sees full vector (frozen, doesn't learn). FFN sees masked vector (trains on active bands).
+        pub fn forward_with_curriculum(&self, token_ids: &[usize], active_bands: usize) -> Result<Tensor> {
             let n_pos = token_ids.len();
 
-            // Embedding: lookup + positional
+            // Build soft mask (GPU-resident, created once per call — cheap)
+            let ffn_mask = if active_bands < N_BANDS {
+                let mut mask_data = vec![1.0f32; N_EMBD];
+                for k in active_bands..N_BANDS {
+                    mask_data[k * 2] = 0.01;
+                    mask_data[k * 2 + 1] = 0.01;
+                }
+                Some(Tensor::from_vec(mask_data, (1, N_EMBD), &self.device)?)
+            } else {
+                None
+            };
+
+            // Embedding: lookup + positional (NO masking — LN needs full vector)
             let mut hidden_vecs = vec![0.0f32; n_pos * N_EMBD];
             let wte_data = self.wte.to_vec2::<f32>()?;
             let wpe_data = self.wpe.to_vec2::<f32>()?;
@@ -421,12 +440,19 @@ pub mod engine {
                     &block.attn_out_proj_w, &block.attn_out_proj_b,
                 )?;
 
-                // FFN (trained)
+                // FFN (trained) — soft-mask inactive bands (curriculum)
+                // Attention sees full normed (frozen, routes only).
+                // FFN sees masked normed (trains on active bands).
+                let ffn_input = match &ffn_mask {
+                    Some(mask) => normed.broadcast_mul(mask)?,
+                    None => normed.clone(),
+                };
+
                 // Maestro in
-                let mae_in = block.mae_in_sq.forward(&normed)?;
+                let mae_in = block.mae_in_sq.forward(&ffn_input)?;
                 let mae_in = mae_in.gelu()?;
                 let mae_in = block.mae_in_pr.forward(&mae_in)?;
-                let precond = (&normed + &mae_in)?;
+                let precond = (&ffn_input + &mae_in)?;
 
                 // Monitor precond max value
                 let precond_vals = precond.to_vec2::<f32>()?;
@@ -544,13 +570,23 @@ pub mod engine {
         )?;
         let mut rng = crate::rng::Rng::new(1337);
 
+        // Curriculum: soft-mask inactive bands (0.01 scale, not zero)
+        let use_curriculum = !std::env::args().any(|a| a == "--no-curriculum");
+        let curriculum = if use_curriculum {
+            crate::train::CurriculumSchedule::default_4stage(N_BANDS)
+        } else {
+            crate::train::CurriculumSchedule::none(N_BANDS)
+        };
+
         println!("\nTraining for {n_iters} iters (batch={batch_size}, seq={seq_len}, lr={lr})");
-        println!("{:>6} {:>10} {:>10} {:>12} {:>12}", "Iter", "Loss", "Time", "Fwd(ms)", "Bwd(ms)");
-        println!("{}", "-".repeat(55));
+        curriculum.describe(n_iters);
+        println!("{:>6} {:>10} {:>10}", "Iter", "Loss", "Time");
+        println!("{}", "-".repeat(35));
 
         let train_start = Instant::now();
 
         for iter in 0..n_iters {
+            let active_bands = curriculum.active_bands(iter, n_iters);
             let iter_start = Instant::now();
             let mut total_loss = 0.0f32;
 
@@ -561,7 +597,7 @@ pub mod engine {
 
                 // Forward with timing
                 let t_fwd = Instant::now();
-                let logits = model.forward(input)?;
+                let logits = model.forward_with_curriculum(input, active_bands)?;
                 let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
 
                 // Loss
