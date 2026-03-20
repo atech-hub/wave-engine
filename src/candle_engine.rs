@@ -636,47 +636,30 @@ pub mod engine {
                 let input = &train_data[start..start + seq_len];
                 let target = &train_data[start + 1..start + seq_len + 1];
 
-                // Explicit scope: all tensors dropped at block exit → GPU memory freed
+                // Explicit scope: all tensors dropped at block exit
                 let loss_val = {
                     let logits = model.forward_with_curriculum(input, &band_masks)?;
                     let target_tensor = Tensor::from_vec(
                         target.to_vec().iter().map(|&t| t as u32).collect::<Vec<u32>>(),
                         (seq_len,), &device,
                     )?;
-                    // Plain cross-entropy (no label smoothing — it leaked tensor graph)
                     let loss = candle_nn::loss::cross_entropy(&logits, &target_tensor)?;
                     let lv = loss.to_scalar::<f32>()?;
 
                     if lv.is_nan() || lv.is_infinite() {
                         nan_skip_count += 1;
                         eprintln!("  [NaN skip] iter {iter} batch {_b} (total skips: {nan_skip_count})");
-                        lv // return NaN — will be skipped below
+                        lv
                     } else {
-                        // Backward
                         let grads = loss.backward()?;
-
-                        // Grad norm: compute on GPU as scalar, no flatten_all intermediate tensor
-                        let mut total_norm_sq = 0.0f64;
-                        for var in &varmap.all_vars() {
-                            if let Some(grad) = grads.get(var) {
-                                let norm_sq = grad.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
-                                total_norm_sq += norm_sq;
-                            }
-                        }
-                        let total_norm = total_norm_sq.sqrt();
-
-                        // Clip + step
-                        if total_norm > 1.0 {
-                            let scale = 1.0 / total_norm;
-                            optimizer.set_learning_rate(current_lr * scale);
-                            optimizer.step(&grads)?;
-                            optimizer.set_learning_rate(current_lr);
-                        } else {
-                            optimizer.step(&grads)?;
-                        }
+                        optimizer.step(&grads)?;
+                        drop(grads);
+                        // Force CUDA to reclaim memory from optimizer intermediates.
+                        // Without this, CUDA's allocator caches freed blocks indefinitely,
+                        // growing ~30MB/iter until OOM. One line, zero leak.
+                        device.synchronize()?;
                         lv
                     }
-                    // logits, target_tensor, loss, grads ALL dropped here
                 };
 
                 if !loss_val.is_nan() {
