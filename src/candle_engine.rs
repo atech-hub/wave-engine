@@ -652,7 +652,24 @@ pub mod engine {
                         lv
                     } else {
                         let grads = loss.backward()?;
-                        optimizer.step(&grads)?;
+                        // Gradient clipping via LR scaling.
+                        // Pull grad values to CPU for norm computation (no GPU intermediate tensors).
+                        let mut gnorm_sq = 0.0f64;
+                        for var in &varmap.all_vars() {
+                            if let Some(grad) = grads.get(var) {
+                                // to_vec1 works for 1D, use flatten for higher dims
+                                let g: Vec<f32> = grad.flatten_all()?.to_vec1::<f32>()?;
+                                for &v in &g { gnorm_sq += (v as f64) * (v as f64); }
+                            }
+                        }
+                        let gnorm = gnorm_sq.sqrt();
+                        if gnorm > 1.0 {
+                            optimizer.set_learning_rate(current_lr / gnorm);
+                            optimizer.step(&grads)?;
+                            optimizer.set_learning_rate(current_lr);
+                        } else {
+                            optimizer.step(&grads)?;
+                        }
                         drop(grads);
                         // Force CUDA to reclaim memory from optimizer intermediates.
                         // Without this, CUDA's allocator caches freed blocks indefinitely,
