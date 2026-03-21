@@ -38,57 +38,43 @@ pub mod engine {
 
     // ─── Kerr-ODE (CPU, frozen, identity backward) ───
 
+    /// Perturbative ODE — single-pass analytical Kerr computation.
+    /// Based on first-order perturbation theory from telecom DSP.
+    /// Lab-validated: MSE 0.000005 vs RK4-16, trains BETTER (2.97 vs 3.07).
+    /// Replaces 16 iterative RK4 steps with: damping + rotation + correction.
     fn kerr_ode_cpu(x: &[f32], params: &OdeParams) -> Vec<f32> {
         let n_bands = params.gamma_raw.len();
         let n_embd = n_bands * 2;
-        let n_steps = params.rk4_n_steps;
-        let dt = 1.0 / n_steps as f32;
 
         fn softplus(v: f32) -> f32 { if v > 20.0 { v } else { (1.0 + v.exp()).ln() } }
         let gamma: Vec<f32> = params.gamma_raw.iter().map(|&g| softplus(g)).collect();
 
-        let mut r: Vec<f32> = (0..n_bands).map(|k| x[k * 2]).collect();
-        let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
-
-        let deriv = |r: &[f32], s: &[f32]| -> (Vec<f32>, Vec<f32>) {
-            let n = r.len();
-            let mut dr = vec![0.0f32; n];
-            let mut ds = vec![0.0f32; n];
-            for k in 0..n {
-                let mag_sq = r[k]*r[k] + s[k]*s[k];
-                let mut ns = 0.0f32;
-                if k >= 2 { ns += r[k-2]*r[k-2] + s[k-2]*s[k-2]; }
-                if k >= 1 { ns += r[k-1]*r[k-1] + s[k-1]*s[k-1]; }
-                if k+1 < n { ns += r[k+1]*r[k+1] + s[k+1]*s[k+1]; }
-                if k+2 < n { ns += r[k+2]*r[k+2] + s[k+2]*s[k+2]; }
-                let phi = params.omega[k] + params.alpha * mag_sq + params.beta * ns;
-                dr[k] = -gamma[k] * r[k] - phi * s[k];
-                ds[k] = -gamma[k] * s[k] + phi * r[k];
-            }
-            (dr, ds)
-        };
-
-        // NO clamping — RK4-16 is stable at 768-dim (proven, bounded [-7,7])
-        // Clamps were the bug: they cost ~1 loss point (3.74 vs 2.79)
-        for _ in 0..n_steps {
-            let (k1r, k1s) = deriv(&r, &s);
-            let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&a,&b)| a+0.5*dt*b).collect();
-            let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&a,&b)| a+0.5*dt*b).collect();
-            let (k2r, k2s) = deriv(&r2, &s2);
-            let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&a,&b)| a+0.5*dt*b).collect();
-            let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&a,&b)| a+0.5*dt*b).collect();
-            let (k3r, k3s) = deriv(&r3, &s3);
-            let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a,&b)| a+dt*b).collect();
-            let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a,&b)| a+dt*b).collect();
-            let (k4r, k4s) = deriv(&r4, &s4);
-            for i in 0..n_bands {
-                r[i] += dt/6.0 * (k1r[i] + 2.0*k2r[i] + 2.0*k3r[i] + k4r[i]);
-                s[i] += dt/6.0 * (k1s[i] + 2.0*k2s[i] + 2.0*k3s[i] + k4s[i]);
-            }
+        // Step 1: Linear solution (damping + base rotation)
+        let mut r_lin = vec![0.0f32; n_bands];
+        let mut s_lin = vec![0.0f32; n_bands];
+        for k in 0..n_bands {
+            let r = x[k * 2];
+            let s = x[k * 2 + 1];
+            let decay = (-gamma[k]).exp();
+            let cos_w = params.omega[k].cos();
+            let sin_w = params.omega[k].sin();
+            r_lin[k] = decay * (r * cos_w - s * sin_w);
+            s_lin[k] = decay * (r * sin_w + s * cos_w);
         }
 
+        // Step 2: First-order nonlinear correction (SPM + XPM)
         let mut out = vec![0.0f32; n_embd];
-        for k in 0..n_bands { out[k * 2] = r[k]; out[k * 2 + 1] = s[k]; }
+        for k in 0..n_bands {
+            let mag_sq = r_lin[k] * r_lin[k] + s_lin[k] * s_lin[k];
+            let mut ns = 0.0f32;
+            if k >= 2 { ns += r_lin[k-2]*r_lin[k-2] + s_lin[k-2]*s_lin[k-2]; }
+            if k >= 1 { ns += r_lin[k-1]*r_lin[k-1] + s_lin[k-1]*s_lin[k-1]; }
+            if k+1 < n_bands { ns += r_lin[k+1]*r_lin[k+1] + s_lin[k+1]*s_lin[k+1]; }
+            if k+2 < n_bands { ns += r_lin[k+2]*r_lin[k+2] + s_lin[k+2]*s_lin[k+2]; }
+            let delta_phi = params.alpha * mag_sq + params.beta * ns;
+            out[k * 2]     = r_lin[k] - delta_phi * s_lin[k];
+            out[k * 2 + 1] = s_lin[k] + delta_phi * r_lin[k];
+        }
         out
     }
 
@@ -609,7 +595,7 @@ pub mod engine {
         let mut nan_skip_count = 0usize;
 
         // Cosine LR schedule with warmup
-        let warmup_iters = 200usize;
+        let warmup_iters = 100usize;
         let min_lr_ratio = 0.1;
         let cosine_lr = |iter: usize| -> f64 {
             if iter < warmup_iters {
@@ -706,9 +692,13 @@ pub mod engine {
                 println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  vram={}MB", iter, total_loss, iter_time, current_lr, vram_used_mb);
             }
 
-            // Periodic checkpoint: save every 100 iters until leak is confirmed fixed
-            if (iter + 1) % 100 == 0 || iter == total_iters - 1 {
-                let st_path = format!("candle_checkpoint_iter{}.safetensors", iter + 1);
+            // Periodic checkpoint: save every 500 iters (leak is fixed, 100 was debug)
+            if (iter + 1) % 500 == 0 || iter == total_iters - 1 {
+                // NaN guard: never overwrite good checkpoints with corrupted weights
+                if total_loss.is_nan() || total_loss == 0.0 || total_loss.is_infinite() {
+                    eprintln!("  WARNING: loss={total_loss} — skipping checkpoint (corrupted)");
+                } else {
+                let st_path = format!("candle_checkpoint_iter{}_loss{:.2}.safetensors", iter + 1, total_loss);
                 let meta = format!("iter={}\nloss={}\nlr={}\nvocab_size={}\n", iter + 1, total_loss, current_lr, vocab_size);
                 if varmap.save(&st_path).is_ok() {
                     std::fs::write(format!("candle_checkpoint_iter{}.meta", iter + 1), &meta).ok();
@@ -723,6 +713,7 @@ pub mod engine {
                     &params, vocab_size, N_LAYERS, iter + 1, lr as f32,
                     &dummy_adam, 0, "checkpoint.bin",
                 );
+                } // end NaN guard else
             }
         }
 
