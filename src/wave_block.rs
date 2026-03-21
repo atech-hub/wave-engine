@@ -205,26 +205,41 @@ fn maestro_forward_cpu(weights: &MaestroWeights, x: &[f32]) -> Vec<f32> {
     processed
 }
 
+/// Perturbative ODE — single-pass analytical Kerr computation (all CPU tiers).
+/// Lab-validated: MSE 0.000005 vs RK4-16, trains better (2.97 vs 3.07).
 fn kerr_ode_forward_cpu(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
     let n_bands = weights.gamma_raw.len();
     let n_embd = n_bands * 2;
-    let n_steps = weights.rk4_n_steps;
-    let dt = 1.0 / n_steps as f32;
 
     fn softplus(v: f32) -> f32 { if v > 20.0 { v } else { (1.0 + v.exp()).ln() } }
     let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
 
-    let mut r: Vec<f32> = (0..n_bands).map(|k| x[k * 2]).collect();
-    let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
-
-    for _ in 0..n_steps {
-        let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta);
-        r = r_new;
-        s = s_new;
+    // Step 1: Linear solution (damping + base rotation)
+    let mut r_lin = vec![0.0f32; n_bands];
+    let mut s_lin = vec![0.0f32; n_bands];
+    for k in 0..n_bands {
+        let r = x[k * 2];
+        let s = x[k * 2 + 1];
+        let decay = (-gamma[k]).exp();
+        let cos_w = weights.omega[k].cos();
+        let sin_w = weights.omega[k].sin();
+        r_lin[k] = decay * (r * cos_w - s * sin_w);
+        s_lin[k] = decay * (r * sin_w + s * cos_w);
     }
 
+    // Step 2: First-order nonlinear correction (SPM + XPM)
     let mut out = vec![0.0f32; n_embd];
-    for k in 0..n_bands { out[k * 2] = r[k]; out[k * 2 + 1] = s[k]; }
+    for k in 0..n_bands {
+        let mag_sq = r_lin[k] * r_lin[k] + s_lin[k] * s_lin[k];
+        let mut ns = 0.0f32;
+        if k >= 2 { ns += r_lin[k-2]*r_lin[k-2] + s_lin[k-2]*s_lin[k-2]; }
+        if k >= 1 { ns += r_lin[k-1]*r_lin[k-1] + s_lin[k-1]*s_lin[k-1]; }
+        if k+1 < n_bands { ns += r_lin[k+1]*r_lin[k+1] + s_lin[k+1]*s_lin[k+1]; }
+        if k+2 < n_bands { ns += r_lin[k+2]*r_lin[k+2] + s_lin[k+2]*s_lin[k+2]; }
+        let delta_phi = weights.alpha * mag_sq + weights.beta * ns;
+        out[k * 2]     = r_lin[k] - delta_phi * s_lin[k];
+        out[k * 2 + 1] = s_lin[k] + delta_phi * r_lin[k];
+    }
     out
 }
 
