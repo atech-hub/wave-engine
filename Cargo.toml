@@ -8,6 +8,7 @@ repository = "https://github.com/atech-hub/wave-engine"
 authors = ["Marco Da Cunha"]
 keywords = ["machine-learning", "neural-network", "wave-coherence", "gpu", "training"]
 categories = ["science", "mathematics"]
+default-run = "wave-engine"
 
 [features]
 default = []
@@ -29,3 +30,15 @@ rustfft = "6.2"
 candle-core = { version = "0.9", optional = true, features = ["cuda"] }
 candle-nn = { version = "0.9", optional = true }
 candle-cuda-vmm = { version = "0.1", optional = true }
+
+[[bin]]
+name = "wave-engine"
+path = "src/main.rs"
+
+[[bin]]
+name = "ode-bench"
+path = "lab/ode_bench.rs"
+
+[[bin]]
+name = "ode-train-test"
+path = "lab/ode_train_test.rs"
