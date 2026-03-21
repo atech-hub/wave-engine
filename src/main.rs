@@ -59,6 +59,7 @@ mod rng;
 mod train;
 mod wave_checkpoint;
 mod token_cache;
+mod gpu_ode;
 
 use wave_embed::*;
 use wave_attn::*;

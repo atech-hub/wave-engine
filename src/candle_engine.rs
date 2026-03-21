@@ -284,6 +284,7 @@ pub mod engine {
         mae_in_sq: Linear,
         mae_in_pr: Linear,
         ode_params: OdeParams,
+        gpu_ode_params: crate::gpu_ode::gpu_ode::GpuOdeParams,
         mae_out_sq: Linear,
         mae_out_pr: Linear,
         out_proj: Linear,
@@ -359,12 +360,16 @@ pub mod engine {
                     beta: 0.1,
                     rk4_n_steps: RK4_STEPS,
                 };
+                let gpu_ode_params = crate::gpu_ode::gpu_ode::GpuOdeParams::new(
+                    &ode_params.gamma_raw, &ode_params.omega,
+                    ode_params.alpha, ode_params.beta, device,
+                )?;
 
                 blocks.push(CandleBlock {
                     ln_w, ln_b,
                     phase_proj_ws, phase_proj_bs, v_proj_ws, v_proj_bs,
                     harmonic_ns, attn_out_proj_w, attn_out_proj_b,
-                    mae_in_sq, mae_in_pr, ode_params, mae_out_sq, mae_out_pr, out_proj,
+                    mae_in_sq, mae_in_pr, ode_params, gpu_ode_params, mae_out_sq, mae_out_pr, out_proj,
                 });
             }
 
@@ -450,7 +455,8 @@ pub mod engine {
                 }
 
                 // ODE via CustomOp1 — forward runs RK4 (no clamping), backward is identity
-                let effective_ode_out = kerr_ode_batch(&precond, &block.ode_params)?;
+                // GPU-native perturbative ODE — zero CPU transfers, true autograd backward
+                let effective_ode_out = crate::gpu_ode::gpu_ode::kerr_ode_gpu(&precond, &block.gpu_ode_params)?;
 
                 // Maestro out (operates on effective ODE output — gradients flow through precond)
                 let mae_out = block.mae_out_sq.forward(&effective_ode_out)?;
