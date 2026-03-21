@@ -60,6 +60,7 @@ mod train;
 mod wave_checkpoint;
 mod token_cache;
 mod gpu_ode;
+mod block_diagonal;
 
 use wave_embed::*;
 use wave_attn::*;
