@@ -552,9 +552,16 @@ pub mod engine {
         if let Some(ref ckpt) = resume_path {
             println!("  Resuming from: {ckpt}");
             varmap.load(ckpt)?;
-            // Read iter from .meta file
+            // Read iter from .meta file (try exact match, then strip loss suffix)
             let meta_path = ckpt.replace(".safetensors", ".meta");
-            if let Ok(meta) = std::fs::read_to_string(&meta_path) {
+            let meta_content = std::fs::read_to_string(&meta_path)
+                .or_else(|_| {
+                    // Try stripping _lossN.NN from filename
+                    let stripped = meta_path.split("_loss").next().unwrap_or(&meta_path);
+                    std::fs::read_to_string(format!("{stripped}.meta"))
+                })
+                .or_else(|_| std::fs::read_to_string("candle_checkpoint_latest.meta"));
+            if let Ok(meta) = meta_content {
                 for line in meta.lines() {
                     if let Some(v) = line.strip_prefix("iter=") {
                         start_iter = v.parse().unwrap_or(0);
@@ -707,7 +714,7 @@ pub mod engine {
                 let st_path = format!("candle_checkpoint_iter{}_loss{:.2}.safetensors", iter + 1, total_loss);
                 let meta = format!("iter={}\nloss={}\nlr={}\nvocab_size={}\n", iter + 1, total_loss, current_lr, vocab_size);
                 if varmap.save(&st_path).is_ok() {
-                    std::fs::write(format!("candle_checkpoint_iter{}.meta", iter + 1), &meta).ok();
+                    std::fs::write(format!("candle_checkpoint_iter{}_loss{:.2}.meta", iter + 1, total_loss), &meta).ok();
                     println!("  Checkpoint: {st_path}");
                 }
                 let _ = varmap.save("candle_checkpoint_latest.safetensors");
