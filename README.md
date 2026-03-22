@@ -64,13 +64,40 @@ Tokenizer:
   --bpe               Use BPE tokenizer (default: character-level)
   --tokenizer FILE    Path to HuggingFace tokenizer.json (default: data/tokenizer.json)
 
+Architecture (runtime configurable):
+  --n-bands N         Harmonic frequency bands (default: 384, embedding dim = N×2)
+  --n-head N          Attention heads (default: 12)
+  --maestro-dim N     Maestro bottleneck width (default: 16)
+  --rk4-steps N       ODE integration steps, 1=perturbative (default: 16)
+  --out-proj-groups N Block-diagonal groups, 1=dense (default: 6)
+
 GPU:
   --gpu               Enable wgpu GPU acceleration (any GPU)
   --candle            Use Candle/CUDA backend (NVIDIA only, requires candle-backend feature)
 
 Monitoring:
   --monitor           Enable always-on pipeline timing (per-section FFN breakdown)
+
+Resume:
+  --resume FILE       Resume training from WCHK checkpoint
+  --no-curriculum     Disable progressive band curriculum
 ```
+
+### Always-On Monitors
+
+These run automatically during training — no flags needed:
+
+| Monitor | Output | Description |
+|---------|--------|-------------|
+| Loss + time | Console | Per-iteration loss and wall-clock time |
+| Gradient norm | Console | `gnorm=` after each iteration |
+| NaN recovery | Console | Detects NaN loss, skips step, logs count, continues |
+| VRAM tracking | Console (Candle) | Real-time GPU memory via cudarc `mem_get_info` |
+| JSONL telemetry | `training_log.jsonl` | Per-iteration: loss, lr, time_ms, vram_mb, nan_skips |
+| Checkpoint guard | — | Refuses to save when loss is NaN/Inf/zero |
+| Loss in filename | Checkpoint | `checkpoint_iter500_loss2.48.bin` for quick comparison |
+
+The `--monitor` flag adds per-section FFN timing on top of these.
 
 ## Features
 
@@ -203,36 +230,45 @@ This connection is implemented in `fft_ode.rs` using rustfft, with a GPU FFT sha
 
 ```
 src/
-├── main.rs              Training loop, CLI, model init
-├── wave_attn.rs         Harmonic coherence attention (frozen)
-├── wave_block.rs        Dual-maestro Kerr-ODE FFN
-├── wave_embed.rs        Frozen harmonic + positional embeddings
-├── ffn_backend.rs       CPU/GPU FFN routing via ComputeBackend
-├── ffn_gpu.rs           Ping-pong GPU buffer management
-├── fft_ode.rs           OFDM-inspired FFT ODE derivative
-├── candle_engine.rs     Candle/CUDA backend
-├── monitor.rs           Always-on pipeline timing
-├── backend.rs           ComputeBackend trait (CPU/GPU abstraction)
-├── gpu_pipelines.rs     wgpu pipeline + shader compilation
-├── gpu_dispatch.rs      GPU ComputeBackend implementation
-├── gpu_ops_forward.rs   GPU forward operations (including fused ODE)
-├── gpu_ops_backward.rs  GPU backward operations
-├── optim.rs             Adam optimizer
-├── bpe.rs               BPE tokenizer (HuggingFace format)
-├── checkpoint.rs        WCHK checkpoint save/load with resume
-└── rng.rs               Deterministic PRNG
+├── main.rs                  Training loop, CLI, model init, re-export shims
+├── common/                  Shared modules (all tiers)
+│   ├── model.rs             Weight structs, OutProjWeights enum, layer_norm, gelu, linear
+│   ├── attn.rs              Harmonic coherence attention (frozen)
+│   ├── block.rs             Parallel block (GPT-J formulation)
+│   ├── ffn.rs               FFN routing via ComputeBackend
+│   ├── embed.rs             Frozen harmonic + positional embeddings
+│   ├── checkpoint.rs        WCHK v2 checkpoint save/load with resume
+│   ├── fft_ode.rs           OFDM-inspired FFT ODE derivative
+│   └── optim.rs             Adam optimizer
+├── cpu/
+│   └── train.rs             CPU/wgpu training loop
+├── wgpu_tier/               Cross-platform GPU backend
+│   ├── pipelines.rs         Pipeline + shader compilation (35 shaders)
+│   ├── dispatch.rs          ComputeBackend trait implementation
+│   ├── ops_forward.rs       Forward ops (fused RK4, perturbative, block-diagonal)
+│   ├── ops_backward.rs      Backward ops (analytical gradients)
+│   ├── resident.rs          Pre-uploaded weight buffers (zero per-iter allocation)
+│   ├── buffers.rs           Buffer pool with cache-by-pointer
+│   └── ffn_gpu.rs           Ping-pong buffer management
+├── candle_tier/             NVIDIA CUDA backend
+│   ├── engine.rs            Candle training loop with autograd
+│   ├── ode.rs               GPU-native perturbative ODE
+│   └── block_diag.rs        Block-diagonal linear via Candle
+├── backend.rs               ComputeBackend trait (CPU/GPU abstraction)
+├── bpe.rs                   BPE tokenizer (HuggingFace format)
+├── monitor.rs               Always-on pipeline timing
+└── rng.rs                   Deterministic PRNG
 
-shaders/                 32+ WGSL compute shaders
-├── matvec_batch_tiled_kahan.wgsl    Forward matmul (256-thread, Kahan compensated)
+shaders/                     35 WGSL compute shaders
+├── kerr_perturbative_batch.wgsl         Single-dispatch perturbative ODE (14x speedup)
+├── matvec_block_diagonal_batch.wgsl     Block-diagonal batched matvec
+├── matvec_batch_tiled_kahan.wgsl        Forward matmul (256-thread, Kahan compensated)
 ├── matvec_backward_batch_tiled_kahan.wgsl  Backward d_x
-├── outer_product.wgsl               Backward d_W (Kahan compensated)
-├── fft_512.wgsl                     512-point radix-2 FFT
-├── kerr_step_batch.wgsl             Fused ODE forward
-└── ...                              Layer norm, GELU, attention, RK4, etc.
-
-data/
-├── input.txt            Shakespeare training data
-└── tokenizer.json       BPE tokenizer (HuggingFace format)
+├── outer_product.wgsl                   Backward d_W (Kahan compensated)
+├── fft_512.wgsl                         512-point radix-2 FFT
+├── kerr_step_batch.wgsl                 Fused ODE forward (RK4)
+├── kerr_backward_batch.wgsl             Analytical ODE backward
+└── ...                                  Layer norm, GELU, attention, RK4, etc.
 ```
 
 ## Requirements
