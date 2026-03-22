@@ -9,7 +9,7 @@ use crate::wave_attn::*;
 // Re-export model types so callers can use wave_block::KerrWeights etc.
 pub use crate::model::{
     LayerNormWeights, LinearWeights, MaestroWeights, KerrWeights,
-    KerrDualMaestroWeights, layer_norm, gelu,
+    KerrDualMaestroWeights, OutProjWeights, BlockDiagonalWeights, layer_norm, gelu,
 };
 
 /// Weights for one parallel wave block.
@@ -149,25 +149,8 @@ pub fn dual_maestro_forward_cached(
 
     // Out_proj: ping-pong GPU when available (Buffer A holds regulated_all for backward)
     let _ = gpu;
-    let output: Vec<Vec<f32>> = if let Some((bufs, gpu_be)) = ping_pong {
-        // Flatten regulated_all and weights
-        let reg_flat: Vec<f32> = regulated_all.iter().flat_map(|v| v.iter().copied()).collect();
-        let mut w_flat = Vec::with_capacity(n_embd * n_embd);
-        for row in &weights.out_proj.w { w_flat.extend_from_slice(row); }
-        let result_flat = bufs.forward_out_proj(gpu_be, &reg_flat, &w_flat, &weights.out_proj.b, t, n_embd);
-        // Buffer A now holds regulated_all in VRAM for backward
-        result_flat.chunks(n_embd).map(|c| c.to_vec()).collect()
-    } else {
-        regulated_all.iter().map(|regulated| {
-            let mut projected = vec![0.0f32; n_embd];
-            for i in 0..n_embd {
-                let mut sum = 0.0f32;
-                for j in 0..n_embd { sum += weights.out_proj.w[i][j] * regulated[j]; }
-                projected[i] = sum + weights.out_proj.b[i];
-            }
-            projected
-        }).collect()
-    };
+    // Out projection via OutProjWeights enum (GPU ping-pong disabled for block-diagonal)
+    let output = weights.out_proj.forward_batch(&regulated_all);
 
     let cache = FfnForwardCache {
         mae_in_sq: mae_in_sq_all,

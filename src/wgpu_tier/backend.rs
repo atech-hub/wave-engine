@@ -581,8 +581,8 @@ fn kerr_dual_maestro_add_cpu(weights: &KerrDualMaestroWeights, x: &[Vec<f32>]) -
         let mut regulated = vec![0.0f32; n_embd];
         for i in 0..n_embd { regulated[i] = kerr_out[i] + mae_out_out[i]; }
 
-        // 4. Output projection
-        let projected = linear_fn(&weights.out_proj.w, &weights.out_proj.b, &regulated);
+        // 4. Output projection (via OutProjWeights enum)
+        let projected = weights.out_proj.forward(&regulated);
         result.push(projected);
     }
 

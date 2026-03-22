@@ -186,7 +186,7 @@ pub fn run_training(config: TrainConfig) {
     let (mut model, start_iter, mut optimizer, mut rng);
     if let Some(ref ckpt) = config.resume_path {
         println!("Resuming from checkpoint: {ckpt}");
-        let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v) = wave_checkpoint::load_checkpoint(ckpt);
+        let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v, _ck_groups) = wave_checkpoint::load_checkpoint(ckpt);
         assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
         let mut m = init_model(vocab_size, 42, config.n_layers);
         unflatten_params(&mut m, &params);
@@ -309,7 +309,8 @@ pub fn run_training(config: TrainConfig) {
         if (iter + 1) % 500 == 0 {
             let params = flatten_params(&model);
             let path = format!("checkpoint_iter{}.bin", iter + 1);
-            wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), iter + 1, lr, &optimizer, rng.state(), &path);
+            let groups = model.blocks[0].ffn.out_proj.n_groups();
+            wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), groups, iter + 1, lr, &optimizer, rng.state(), &path);
             println!("  Checkpoint: {path}");
         }
     }
@@ -318,6 +319,7 @@ pub fn run_training(config: TrainConfig) {
 
     // Final checkpoint
     let params = flatten_params(&model);
-    wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), total_iters, lr, &optimizer, rng.state(), "checkpoint.bin");
+    let groups = model.blocks[0].ffn.out_proj.n_groups();
+    wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), groups, total_iters, lr, &optimizer, rng.state(), "checkpoint.bin");
     println!("Checkpoint saved to checkpoint.bin");
 }

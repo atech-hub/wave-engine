@@ -287,7 +287,7 @@ pub mod engine {
         gpu_ode_params: crate::gpu_ode::gpu_ode::GpuOdeParams,
         mae_out_sq: Linear,
         mae_out_pr: Linear,
-        out_proj: Linear,
+        out_proj: crate::block_diagonal::block_diag::BlockDiagonalLinear,
     }
 
     impl CandleWaveModel {
@@ -349,7 +349,9 @@ pub mod engine {
                 let mae_in_pr = linear_uniform(MAESTRO_DIM, N_EMBD, vs_block.pp("mae_in_pr"))?;
                 let mae_out_sq = linear_uniform(N_EMBD, MAESTRO_DIM, vs_block.pp("mae_out_sq"))?;
                 let mae_out_pr = linear_uniform(MAESTRO_DIM, N_EMBD, vs_block.pp("mae_out_pr"))?;
-                let out_proj = linear_uniform(N_EMBD, N_EMBD, vs_block.pp("out_proj"))?;
+                let out_proj = crate::block_diagonal::block_diag::BlockDiagonalLinear::new(
+                    N_EMBD, 6, vs_block.pp("out_proj"),  // 6 groups of 128 dims — 6x param reduction
+                )?;
 
                 // ODE params (frozen)
                 let gamma_raw_val = ((0.1f32).exp() - 1.0).ln();
@@ -722,8 +724,9 @@ pub mod engine {
 
                 let params = extract_wchk_params(&varmap, N_LAYERS, N_EMBD, MAESTRO_DIM, vocab_size);
                 let dummy_adam = crate::train::Adam::new(lr as f32, params.len());
+                let out_proj_groups = 6; // Candle uses 6-group block-diagonal
                 crate::wave_checkpoint::save_checkpoint(
-                    &params, vocab_size, N_LAYERS, iter + 1, lr as f32,
+                    &params, vocab_size, N_LAYERS, out_proj_groups, iter + 1, lr as f32,
                     &dummy_adam, 0, "checkpoint.bin",
                 );
                 } // end NaN guard else
@@ -767,8 +770,11 @@ pub mod engine {
             params.extend(get_flat(&format!("{p}.mae_out_pr.weight")));
             params.extend(get_flat(&format!("{p}.mae_out_pr.bias")));
             // Out proj
-            params.extend(get_flat(&format!("{p}.out_proj.weight")));
-            params.extend(get_flat(&format!("{p}.out_proj.bias")));
+            // Block-diagonal out_proj: 6 groups × (128×128 weight + 128 bias)
+            for g in 0..6 {
+                params.extend(get_flat(&format!("{p}.out_proj.g{g}.weight")));
+                params.extend(get_flat(&format!("{p}.out_proj.g{g}.bias")));
+            }
         }
         // ln_f
         params.extend(get_flat("ln_f_w"));

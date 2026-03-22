@@ -144,6 +144,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-cuda-vmm"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5277d607658736956c7d54f94d8e095270e32390c251c1cf950c1dc8761df79"
+dependencies = [
+ "candle-core",
+ "cudarc 0.18.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "candle-kernels"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -284,6 +295,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf99ab37ee7072d64d906aa2dada9a3422f1d975cdf8c8055a573bc84897ed8"
 dependencies = [
  "half",
+ "libloading 0.8.9",
+]
+
+[[package]]
+name = "cudarc"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3aa12038120eb13347a6ae2ffab1d34efe78150125108627fd85044dd4d6ff1e"
+dependencies = [
  "libloading 0.8.9",
 ]
 
@@ -1833,6 +1853,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "candle-core",
+ "candle-cuda-vmm",
  "candle-nn",
  "mimalloc",
  "pollster",

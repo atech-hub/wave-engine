@@ -213,8 +213,8 @@ impl ResidentWeightBuffers {
                         out_squeeze_b: create_buf(device, queue, &w.maestro_out.squeeze.b),
                         out_process_w: create_buf(device, queue, &flatten_weights(&w.maestro_out.process_1.w)),
                         out_process_b: create_buf(device, queue, &w.maestro_out.process_1.b),
-                        out_proj_w: create_buf(device, queue, &flatten_weights(&w.out_proj.w)),
-                        out_proj_b: create_buf(device, queue, &w.out_proj.b),
+                        out_proj_w: create_buf(device, queue, &w.out_proj.weights_flat()),
+                        out_proj_b: create_buf(device, queue, &w.out_proj.bias_flat()),
                     }
                 }
             };
@@ -302,8 +302,8 @@ impl ResidentWeightBuffers {
                     queue.write_buffer(out_squeeze_b, 0, bytemuck::cast_slice(&w.maestro_out.squeeze.b));
                     queue.write_buffer(out_process_w, 0, bytemuck::cast_slice(&flatten_weights(&w.maestro_out.process_1.w)));
                     queue.write_buffer(out_process_b, 0, bytemuck::cast_slice(&w.maestro_out.process_1.b));
-                    queue.write_buffer(out_proj_w, 0, bytemuck::cast_slice(&flatten_weights(&w.out_proj.w)));
-                    queue.write_buffer(out_proj_b, 0, bytemuck::cast_slice(&w.out_proj.b));
+                    queue.write_buffer(out_proj_w, 0, bytemuck::cast_slice(&w.out_proj.weights_flat()));
+                    queue.write_buffer(out_proj_b, 0, bytemuck::cast_slice(&w.out_proj.bias_flat()));
                 }
                 _ => {} // FFN type mismatch — shouldn't happen
             }

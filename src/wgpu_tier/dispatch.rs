@@ -532,7 +532,7 @@ impl ComputeBackend for GpuBackend {
             for i in 0..n_embd { r[i] = kerr_outs[pos][i] + mae_out_out[pos][i]; }
             r
         }).collect();
-        self.linear_batch(&weights.out_proj.w, &weights.out_proj.b, &regulated)
+        self.linear_batch(&weights.out_proj.as_linear().w, &weights.out_proj.as_linear().b, &regulated)
     }
 
     fn linear_batch(&self, w: &[Vec<f32>], b: &[f32], xs: &[Vec<f32>]) -> Vec<Vec<f32>> {

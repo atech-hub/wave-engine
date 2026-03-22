@@ -126,7 +126,7 @@ pub fn ffn_forward_gpu(
     let in_pr_w = flatten_w(&weights.maestro_in.process_1.w);
     let out_sq_w = flatten_w(&weights.maestro_out.squeeze.w);
     let out_pr_w = flatten_w(&weights.maestro_out.process_1.w);
-    let op_w = flatten_w(&weights.out_proj.w);
+    let op_w = flatten_w(&weights.out_proj.as_linear().w);
 
     // Upload all weight buffers
     let upload = |data: &[f32]| -> wgpu::Buffer {
@@ -144,7 +144,7 @@ pub fn ffn_forward_gpu(
     let w_out_pr = upload(&out_pr_w);
     let b_out_pr = upload(&weights.maestro_out.process_1.b);
     let w_op = upload(&op_w);
-    let b_op = upload(&weights.out_proj.b);
+    let b_op = upload(&weights.out_proj.as_linear().b);
 
     // ODE weights
     fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
@@ -444,14 +444,14 @@ pub fn ffn_backward_gpu(
     };
 
     // Transposed weights for backward d_x (use SAME shader as forward)
-    let wt_op = upload(&transpose_w(&weights.out_proj.w));         // n_embd×n_embd
+    let wt_op = upload(&transpose_w(&weights.out_proj.as_linear().w));         // n_embd×n_embd
     let wt_out_pr = upload(&transpose_w(&weights.maestro_out.process_1.w)); // maestro×n_embd
     let wt_out_sq = upload(&transpose_w(&weights.maestro_out.squeeze.w));   // n_embd×maestro
     let wt_in_pr = upload(&transpose_w(&weights.maestro_in.process_1.w));   // maestro×n_embd
     let wt_in_sq = upload(&transpose_w(&weights.maestro_in.squeeze.w));     // n_embd×maestro
 
     // Original weights for outer product d_W
-    let w_op = upload(&flatten_w(&weights.out_proj.w));
+    let w_op = upload(&flatten_w(&weights.out_proj.as_linear().w));
     let w_out_pr = upload(&flatten_w(&weights.maestro_out.process_1.w));
     let w_out_sq = upload(&flatten_w(&weights.maestro_out.squeeze.w));
     let w_in_pr = upload(&flatten_w(&weights.maestro_in.process_1.w));

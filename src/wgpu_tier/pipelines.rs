@@ -337,7 +337,7 @@ impl GpuBackend {
         // 64 threads per workgroup, each accumulates in_dim/64 terms,
         // then tree-reduce. Error O(in_dim/64 + log2(64)) vs O(in_dim).
         // One workgroup PER output row (dispatch = out_dim workgroups).
-        let matvec_src = include_str!("../shaders/matvec_tiled.wgsl");
+        let matvec_src = include_str!("../../shaders/matvec_tiled.wgsl");
         let matvec_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matvec"),
             source: wgpu::ShaderSource::Wgsl(matvec_src.into()),
@@ -371,7 +371,7 @@ impl GpuBackend {
         });
 
         // ─── Compile layer_norm shader ──────────────────────────
-        let ln_src = include_str!("../shaders/layer_norm.wgsl");
+        let ln_src = include_str!("../../shaders/layer_norm.wgsl");
         let ln_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("layer_norm"),
             source: wgpu::ShaderSource::Wgsl(ln_src.into()),
@@ -405,7 +405,7 @@ impl GpuBackend {
         });
 
         // ─── Compile Kerr derivative shader ─────────────────────
-        let kerr_src = include_str!("../shaders/kerr_step.wgsl");
+        let kerr_src = include_str!("../../shaders/kerr_step.wgsl");
         let kerr_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kerr_derivative"),
             source: wgpu::ShaderSource::Wgsl(kerr_src.into()),
@@ -445,7 +445,7 @@ impl GpuBackend {
         // ─── Compile backward shaders ──────────────────────────────
 
         // matvec_backward: d_x = W^T @ d_y (tiled reduction)
-        let mvb_src = include_str!("../shaders/matvec_backward_tiled.wgsl");
+        let mvb_src = include_str!("../../shaders/matvec_backward_tiled.wgsl");
         let mvb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matvec_backward"),
             source: wgpu::ShaderSource::Wgsl(mvb_src.into()),
@@ -470,7 +470,7 @@ impl GpuBackend {
         });
 
         // layer_norm_backward: d_x, d_weight, d_bias from d_y
-        let lnb_src = include_str!("../shaders/layer_norm_backward.wgsl");
+        let lnb_src = include_str!("../../shaders/layer_norm_backward.wgsl");
         let lnb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("layer_norm_backward"),
             source: wgpu::ShaderSource::Wgsl(lnb_src.into()),
@@ -495,7 +495,7 @@ impl GpuBackend {
         });
 
         // gelu_backward: d_x = d_y * gelu'(x)
-        let gb_src = include_str!("../shaders/gelu_backward.wgsl");
+        let gb_src = include_str!("../../shaders/gelu_backward.wgsl");
         let gb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gelu_backward"),
             source: wgpu::ShaderSource::Wgsl(gb_src.into()),
@@ -521,7 +521,7 @@ impl GpuBackend {
 
         // ─── Compile attention backward shaders ─────────────────────
         // Dispatch 1: attn_backward_scores — one workgroup per (pos, head)
-        let abs_src = include_str!("../shaders/attn_backward_scores.wgsl");
+        let abs_src = include_str!("../../shaders/attn_backward_scores.wgsl");
         let abs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("attn_backward_scores"),
             source: wgpu::ShaderSource::Wgsl(abs_src.into()),
@@ -550,7 +550,7 @@ impl GpuBackend {
         });
 
         // Dispatch 2: attn_backward_dkv — one thread per (ki, d_global)
-        let abdkv_src = include_str!("../shaders/attn_backward_dkv.wgsl");
+        let abdkv_src = include_str!("../../shaders/attn_backward_dkv.wgsl");
         let abdkv_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("attn_backward_dkv"),
             source: wgpu::ShaderSource::Wgsl(abdkv_src.into()),
@@ -579,7 +579,7 @@ impl GpuBackend {
         });
 
         // ─── Compile outer product shader ────────────────────────────
-        let op_src = include_str!("../shaders/outer_product.wgsl");
+        let op_src = include_str!("../../shaders/outer_product.wgsl");
         let op_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("outer_product"),
             source: wgpu::ShaderSource::Wgsl(op_src.into()),
@@ -604,7 +604,7 @@ impl GpuBackend {
         });
 
         // ─── Compile batched matvec backward shader (tiled + Kahan hybrid) ──
-        let mvbb_src = include_str!("../shaders/matvec_backward_batch_tiled_kahan.wgsl");
+        let mvbb_src = include_str!("../../shaders/matvec_backward_batch_tiled_kahan.wgsl");
         let mvbb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matvec_backward_batch"),
             source: wgpu::ShaderSource::Wgsl(mvbb_src.into()),
@@ -630,7 +630,7 @@ impl GpuBackend {
 
         // ─── Compile batched matvec forward shader (tiled + Kahan = high utilisation) ──
         println!("  Precision: tiled + Kahan (ping-pong handles correctness, Kahan handles utilisation)");
-        let mvb_fwd_src = include_str!("../shaders/matvec_batch_tiled_kahan.wgsl");
+        let mvb_fwd_src = include_str!("../../shaders/matvec_batch_tiled_kahan.wgsl");
         let mvb_fwd_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matvec_batch"),
             source: wgpu::ShaderSource::Wgsl(mvb_fwd_src.into()),
@@ -655,7 +655,7 @@ impl GpuBackend {
         });
 
         // ─── Compile batched layer norm shader ──────────────────────
-        let lnb_fwd_src = include_str!("../shaders/layer_norm_batch.wgsl");
+        let lnb_fwd_src = include_str!("../../shaders/layer_norm_batch.wgsl");
         let lnb_fwd_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("layer_norm_batch"),
             source: wgpu::ShaderSource::Wgsl(lnb_fwd_src.into()),
@@ -680,7 +680,7 @@ impl GpuBackend {
         });
 
         // ─── Compile batched Kerr derivative shader ─────────────────
-        let kdb_src = include_str!("../shaders/kerr_step_batch.wgsl");
+        let kdb_src = include_str!("../../shaders/kerr_step_batch.wgsl");
         let kdb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kerr_derivative_batch"),
             source: wgpu::ShaderSource::Wgsl(kdb_src.into()),
@@ -709,7 +709,7 @@ impl GpuBackend {
         });
 
         // ─── Compile batched Kerr backward shader ─────────────────
-        let kbb_src = include_str!("../shaders/kerr_backward_batch.wgsl");
+        let kbb_src = include_str!("../../shaders/kerr_backward_batch.wgsl");
         let kbb_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kerr_backward_batch"),
             source: wgpu::ShaderSource::Wgsl(kbb_src.into()),
@@ -741,7 +741,7 @@ impl GpuBackend {
         });
 
         // ─── Compile vec_scale_add shader (y = a + scale * b) ───
-        let vsa_src = include_str!("../shaders/vec_scale_add.wgsl");
+        let vsa_src = include_str!("../../shaders/vec_scale_add.wgsl");
         let vsa_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("vec_scale_add"),
             source: wgpu::ShaderSource::Wgsl(vsa_src.into()),
@@ -765,7 +765,7 @@ impl GpuBackend {
         });
 
         // ─── Compile rk4_combine shader (y = base + dt/6*(k1 + 2*k2 + 2*k3 + k4)) ───
-        let rc_src = include_str!("../shaders/rk4_combine.wgsl");
+        let rc_src = include_str!("../../shaders/rk4_combine.wgsl");
         let rc_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rk4_combine"),
             source: wgpu::ShaderSource::Wgsl(rc_src.into()),
@@ -790,7 +790,7 @@ impl GpuBackend {
 
         // ─── Compile deinterleave/reinterleave shaders ────────────────
         let di_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("deinterleave"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/deinterleave.wgsl").into()),
+            label: Some("deinterleave"), source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/deinterleave.wgsl").into()),
         });
         let deinterleave_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("deinterleave_layout"), entries: &[storage_ro(0), storage_rw(1), storage_rw(2), uniform_entry(3)],
@@ -804,7 +804,7 @@ impl GpuBackend {
         });
 
         let ri_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("reinterleave"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/reinterleave.wgsl").into()),
+            label: Some("reinterleave"), source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/reinterleave.wgsl").into()),
         });
         let reinterleave_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("reinterleave_layout"), entries: &[storage_ro(0), storage_ro(1), storage_rw(2), uniform_entry(3)],
@@ -819,7 +819,7 @@ impl GpuBackend {
 
         // ─── Compile GELU shader (for fused FFN chain) ──────────────
         let gelu_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gelu"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/gelu.wgsl").into()),
+            label: Some("gelu"), source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/gelu.wgsl").into()),
         });
         let gelu_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("gelu_layout"), entries: &[storage_ro(0), storage_rw(1), uniform_entry(2)],
@@ -834,7 +834,7 @@ impl GpuBackend {
 
         // ─── Compile vec_add shader (y = a + b, for fused FFN chain) ─
         let va_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("vec_add"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/vec_add.wgsl").into()),
+            label: Some("vec_add"), source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/vec_add.wgsl").into()),
         });
         let vec_add_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("vec_add_layout"), entries: &[storage_ro(0), storage_ro(1), storage_rw(2), uniform_entry(3)],
@@ -848,7 +848,7 @@ impl GpuBackend {
         });
 
         // ─── Compile FFT 512-point convolution shader (OFDM-inspired ODE) ──
-        let fft_src = include_str!("../shaders/fft_512.wgsl");
+        let fft_src = include_str!("../../shaders/fft_512.wgsl");
         let fft_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fft_512"), source: wgpu::ShaderSource::Wgsl(fft_src.into()),
         });

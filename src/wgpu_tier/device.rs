@@ -44,7 +44,7 @@ impl KernGpu {
         .expect("Failed to get GPU device");
 
         // Load shader
-        let shader_src = include_str!("../shaders/kerr_step.wgsl");
+        let shader_src = include_str!("../../shaders/kerr_step.wgsl");
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kerr_step"),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),

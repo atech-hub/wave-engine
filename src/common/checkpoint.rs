@@ -1,16 +1,21 @@
 //! WCHK checkpoint format — save/load trained model weights + optimizer state.
 //!
-//! Format: magic "WCHK" + version + config + metadata + optimizer + params.
-//! Supports bit-perfect resume (Adam m/v/t + RNG state preserved).
+//! v1: 6 config fields (n_bands, n_head, n_layers, maestro_dim, block_size, rk4_steps)
+//! v2: adds out_proj_groups (7th config field) — enables Dense or BlockDiagonal
+//!
+//! Param layout for out_proj depends on groups:
+//!   groups=1 (Dense): n_embd×n_embd weight + n_embd bias
+//!   groups=N (BlockDiagonal): N × (group_size×group_size weight + group_size bias)
 
 use crate::{N_BANDS, N_EMBD, N_HEAD, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS};
 use crate::train::Adam;
 
-/// Save model checkpoint in WCHK format.
+/// Save model checkpoint in WCHK v2 format.
 pub fn save_checkpoint(
     params: &[f32],
     vocab_size: usize,
     n_layers: usize,
+    out_proj_groups: usize,
     iter: usize,
     lr: f32,
     optimizer: &Adam,
@@ -20,17 +25,18 @@ pub fn save_checkpoint(
     use std::io::Write;
     let mut f = std::fs::File::create(path).expect("Failed to create checkpoint file");
 
-    // Magic + version
+    // Magic + version (v2 = has out_proj_groups)
     f.write_all(b"WCHK").unwrap();
-    f.write_all(&1u32.to_le_bytes()).unwrap();
+    f.write_all(&2u32.to_le_bytes()).unwrap();
 
-    // Config (self-describing)
+    // Config (7 fields in v2)
     f.write_all(&(N_BANDS as u32).to_le_bytes()).unwrap();
     f.write_all(&(N_HEAD as u32).to_le_bytes()).unwrap();
     f.write_all(&(n_layers as u32).to_le_bytes()).unwrap();
     f.write_all(&(MAESTRO_DIM as u32).to_le_bytes()).unwrap();
     f.write_all(&(BLOCK_SIZE as u32).to_le_bytes()).unwrap();
     f.write_all(&(RK4_STEPS as u32).to_le_bytes()).unwrap();
+    f.write_all(&(out_proj_groups as u32).to_le_bytes()).unwrap(); // NEW in v2
 
     // Metadata
     f.write_all(&(vocab_size as u64).to_le_bytes()).unwrap();
@@ -48,13 +54,13 @@ pub fn save_checkpoint(
     let n = params.len();
     for &v in params { f.write_all(&v.to_le_bytes()).unwrap(); }
 
-    let file_size = 4 + 4 + 6*4 + 8 + 8 + 4 + 8 + 8 + n*4*2 + n*4;
-    println!("  WCHK: {n} params, {n_layers} layers, {:.1}MB", file_size as f64 / 1e6);
+    println!("  WCHK v2: {n} params, {n_layers} layers, {out_proj_groups} groups, {:.1}MB",
+        (4+4+7*4+8+8+4+8+8+n*4*2+n*4) as f64 / 1e6);
 }
 
 /// Load checkpoint for resume.
-/// Returns (params, vocab_size, iter, lr, rng_state, adam_t, adam_m, adam_v).
-pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, Vec<f32>, Vec<f32>) {
+/// Returns (params, vocab_size, iter, lr, rng_state, adam_t, adam_m, adam_v, out_proj_groups).
+pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, Vec<f32>, Vec<f32>, usize) {
     use std::io::Read;
     let mut f = std::fs::File::open(path).unwrap_or_else(|e| panic!("Failed to open {path}: {e}"));
 
@@ -67,14 +73,22 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let read_f32_single = |f: &mut std::fs::File| -> f32 { let mut b = [0u8; 4]; f.read_exact(&mut b).unwrap(); f32::from_le_bytes(b) };
 
     let version = read_u32(&mut f);
-    assert_eq!(version, 1, "Unknown WCHK version");
+    assert!(version == 1 || version == 2, "Unknown WCHK version {version}");
 
+    // Config
     let ck_bands = read_u32(&mut f) as usize;
     let ck_head = read_u32(&mut f) as usize;
     let ck_layers = read_u32(&mut f) as usize;
     let ck_maestro = read_u32(&mut f) as usize;
     let _ck_block_size = read_u32(&mut f) as usize;
     let _ck_rk4 = read_u32(&mut f) as usize;
+
+    // v2 adds out_proj_groups; v1 defaults to dense (groups=1)
+    let out_proj_groups = if version >= 2 {
+        read_u32(&mut f) as usize
+    } else {
+        1 // v1 = dense out_proj
+    };
 
     assert_eq!(ck_bands, N_BANDS, "Checkpoint bands mismatch");
     assert_eq!(ck_head, N_HEAD, "Checkpoint heads mismatch");
@@ -85,9 +99,13 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let lr = read_f32_single(&mut f);
     let rng_state = read_u64(&mut f);
 
-    // Compute param count
-    let per_block = N_EMBD*2 + N_EMBD*2 + MAESTRO_DIM*N_EMBD + MAESTRO_DIM + N_EMBD*MAESTRO_DIM + N_EMBD
-        + MAESTRO_DIM*N_EMBD + MAESTRO_DIM + N_EMBD*MAESTRO_DIM + N_EMBD + N_EMBD*N_EMBD + N_EMBD;
+    // Compute param count based on out_proj_groups
+    let gs = N_EMBD / out_proj_groups;
+    let out_proj_params = out_proj_groups * (gs * gs + gs);
+    let per_block = N_EMBD*2 + N_EMBD*2
+        + MAESTRO_DIM*N_EMBD + MAESTRO_DIM + N_EMBD*MAESTRO_DIM + N_EMBD
+        + MAESTRO_DIM*N_EMBD + MAESTRO_DIM + N_EMBD*MAESTRO_DIM + N_EMBD
+        + out_proj_params;
     let n_params = ck_layers * per_block + N_EMBD*2 + vocab_size*N_EMBD;
 
     let adam_t = read_u64(&mut f) as usize;
@@ -100,6 +118,6 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let adam_v = read_f32_vec(&mut f, n_params);
     let params = read_f32_vec(&mut f, n_params);
 
-    println!("  Resumed: iter {iter}, lr {lr:.6}, {n_params} params, {ck_layers} layers");
-    (params, vocab_size, iter, lr, rng_state, adam_t, adam_m, adam_v)
+    println!("  WCHK v{version}: iter {iter}, lr {lr:.6}, {n_params} params, {ck_layers} layers, {out_proj_groups} groups");
+    (params, vocab_size, iter, lr, rng_state, adam_t, adam_m, adam_v, out_proj_groups)
 }

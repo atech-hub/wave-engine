@@ -3,64 +3,82 @@
 //! New architecture: parallel attention + FFN with harmonic coherence scoring.
 //! Tests whether wave packet mechanics can serve as the core computation primitive.
 
-#[allow(dead_code)]
-mod model;
-#[allow(dead_code)]
-mod backend;
-#[allow(dead_code)]
-mod backward;
-#[allow(dead_code)]
-mod gpu;
-#[allow(dead_code)]
-mod gpu_backend;
-#[allow(dead_code)]
-mod gpu_buffers;
-#[allow(dead_code)]
-mod gpu_dispatch;
-#[allow(dead_code)]
-mod gpu_ops_forward;
-#[allow(dead_code)]
-mod gpu_ops_backward;
-#[allow(dead_code)]
-mod gpu_persistent;
-#[allow(dead_code)]
-mod gpu_pipelines;
-#[allow(dead_code)]
-mod gpu_resident;
-#[allow(dead_code)]
-mod gpu_validate;
-#[allow(dead_code)]
-mod init;
-#[allow(dead_code)]
-mod pipeline;
-#[allow(dead_code)]
-mod optim;
-#[allow(dead_code)]
-mod bpe;
-#[allow(dead_code)]
-mod checkpoint;
-#[allow(dead_code)]
-mod data;
-#[allow(dead_code)]
-mod grad_test;
-#[allow(dead_code)]
-mod weights;
+// ─── Module tree ─────────────────────────────────────────────
+// Physical layout: src/common/, src/cpu/, src/wgpu_tier/, src/candle_tier/
+// Re-exports below keep old crate:: paths working (shim layer).
 
-mod wave_embed;
-mod wave_attn;
-mod wave_block;
-mod monitor;
-mod ffn_gpu;
-mod ffn_full_gpu;
-mod candle_engine;
-mod ffn_backend;
-mod fft_ode;
-mod rng;
-mod train;
-mod wave_checkpoint;
-mod token_cache;
-mod gpu_ode;
-mod block_diagonal;
+#[allow(dead_code)]
+mod common;
+#[allow(dead_code)]
+mod cpu;
+#[allow(dead_code)]
+mod wgpu_tier;
+#[allow(dead_code)]
+mod candle_tier;
+
+// Re-export shim — existing code uses crate::model, crate::backend, etc.
+// These map to the new physical locations without changing any imports.
+#[allow(unused_imports)]
+pub use common::model;
+#[allow(unused_imports)]
+pub use common::embed as wave_embed;
+#[allow(unused_imports)]
+pub use common::attn as wave_attn;
+#[allow(unused_imports)]
+pub use common::block as wave_block;
+#[allow(unused_imports)]
+pub use common::ffn as ffn_backend;
+#[allow(unused_imports)]
+pub use common::checkpoint as wave_checkpoint;
+#[allow(unused_imports)]
+pub use common::rng;
+#[allow(unused_imports)]
+pub use common::bpe;
+#[allow(unused_imports)]
+pub use common::token_cache;
+#[allow(unused_imports)]
+pub use common::monitor;
+#[allow(unused_imports)]
+pub use common::data;
+#[allow(unused_imports)]
+pub use common::fft_ode;
+
+#[allow(unused_imports)]
+pub use cpu::train;
+#[allow(unused_imports)]
+pub use cpu::backward;
+
+#[allow(unused_imports)]
+pub use wgpu_tier::backend;
+#[allow(unused_imports)]
+pub use wgpu_tier::device as gpu;
+#[allow(unused_imports)]
+pub use wgpu_tier::gpu_backend;
+#[allow(unused_imports)]
+pub use wgpu_tier::buffers as gpu_buffers;
+#[allow(unused_imports)]
+pub use wgpu_tier::dispatch as gpu_dispatch;
+#[allow(unused_imports)]
+pub use wgpu_tier::ops_forward as gpu_ops_forward;
+#[allow(unused_imports)]
+pub use wgpu_tier::ops_backward as gpu_ops_backward;
+#[allow(unused_imports)]
+pub use wgpu_tier::pipelines as gpu_pipelines;
+#[allow(unused_imports)]
+pub use wgpu_tier::resident as gpu_resident;
+#[allow(unused_imports)]
+pub use wgpu_tier::validate as gpu_validate;
+#[allow(unused_imports)]
+pub use wgpu_tier::ffn_gpu;
+#[allow(unused_imports)]
+pub use wgpu_tier::ffn_full_gpu;
+
+#[allow(unused_imports)]
+pub use candle_tier::engine as candle_engine;
+#[allow(unused_imports)]
+pub use candle_tier::ode as gpu_ode;
+#[allow(unused_imports)]
+pub use candle_tier::block_diag as block_diagonal;
 
 use wave_embed::*;
 use wave_attn::*;
@@ -144,7 +162,7 @@ fn init_model(vocab_size: usize, seed: u64, n_layers: usize) -> WavePacketModel 
             process_1: LinearWeights { w: pr_w2, b: pr_b2 },
         };
         let (op_w, op_b) = init_linear(&mut rng, N_EMBD, N_EMBD);
-        let ffn = KerrDualMaestroWeights { kerr, maestro_in, maestro_out, out_proj: LinearWeights { w: op_w, b: op_b } };
+        let ffn = KerrDualMaestroWeights { kerr, maestro_in, maestro_out, out_proj: OutProjWeights::dense(op_w, op_b) };
 
         let ln_ffn = LayerNormWeights { weight: vec![1.0f32; N_EMBD], bias: vec![0.0f32; N_EMBD] };
         blocks.push(WaveBlockWeights { ln, ln_ffn, attn, ffn });
@@ -515,12 +533,7 @@ fn ffn_backward(
         let mut cpu_regulated = vec![0.0f32; N_EMBD];
         for i in 0..N_EMBD { cpu_regulated[i] = cpu_kerr[i] + cpu_mae_out[i]; }
         // CPU out_proj
-        let mut cpu_output = vec![0.0f32; N_EMBD];
-        for i in 0..N_EMBD {
-            let mut sum = 0.0f32;
-            for j in 0..N_EMBD { sum += weights.out_proj.w[i][j] * cpu_regulated[j]; }
-            cpu_output[i] = sum + weights.out_proj.b[i];
-        }
+        let cpu_output = weights.out_proj.forward(&cpu_regulated);
 
         fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
             a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
@@ -535,51 +548,16 @@ fn ffn_backward(
     }
 
     // Backward through out_proj — ping-pong: reads Buffer A (same bits as forward)
-    let d_regulated: Vec<Vec<f32>> = if let Some((bufs, gpu_be)) = ping_pong {
-        // GPU backward: d_x and d_W computed on GPU, reading regulated_all from Buffer A
-        let d_flat: Vec<f32> = d_ffn_out.iter().flat_map(|v| v.iter().copied()).collect();
-        let mut w_flat = Vec::with_capacity(N_EMBD * N_EMBD);
-        for row in &weights.out_proj.w { w_flat.extend_from_slice(row); }
-        let (d_reg_flat, d_w_flat, d_b) = bufs.backward_out_proj(gpu_be, &d_flat, &w_flat, t, N_EMBD);
-        // Accumulate GPU-computed weight gradients
-        for i in 0..N_EMBD {
-            for j in 0..N_EMBD {
-                grads.block_ffn_out_proj_w[block_idx][i][j] += d_w_flat[i * N_EMBD + j];
-            }
-            grads.block_ffn_out_proj_b[block_idx][i] += d_b[i];
-        }
-        d_reg_flat.chunks(N_EMBD).map(|c| c.to_vec()).collect()
-    } else if let Some(be) = gpu {
-        let d_reg = be.linear_backward_dx_batch(d_ffn_out, &weights.out_proj.w);
-        for pos in 0..t {
-            for i in 0..N_EMBD {
-                for j in 0..N_EMBD {
-                    grads.block_ffn_out_proj_w[block_idx][i][j] += d_ffn_out[pos][i] * regulated_all[pos][j];
-                }
-                grads.block_ffn_out_proj_b[block_idx][i] += d_ffn_out[pos][i];
-            }
-        }
-        d_reg
-    } else {
-        // CPU fallback
-        let mut d_reg = Vec::with_capacity(t);
-        for pos in 0..t {
-            let mut d_r = vec![0.0f32; N_EMBD];
-            for i in 0..N_EMBD {
-                for j in 0..N_EMBD {
-                    d_r[j] += weights.out_proj.w[i][j] * d_ffn_out[pos][i];
-                }
-            }
-            for i in 0..N_EMBD {
-                for j in 0..N_EMBD {
-                    grads.block_ffn_out_proj_w[block_idx][i][j] += d_ffn_out[pos][i] * regulated_all[pos][j];
-                }
-                grads.block_ffn_out_proj_b[block_idx][i] += d_ffn_out[pos][i];
-            }
-            d_reg.push(d_r);
-        }
-        d_reg
-    };
+    // Backward through out_proj using enum methods (works for Dense or BlockDiagonal)
+    let d_regulated: Vec<Vec<f32>> = d_ffn_out.iter().map(|dy| {
+        weights.out_proj.backward_dx(dy)
+    }).collect();
+    // Accumulate d_W and d_b
+    let (d_w, d_b) = weights.out_proj.backward_dw_db(d_ffn_out, regulated_all);
+    for i in 0..N_EMBD {
+        for j in 0..N_EMBD { grads.block_ffn_out_proj_w[block_idx][i][j] += d_w[i][j]; }
+        grads.block_ffn_out_proj_b[block_idx][i] += d_b[i];
+    }
 
     // Backward through maestro_out (d_regulated → d_kerr_out + maestro_out grads)
     let mut d_kerr_out = Vec::with_capacity(t);
@@ -738,7 +716,7 @@ fn rk4_step_standalone(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f3
 
 fn count_trainable(model: &WavePacketModel) -> usize {
     let mut n = 0;
-    for _ in &model.blocks {
+    for block in &model.blocks {
         n += N_EMBD * 2; // LN
         n += N_EMBD * 2; // LN_FFN
         // FFN: maestro_in + maestro_out + out_proj (kerr frozen for now)
@@ -746,7 +724,7 @@ fn count_trainable(model: &WavePacketModel) -> usize {
         n += N_EMBD * MAESTRO_DIM + N_EMBD;       // mae_in process
         n += MAESTRO_DIM * N_EMBD + MAESTRO_DIM; // mae_out squeeze
         n += N_EMBD * MAESTRO_DIM + N_EMBD;       // mae_out process
-        n += N_EMBD * N_EMBD + N_EMBD;            // out_proj
+        n += block.ffn.out_proj.param_count();      // out_proj (dense or block-diagonal)
     }
     n += N_EMBD * 2; // ln_f
     n += model.vocab_size * N_EMBD; // lm_head
@@ -768,8 +746,7 @@ fn flatten_params(model: &WavePacketModel) -> Vec<f32> {
         p.extend_from_slice(&block.ffn.maestro_out.squeeze.b);
         for row in &block.ffn.maestro_out.process_1.w { p.extend_from_slice(row); }
         p.extend_from_slice(&block.ffn.maestro_out.process_1.b);
-        for row in &block.ffn.out_proj.w { p.extend_from_slice(row); }
-        p.extend_from_slice(&block.ffn.out_proj.b);
+        block.ffn.out_proj.flatten_into(&mut p);
     }
     p.extend_from_slice(&model.ln_f.weight);
     p.extend_from_slice(&model.ln_f.bias);
@@ -816,8 +793,7 @@ fn unflatten_params(model: &mut WavePacketModel, params: &[f32]) {
         block.ffn.maestro_out.squeeze.b.copy_from_slice(&params[idx..idx+MAESTRO_DIM]); idx += MAESTRO_DIM;
         for row in &mut block.ffn.maestro_out.process_1.w { row.copy_from_slice(&params[idx..idx+MAESTRO_DIM]); idx += MAESTRO_DIM; }
         block.ffn.maestro_out.process_1.b.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
-        for row in &mut block.ffn.out_proj.w { row.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD; }
-        block.ffn.out_proj.b.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
+        block.ffn.out_proj.unflatten_from(params, &mut idx);
     }
     model.ln_f.weight.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
     model.ln_f.bias.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;

@@ -7,7 +7,7 @@
 #[cfg(feature = "candle-backend")]
 pub mod block_diag {
     use candle_core::{Tensor, Result};
-    use candle_nn::{Linear, VarBuilder};
+    use candle_nn::{Linear, Module, VarBuilder};
 
     /// Block-diagonal linear: N_EMBD split into n_groups independent projections.
     /// Each group processes group_size dims → group_size dims.
@@ -46,7 +46,7 @@ pub mod block_diag {
             let mut outputs = Vec::with_capacity(self.n_groups);
             for g in 0..self.n_groups {
                 let start = g * self.group_size;
-                let group_input = x.narrow(candle_core::D::Minus1, start, self.group_size)?;
+                let group_input = x.narrow(candle_core::D::Minus1, start, self.group_size)?.contiguous()?;
                 let group_output = self.groups[g].forward(&group_input)?;
                 outputs.push(group_output);
             }

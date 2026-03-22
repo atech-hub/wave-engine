@@ -22,3 +22,15 @@ data/tokenizer.json
 
 # Raw audit logs (not useful for public)
 results/audit_*.txt
+
+# Large data files
+data/wikitext.txt
+data/wikitext.txt.bpe.tokens
+data/grammar_corpus.txt.char.tokens
+data/input.txt.char.tokens
+*.safetensors
+*.meta
+training_log.jsonl
+block_diag_test.log
+checkpoint.bin
+checkpoint_iter*.bin

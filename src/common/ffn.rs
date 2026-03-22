@@ -62,22 +62,10 @@ pub fn ffn_forward_via_backend(
     let regulated = cpu.vec_add_batch(&kerr_out, &mae_out_out);
     let _mae_out_dur = _t_mae_out.elapsed();
 
-    // 6. Out projection: GPU ping-pong when available (13ms→~1ms), else CPU
-    // Ping-pong stores regulated in VRAM — backward reads same bits. No mismatch.
+    // 6. Out projection via OutProjWeights enum (Dense or BlockDiagonal)
     let _t_proj = std::time::Instant::now();
-    let (output, proj_device) = if let Some((bufs, gpu_be)) = ping_pong {
-        // Flatten regulated for GPU upload
-        let reg_flat: Vec<f32> = regulated.iter().flat_map(|v| v.iter().copied()).collect();
-        let mut w_flat = Vec::with_capacity(n_embd * n_embd);
-        for row in &weights.out_proj.w { w_flat.extend_from_slice(row); }
-        let out_flat = bufs.forward_out_proj(gpu_be, &reg_flat, &w_flat, &weights.out_proj.b, t, n_embd);
-        // Unflatten output
-        let out: Vec<Vec<f32>> = out_flat.chunks(n_embd).map(|c| c.to_vec()).collect();
-        (out, "GPU")
-    } else {
-        let out = cpu.linear_batch(&weights.out_proj.w, &weights.out_proj.b, &regulated);
-        (out, "CPU")
-    };
+    let output = weights.out_proj.forward_batch(&regulated);
+    let proj_device = if weights.out_proj.n_groups() > 1 { "CPU-BD" } else { "CPU" };
     let _proj_dur = _t_proj.elapsed();
 
     if profiling {
@@ -112,24 +100,12 @@ pub fn ffn_backward_via_backend(
     let cpu = &crate::backend::CpuBackend;
     let profiling = crate::PROFILE.load(std::sync::atomic::Ordering::Relaxed);
 
-    // ─── Out_proj backward: GPU ping-pong when available, else CPU ───
+    // ─── Out_proj backward via OutProjWeights enum ───
     let _t_bwd_proj = std::time::Instant::now();
-    let (d_regulated, d_out_proj_w, d_out_proj_b, proj_device) = if let Some((bufs, gpu_be)) = ping_pong {
-        // GPU backward: d_x and d_W computed on GPU, reading regulated from Buffer A (forward's bits)
-        let d_flat: Vec<f32> = d_ffn_out.iter().flat_map(|v| v.iter().copied()).collect();
-        let mut w_flat = Vec::with_capacity(n_embd * n_embd);
-        for row in &weights.out_proj.w { w_flat.extend_from_slice(row); }
-        let (d_reg_flat, d_w_flat, d_b) = bufs.backward_out_proj(gpu_be, &d_flat, &w_flat, t, n_embd);
-        // Unflatten d_regulated
-        let d_reg: Vec<Vec<f32>> = d_reg_flat.chunks(n_embd).map(|c| c.to_vec()).collect();
-        // Unflatten d_w
-        let d_w: Vec<Vec<f32>> = d_w_flat.chunks(n_embd).map(|c| c.to_vec()).collect();
-        (d_reg, d_w, d_b, "GPU")
-    } else {
-        let d_reg = cpu.linear_backward_dx_batch(d_ffn_out, &weights.out_proj.w);
-        let (d_w, d_b) = cpu.outer_product_accum(d_ffn_out, &cache.regulated, true);
-        (d_reg, d_w, d_b, "CPU")
-    };
+    let d_regulated: Vec<Vec<f32>> = d_ffn_out.iter()
+        .map(|dy| weights.out_proj.backward_dx(dy)).collect();
+    let (d_out_proj_w, d_out_proj_b) = weights.out_proj.backward_dw_db(d_ffn_out, &cache.regulated);
+    let proj_device = if weights.out_proj.n_groups() > 1 { "CPU-BD" } else { "CPU" };
     let _bwd_proj_dur = _t_bwd_proj.elapsed();
     if profiling {
         eprintln!("    [FFN bwd] out_proj({}): {:.3?}  ({} elem)", proj_device, _bwd_proj_dur, t);
