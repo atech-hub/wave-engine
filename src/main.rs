@@ -855,6 +855,7 @@ fn print_help() {
     println!();
     println!("MONITORS:");
     println!("    --monitor         Enable per-section pipeline timing (forward profiling)");
+    println!("    --debug-nan       Enable per-layer NaN detection (Candle only, ~6x slower)");
     println!();
     println!("    Always-on telemetry (no flag needed):");
     println!("      training_log.jsonl   Per-iteration: loss, lr, time, vram_mb, nan_skips");
@@ -922,8 +923,9 @@ fn main() {
         let rk4_steps: usize = pflag("--rk4-steps", RK4_STEPS);
         let out_proj_groups: usize = pflag("--out-proj-groups", 6);
 
+        let debug_nan = std::env::args().any(|a| a == "--debug-nan");
         match candle_engine::engine::train_candle(
-            &data_path, n_iters, n_bands, n_head, n_layers, maestro_dim, rk4_steps, out_proj_groups,
+            &data_path, n_iters, n_bands, n_head, n_layers, maestro_dim, rk4_steps, out_proj_groups, debug_nan,
         ) {
             Ok(()) => return,
             Err(e) => { eprintln!("Candle error: {e:?}"); std::process::exit(1); }

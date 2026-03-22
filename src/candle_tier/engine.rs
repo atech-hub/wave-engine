@@ -180,10 +180,10 @@ pub mod engine {
 
     fn wave_attention(
         x: &Tensor,
-        phase_proj_ws: &[Tensor],
-        phase_proj_bs: &[Tensor],
-        v_proj_ws: &[Tensor],
-        v_proj_bs: &[Tensor],
+        pp_ws_cpu: &[Vec<Vec<f32>>],  // pre-cached on CPU
+        pp_bs_cpu: &[Vec<f32>],
+        vw_cpu: &[Vec<Vec<f32>>],
+        vb_cpu: &[Vec<f32>],
         harmonic_ns: &[f32],
         out_proj_w: &Tensor,
         out_proj_b: &Tensor,
@@ -192,7 +192,7 @@ pub mod engine {
         let n_head = harmonic_ns.len();
         let head_dim = n_embd / n_head;
 
-        // Pull to CPU for attention scoring (frozen, custom op)
+        // Only ONE GPU→CPU transfer: the input activations (these change every call)
         let x_data = x.to_vec2::<f32>()?;
         let mut out_data = vec![0.0f32; n_pos * n_embd];
 
@@ -200,9 +200,9 @@ pub mod engine {
             let offset = head * head_dim;
             let harmonic_n = harmonic_ns[head];
 
-            // Phase projection
-            let pp_w = phase_proj_ws[head].to_vec2::<f32>()?;
-            let pp_b = phase_proj_bs[head].to_vec1::<f32>()?;
+            // Phase projection — from CPU cache, zero GPU transfers
+            let pp_w = &pp_ws_cpu[head];
+            let pp_b = &pp_bs_cpu[head];
             let phases: Vec<f32> = (0..n_pos).map(|pos| {
                 let mut r = pp_b[0];
                 let mut s = pp_b[1];
@@ -210,9 +210,9 @@ pub mod engine {
                 s.atan2(r)
             }).collect();
 
-            // Value projection
-            let vw = v_proj_ws[head].to_vec2::<f32>()?;
-            let vb = v_proj_bs[head].to_vec1::<f32>()?;
+            // Value projection — from CPU cache, zero GPU transfers
+            let vw = &vw_cpu[head];
+            let vb = &vb_cpu[head];
             let v_all: Vec<Vec<f32>> = (0..n_pos).map(|pos| {
                 let mut v = vec![0.0f32; head_dim];
                 for d in 0..head_dim {
@@ -270,6 +270,7 @@ pub mod engine {
         n_embd: usize,
         n_head: usize,
         block_size: usize,
+        debug_nan: bool,
     }
 
     struct CandleBlock {
@@ -277,7 +278,7 @@ pub mod engine {
         ln_w: Tensor,
         ln_b: Tensor,
 
-        // Attention (frozen)
+        // Attention (frozen) — GPU tensors for out_proj gradient graph
         phase_proj_ws: Vec<Tensor>,
         phase_proj_bs: Vec<Tensor>,
         v_proj_ws: Vec<Tensor>,
@@ -285,6 +286,12 @@ pub mod engine {
         harmonic_ns: Vec<f32>,
         attn_out_proj_w: Tensor,
         attn_out_proj_b: Tensor,
+
+        // Attention (frozen) — CPU-cached copies, eliminates GPU→CPU transfers per forward call
+        phase_proj_ws_cpu: Vec<Vec<Vec<f32>>>,  // [n_head][2][n_embd]
+        phase_proj_bs_cpu: Vec<Vec<f32>>,        // [n_head][2]
+        v_proj_ws_cpu: Vec<Vec<Vec<f32>>>,       // [n_head][head_dim][head_dim]
+        v_proj_bs_cpu: Vec<Vec<f32>>,            // [n_head][head_dim]
 
         // FFN (trained via VarMap)
         mae_in_sq: Linear,
@@ -382,9 +389,20 @@ pub mod engine {
                     ode_params.alpha, ode_params.beta, device,
                 )?;
 
+                // Cache frozen attention weights on CPU — eliminates 48 GPU→CPU transfers per layer per forward
+                let phase_proj_ws_cpu: Vec<Vec<Vec<f32>>> = phase_proj_ws.iter()
+                    .map(|t| t.to_vec2::<f32>().unwrap()).collect();
+                let phase_proj_bs_cpu: Vec<Vec<f32>> = phase_proj_bs.iter()
+                    .map(|t| t.to_vec1::<f32>().unwrap()).collect();
+                let v_proj_ws_cpu: Vec<Vec<Vec<f32>>> = v_proj_ws.iter()
+                    .map(|t| t.to_vec2::<f32>().unwrap()).collect();
+                let v_proj_bs_cpu: Vec<Vec<f32>> = v_proj_bs.iter()
+                    .map(|t| t.to_vec1::<f32>().unwrap()).collect();
+
                 blocks.push(CandleBlock {
                     ln_w, ln_b,
                     phase_proj_ws, phase_proj_bs, v_proj_ws, v_proj_bs,
+                    phase_proj_ws_cpu, phase_proj_bs_cpu, v_proj_ws_cpu, v_proj_bs_cpu,
                     harmonic_ns, attn_out_proj_w, attn_out_proj_b,
                     mae_in_sq, mae_in_pr, ode_params, gpu_ode_params, mae_out_sq, mae_out_pr, out_proj,
                 });
@@ -397,7 +415,7 @@ pub mod engine {
                 candle_nn::Init::Randn { mean: 0.0, stdev: 1.0 / (n_embd as f64).sqrt() })?;
 
             Ok(Self { wte, wpe, blocks, ln_f_w, ln_f_b, lm_head, device: device.clone(),
-                n_bands: n_bands_cfg, n_embd: n_embd_cfg, n_head: n_head_cfg, block_size: block_size_cfg })
+                n_bands: n_bands_cfg, n_embd: n_embd_cfg, n_head: n_head_cfg, block_size: block_size_cfg, debug_nan: false })
         }
 
         pub fn forward(&self, token_ids: &[usize]) -> Result<Tensor> {
@@ -440,16 +458,17 @@ pub mod engine {
 
             for (block_idx, block) in self.blocks.iter().enumerate() {
                 let normed = layer_norm(&hidden, &block.ln_w, &block.ln_b)?;
-                // NaN monitor
-                if normed.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
-                    eprintln!("  [NaN] block {block_idx} after LN");
+                if self.debug_nan {
+                    if normed.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
+                        eprintln!("  [NaN] block {block_idx} after LN");
+                    }
                 }
 
                 // Attention (frozen, CPU scoring, GPU out_proj)
                 let attn_out = wave_attention(
                     &normed,
-                    &block.phase_proj_ws, &block.phase_proj_bs,
-                    &block.v_proj_ws, &block.v_proj_bs,
+                    &block.phase_proj_ws_cpu, &block.phase_proj_bs_cpu,
+                    &block.v_proj_ws_cpu, &block.v_proj_bs_cpu,
                     &block.harmonic_ns,
                     &block.attn_out_proj_w, &block.attn_out_proj_b,
                 )?;
@@ -468,12 +487,13 @@ pub mod engine {
                 let mae_in = block.mae_in_pr.forward(&mae_in)?;
                 let precond = (&ffn_input + &mae_in)?;
 
-                // Monitor precond max value
-                let precond_vals = precond.to_vec2::<f32>()?;
-                let precond_max = precond_vals.iter()
-                    .flat_map(|r| r.iter()).cloned().fold(0.0f32, |a, b| a.max(b.abs()));
-                if precond_max > 10.0 || precond_max.is_nan() || precond_max.is_infinite() {
-                    eprintln!("  [PRECOND] block {block_idx} max={precond_max:.2}");
+                if self.debug_nan {
+                    let precond_vals = precond.to_vec2::<f32>()?;
+                    let precond_max = precond_vals.iter()
+                        .flat_map(|r| r.iter()).cloned().fold(0.0f32, |a, b| a.max(b.abs()));
+                    if precond_max > 10.0 || precond_max.is_nan() || precond_max.is_infinite() {
+                        eprintln!("  [PRECOND] block {block_idx} max={precond_max:.2}");
+                    }
                 }
 
                 // ODE via CustomOp1 — forward runs RK4 (no clamping), backward is identity
@@ -486,23 +506,25 @@ pub mod engine {
                 let mae_out = block.mae_out_pr.forward(&mae_out)?;
                 let regulated = (&effective_ode_out + &mae_out)?;
 
-                // Monitor ODE and maestro_out outputs
-                if effective_ode_out.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
-                    eprintln!("  [NaN] block {block_idx} ODE output");
-                }
-                if regulated.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
-                    eprintln!("  [NaN] block {block_idx} regulated (before out_proj)");
+                if self.debug_nan {
+                    if effective_ode_out.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
+                        eprintln!("  [NaN] block {block_idx} ODE output");
+                    }
+                    if regulated.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
+                        eprintln!("  [NaN] block {block_idx} regulated (before out_proj)");
+                    }
                 }
 
                 // Out proj
                 let ffn_out = block.out_proj.forward(&regulated)?;
 
-                // NaN monitors
-                if attn_out.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
-                    eprintln!("  [NaN] block {block_idx} after attention");
-                }
-                if ffn_out.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
-                    eprintln!("  [NaN] block {block_idx} after FFN");
+                if self.debug_nan {
+                    if attn_out.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
+                        eprintln!("  [NaN] block {block_idx} after attention");
+                    }
+                    if ffn_out.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
+                        eprintln!("  [NaN] block {block_idx} after FFN");
+                    }
                 }
 
                 // Parallel residual
@@ -523,6 +545,7 @@ pub mod engine {
         data_path: &str, n_iters: usize,
         n_bands: usize, n_head: usize, n_layers: usize,
         maestro_dim: usize, _rk4_steps: usize, out_proj_groups: usize,
+        debug_nan: bool,
     ) -> Result<()> {
         // Runtime config — lowercase variables used throughout
         let n_embd = n_bands * 2;
@@ -572,8 +595,10 @@ pub mod engine {
 
         // Model
         let mut varmap = VarMap::new();
-        let model = CandleWaveModel::new(&varmap, vocab_size, &device,
+        let mut model = CandleWaveModel::new(&varmap, vocab_size, &device,
             n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups)?;
+        model.debug_nan = debug_nan;
+        if debug_nan { println!("  [debug-nan] Per-layer NaN detection ENABLED (~6x slower)"); }
         let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
         println!("  Trainable params: {n_params}");
         println!("  Architecture: {n_layers} layers, {n_head} heads, {n_bands} bands");
@@ -819,7 +844,7 @@ pub mod engine {
 // Stub when candle feature is not enabled
 #[cfg(not(feature = "candle-backend"))]
 pub mod engine {
-    pub fn train_candle(_data_path: &str, _n_iters: usize, _n_bands: usize, _n_head: usize, _n_layers: usize, _maestro_dim: usize, _rk4_steps: usize, _out_proj_groups: usize) -> std::result::Result<(), String> {
+    pub fn train_candle(_data_path: &str, _n_iters: usize, _n_bands: usize, _n_head: usize, _n_layers: usize, _maestro_dim: usize, _rk4_steps: usize, _out_proj_groups: usize, _debug_nan: bool) -> std::result::Result<(), String> {
         Err("Candle backend not enabled. Build with: cargo run --release --features candle-backend".to_string())
     }
 }
