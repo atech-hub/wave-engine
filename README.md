@@ -28,6 +28,89 @@ cargo run --release -- --help
 
 No Python. No pip. No CUDA toolkit. One `cargo run` command.
 
+## Examples
+
+### Your first training run
+
+Download any plain text file (Shakespeare, Wikipedia, a novel — anything works) and save it as `data/input.txt`. Then:
+
+```bash
+cargo run --release -- data/input.txt --layers 4 --iters 200
+```
+
+This trains a 4-layer model on CPU for 200 iterations. You'll see loss descending from ~4.5 to ~2.5. The model saves to `checkpoint.bin` when done.
+
+### Scale up with GPU
+
+If you have any GPU (NVIDIA, AMD, Intel, Apple Silicon):
+
+```bash
+cargo run --release -- data/input.txt --layers 4 --iters 200 --gpu
+```
+
+Same model, same results, GPU-accelerated. The `--gpu` flag works on any GPU vendor — no CUDA required.
+
+### NVIDIA CUDA (fastest)
+
+If you have an NVIDIA GPU and want maximum speed:
+
+```bash
+cargo build --release --features candle-backend
+cargo run --release --features candle-backend -- data/input.txt --candle --layers 4 --iters 200
+```
+
+This uses the Candle/CUDA backend with perturbative ODE and block-diagonal output projection. 2.4x faster than CPU.
+
+### Train with BPE tokenizer (recommended for real training)
+
+Character-level tokenization is fine for experiments, but BPE produces better models:
+
+```bash
+# Download a GPT-2 tokenizer (or any HuggingFace tokenizer.json)
+cargo run --release -- data/input.txt --iters 1000 --bpe --tokenizer data/tokenizer.json
+```
+
+### Production training (24 layers, diverse corpus)
+
+For a real model that generates English:
+
+```bash
+# Combine your training data (grammar, literature, etc.)
+cat grammar.txt literature.txt > data/training.txt
+
+# Train 24 layers with BPE on CUDA (fastest)
+cargo run --release --features candle-backend -- data/training.txt --candle \
+    --layers 24 --iters 5000 --seq 256 --batch 4 --lr 1e-4 \
+    --bpe --tokenizer data/tokenizer.json
+```
+
+### Resume training from a checkpoint
+
+```bash
+cargo run --release -- data/input.txt --iters 5000 --resume checkpoint.bin
+```
+
+### Custom architecture dimensions
+
+```bash
+# Smaller model (faster experiments)
+cargo run --release -- data/input.txt --n-bands 64 --n-head 4 --layers 4
+
+# Larger model (more capacity)
+cargo run --release -- data/input.txt --n-bands 448 --n-head 14 --out-proj-groups 7
+```
+
+### Serve your trained model
+
+After training, serve it with [wave-server](https://github.com/atech-hub/wave-server):
+
+```bash
+# In the wave-server repo:
+cargo run --release -- ../wave-engine/checkpoint.bin --bpe ../wave-engine/data/tokenizer.json --port 8080
+
+# Then connect any OpenAI-compatible chat UI to http://localhost:8080/v1
+```
+
 ## Training Tiers
 
 The engine provides three tiers to match your hardware. All tiers train the same model architecture and produce compatible checkpoints.
