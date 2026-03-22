@@ -32,18 +32,17 @@ No Python. No pip. No CUDA toolkit. One `cargo run` command.
 
 The engine provides three tiers to match your hardware. All tiers train the same model architecture and produce compatible checkpoints.
 
-| Tier | Flag | Speed (4L) | Quality | GPU% | Hardware |
-|------|------|-----------|---------|------|----------|
-| CPU | *(none)* | 407ms/iter | **2.48** (gold) | 0% | Any computer |
-| wgpu | `--gpu` | 300ms/iter | **2.48** (matches CPU) | ~10% | Any GPU (Vulkan/Metal/DX12) |
-| wgpu fast | `--gpu` *(ping-pong)* | 145ms/iter | **2.67** (0.19 gap) | ~25% | Any GPU |
-| Candle CUDA | `--candle` | 280ms/iter | **2.59** (0.1 gap) | ~80% | NVIDIA only |
+| Tier | Flag | Speed (4L) | Loss @ 200 | Params | Hardware |
+|------|------|-----------|-----------|--------|----------|
+| CPU | *(none)* | 520ms/iter | **2.52** | 2.63M | Any computer |
+| wgpu | `--gpu` | 520ms/iter | **2.52** (identical to CPU) | 2.63M | Any GPU (Vulkan/Metal/DX12) |
+| Candle CUDA | `--candle` | 213ms/iter | **2.81** (block-diagonal, 4x fewer FFN params) | 657K | NVIDIA only |
 
-**CPU** gives the best training quality on any hardware — a Raspberry Pi, a cloud VM, a 10-year-old laptop. **wgpu** accelerates on any GPU without CUDA, with zero quality loss in safe mode or 2.8x speedup in fast mode. **Candle** uses NVIDIA's cuBLAS for maximum GPU throughput with automatic forward/backward consistency.
+*Measured March 22 2026: 4 layers, seq=64, batch=4, 200 iters, Shakespeare, no curriculum, RTX 4070 Ti.*
 
-The 0.19 gap in wgpu fast mode is an inherent f32 non-associativity difference between CPU and GPU addition order — not a bug. Both are valid training trajectories. GPU fast mode reaches the same loss level as CPU in the same wall-clock time, then keeps going.
+**CPU** gives the best training quality on any hardware — a Raspberry Pi, a cloud VM, a 10-year-old laptop. **wgpu** runs on any GPU without CUDA, producing identical results to CPU (same loss at every iteration). **Candle CUDA** is 2.4x faster with block-diagonal output projection (6 groups of 128) and perturbative ODE — fewer parameters, faster convergence, slightly higher loss from cosine LR warmup.
 
-**Realistic training times:** The engine runs on any hardware from a Raspberry Pi to an RTX 4090. A 4-layer experiment takes seconds on any machine. A 24-layer production model on wikitext-103 (121M tokens, BPE, 54M params) takes ~5 hours on an RTX 4070 Ti with Candle CUDA. Training time scales with your hardware — the architecture is the same everywhere, only the speed differs.
+**Realistic training times:** The engine runs on any hardware from a Raspberry Pi to an RTX 4090. A 4-layer experiment takes ~2 minutes on any machine. Training time scales with your hardware — the architecture is the same everywhere, only the speed differs.
 
 ## Usage
 

@@ -1,43 +1,42 @@
-# Wave Packet Engine — Final Tier Comparison
+# Wave Engine — Tier Comparison
 
-## Date: 2026-03-19
+## Date: 2026-03-22 (updated with fresh measurements)
 
-## All tiers at 4 layers, 768-dim, 200 iters, Shakespeare
+## Config: 4 layers, 768-dim, 200 iters, seq=64, batch=4, Shakespeare, no curriculum
 
-| Tier | Config | iter/s | Loss@200 | Gap from CPU | GPU% |
-|------|--------|--------|----------|--------------|------|
-| CPU (gold) | CpuBackend | 430ms | **2.52** | 0 | 0% |
-| wgpu GPU (ping-pong) | CPU FFN + GPU out_proj ping-pong | 800ms (24L) | **2.74** | 0.22 | 22-27% |
-| wgpu GPU (backend) | ComputeBackend routing | **125ms** | 3.27 | 0.75 | TBD |
-| Candle CUDA (no ODE) | cuBLAS + autograd | 165ms | **2.79** | 0.27 | ~80% |
+| Tier | Flag | Speed | Loss @ 199 | Params | VRAM | Hardware |
+|------|------|-------|-----------|--------|------|----------|
+| CPU | *(none)* | 520ms/iter | **2.52** | 2.63M (dense) | — | Any computer |
+| wgpu GPU | `--gpu` | 520ms/iter | **2.52** (identical) | 2.63M (dense) | — | Any GPU (Vulkan/Metal/DX12) |
+| Candle CUDA | `--candle` | 213ms/iter | **2.81** | 657K (block-diag 6×128) | 1329MB stable | NVIDIA only |
 
 ## Analysis
 
-### CPU tier is the quality leader
-- Best loss (2.52), slowest speed
-- Every op at exact f32 precision
-- No GPU needed — runs on anything
+### CPU and wgpu produce identical results
+- Same loss at every single iteration (verified iter-by-iter)
+- Same init seed, same math, same RK4-16 ODE
+- wgpu dispatches to GPU shaders but the current config routes most work through CPU
+- Both use dense out_proj (1 group)
 
-### Candle CUDA is the best GPU quality
-- cuBLAS handles forward+backward matmul consistently
-- Loss gap (0.27) is from missing ODE, not precision issues
-- When CustomOp1 ODE is fixed, should match CPU quality
-- 80% GPU utilisation — cuBLAS keeps the GPU busy
+### Candle CUDA is 2.4x faster with 4x fewer params
+- 213ms/iter vs 520ms — cuBLAS + autograd
+- Block-diagonal out_proj: 6 groups of 128×128 (657K total params vs 2.63M)
+- Perturbative ODE (single-pass analytical, no RK4 steps)
+- Loss gap (0.29) partly from cosine LR warmup consuming early iterations
+- VRAM rock-solid at 1329MB — no leak (device.synchronize() after optimizer.step())
 
-### wgpu ping-pong is the best cross-platform GPU
-- Works on any GPU (NVIDIA, AMD, Intel, Apple)
-- 0.22 loss gap is acceptable
-- Ping-pong buffers ensure forward/backward consistency for out_proj
-- 22-27% GPU — limited by CPU ODE bottleneck
+### Key differences between tiers
 
-### wgpu ComputeBackend is fastest but needs quality work
-- 125ms/iter — fastest of all tiers
-- 0.75 loss gap too large for production
-- Gap comes from GPU out_proj × CPU regulated cross-precision product
-- Fix: combine ComputeBackend routing with ping-pong for out_proj
+| Feature | CPU / wgpu | Candle CUDA |
+|---------|-----------|-------------|
+| ODE method | RK4-16 (sequential) | Perturbative (single-pass) |
+| Out_proj | Dense 768×768 | Block-diagonal 6×128×128 |
+| Params | 2.63M | 657K |
+| LR schedule | Flat | Cosine with 100-iter warmup |
+| Backward | Manual analytical | Autograd (true gradients) |
 
 ## Recommended Defaults
 
-- `cargo run --release -- data/input.txt 200` → CPU tier (best quality)
-- `cargo run --release -- data/input.txt 200 --gpu` → ping-pong (best GPU quality)
-- `cargo run --release --features candle-backend -- data/input.txt 200 --candle` → Candle (NVIDIA max speed)
+- `cargo run --release -- data/input.txt --iters 200` → CPU tier (best quality, any hardware)
+- `cargo run --release -- data/input.txt --iters 200 --gpu` → wgpu (identical quality, any GPU)
+- `cargo run --release --features candle-backend -- data/input.txt --iters 200 --candle` → Candle (fastest, NVIDIA)
