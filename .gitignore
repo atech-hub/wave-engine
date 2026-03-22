@@ -59,8 +59,20 @@ data/combined_distill.txt
 data/children.txt
 data/legal.txt
 
-# Raw audit logs
+# Raw results (keep only curated summaries)
 results/audit_*.txt
+results/run*.json
+results/run*.txt
+results/step2_*.txt
+results/step2_*.json
+results/SESSION-SUMMARY-*.md
+results/AUDIT-SUMMARY.md
+results/GPU-PRECISION-DIAGNOSTIC.md
+
+# Data files (users download their own)
+data/*.txt
+data/grammar/
+!data/.gitkeep
 
 # Lab experiments (internal benchmarks)
 /lab/
