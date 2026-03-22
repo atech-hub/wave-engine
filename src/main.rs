@@ -78,7 +78,7 @@ const N_HEAD: usize = 12;
 const N_LAYERS: usize = 24; // production config
 const MAESTRO_DIM: usize = 16; // validated: conductor ceiling at 16, 48:1 compression at 768-dim
 const BLOCK_SIZE: usize = 256;
-const RK4_STEPS: usize = 8; // lab-validated: identical quality to 16, 1.9x faster ODE
+const RK4_STEPS: usize = 16; // 8 causes NaN at 768-dim on CPU tier; Candle uses perturbative (no RK4)
 
 // ─── Model ──────────────────────────────────────────────────────
 
