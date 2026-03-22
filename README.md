@@ -308,12 +308,29 @@ What this means for contributions:
 | fp16 for linear ops | Halve memory and PCIe transfer size | Medium |
 | Speculative decoding | Lower per-token latency for serving | Large |
 
+## Important: Model Compatibility
+
+Models trained by wave-engine use a novel architecture (Kerr-ODE, harmonic coherence attention, block-diagonal projections) that is **not compatible** with standard inference tools. Trained checkpoints will **only** work with [wave-server](https://github.com/atech-hub/wave-server). They cannot be loaded by LM Studio, Ollama, llama.cpp, vLLM, or Hugging Face Transformers — these tools have no code path for ODE integration or harmonic attention.
+
+Train with wave-engine → serve with wave-server → connect any OpenAI-compatible chat UI.
+
 ## Related
 
 - [Wave Coherence as a Computational Primitive](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive) — The parent research project (public, MIT, 1000+ cloners)
 - [wave-server](https://github.com/atech-hub/wave-server) — OpenAI-compatible inference server with KV-cache and wave memory (public, Apache 2.0)
 - [kerr-memory](https://github.com/atech-hub/kerr-memory) — Persistent wave memory state (public, Apache 2.0)
 - [kerr-engine](https://github.com/atech-hub/kerr-engine) — First implementation, historical reference (public, Apache 2.0)
+
+## References and Acknowledgments
+
+The perturbative ODE and GPU architecture draw on published work from multiple fields:
+
+- **Secondini et al. (2015)** — "[Fiber Nonlinearity Mitigation in WDM Systems: Enhanced Split-Step Fourier Method](https://arxiv.org/abs/1507.00921)." The ESSFM single-step approach inspired the perturbative Kerr-ODE: replace iterative numerical integration with a single analytical pass.
+- **Lin et al. (2022)** — "[Perturbation-Aided Sample-Based Learned Digital Back-Propagation](https://arxiv.org/abs/2110.05563)." Informed the α/β phase correction structure — self-phase modulation + cross-phase modulation as learnable perturbation terms.
+- **Pal et al. (2024)** — "[Coupled Lugiato-Lefèvre Equation for Nonlinear Frequency Comb Generation](https://arxiv.org/abs/2404.05646v2)." The physical basis for Kerr coupling terms between oscillator bands.
+- **Ng (2026)** — "[RYS-XLarge: Repeated Blocks for Parameter Efficiency](https://huggingface.co/blog/rys-xlarge)." Inspiration for the repeated-blocks experiment (serve model through blocks twice for quality improvement).
+- **Listopad (2025)** — "[ResonanceDB: Phase-Aware Vector Database](https://arxiv.org/abs/2509.09691)." Independent validation of the phase-aware approach to vector similarity, confirming that per-harmonic coherence captures structure invisible to cosine similarity.
+- **Ping-pong buffer pattern** — Standard GPU compute technique for maintaining numerical consistency between forward and backward passes. Our implementation was informed by studying a wgpu Game of Life tutorial demonstrating double-buffered compute dispatch.
 
 ## License
 
