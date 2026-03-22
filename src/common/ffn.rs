@@ -38,9 +38,13 @@ pub fn ffn_forward_via_backend(
     //    CPU FFT fallback, sequential last resort
     let _t_ode = std::time::Instant::now();
     let (kerr_out, ode_device): (Vec<Vec<f32>>, &str) = if let Some((_bufs, gpu_be)) = ping_pong {
-        // GPU fused: entire RK4 loop in one command encoder submit
-        let out = gpu_be.gpu_kerr_ode_batch_fused(&weights.kerr, &precond);
-        (out, "GPU-fused")
+        // GPU: perturbative (single dispatch) or fused RK4 based on rk4_n_steps
+        let out = if weights.kerr.rk4_n_steps <= 1 {
+            gpu_be.gpu_kerr_ode_perturbative_batch(&weights.kerr, &precond)
+        } else {
+            gpu_be.gpu_kerr_ode_batch_fused(&weights.kerr, &precond)
+        };
+        (out, if weights.kerr.rk4_n_steps <= 1 { "GPU-perturbative" } else { "GPU-fused" })
     } else if let Some(st) = stencil {
         let out = precond.iter().map(|p| {
             crate::fft_ode::kerr_ode_fft(p, &weights.kerr.gamma_raw, &weights.kerr.omega,

@@ -62,8 +62,13 @@ impl ComputeBackend for GpuBackend {
     }
 
     fn kerr_ode_batch(&self, weights: &KerrWeights, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        // Fused path with rk4_combine clamping for stability at 512+ bands
-        self.gpu_kerr_ode_batch_fused(weights, xs)
+        if weights.rk4_n_steps <= 1 {
+            // Perturbative: single-dispatch analytical approximation (default)
+            self.gpu_kerr_ode_perturbative_batch(weights, xs)
+        } else {
+            // Fused RK4 path with rk4_combine clamping for stability at 512+ bands
+            self.gpu_kerr_ode_batch_fused(weights, xs)
+        }
     }
 
     fn maestro(&self, weights: &MaestroWeights, x: &[f32]) -> Vec<f32> {
@@ -162,8 +167,8 @@ impl ComputeBackend for GpuBackend {
         let t = x.len();
         let n_embd = x[0].len();
 
-        // Batched Kerr-ODE: fused path with rk4_combine clamping
-        let kerr_outs = self.gpu_kerr_ode_batch_fused(&weights.kerr, x);
+        // Batched Kerr-ODE: perturbative or fused RK4 (selected by kerr_ode_batch)
+        let kerr_outs = self.kerr_ode_batch(&weights.kerr, x);
 
         // NaN detection: Kerr-ODE vs Maestro
         if kerr_outs.iter().any(|h| h.iter().any(|v| v.is_nan())) {
@@ -518,7 +523,7 @@ impl ComputeBackend for GpuBackend {
             for i in 0..n_embd { p[i] = x[pos][i] + mae_in_out[pos][i]; }
             p
         }).collect();
-        let kerr_outs = self.gpu_kerr_ode_batch_fused(&weights.kerr, &precond);
+        let kerr_outs = self.kerr_ode_batch(&weights.kerr, &precond);
         if kerr_outs.iter().any(|h| h.iter().any(|v| v.is_nan())) {
             eprintln!("    [NaN source: dual-maestro Kerr-ODE output]");
         }
@@ -532,7 +537,22 @@ impl ComputeBackend for GpuBackend {
             for i in 0..n_embd { r[i] = kerr_outs[pos][i] + mae_out_out[pos][i]; }
             r
         }).collect();
-        self.linear_batch(&weights.out_proj.as_linear().w, &weights.out_proj.as_linear().b, &regulated)
+        // Use block-diagonal shader when out_proj is BlockDiagonal, dense otherwise
+        match &weights.out_proj {
+            OutProjWeights::BlockDiagonal(bd) => {
+                let w_flat = weights.out_proj.weights_flat();
+                let b_flat = weights.out_proj.bias_flat();
+                let x_flat: Vec<f32> = regulated.iter().flat_map(|v| v.iter().copied()).collect();
+                let y_flat = self.gpu_matvec_block_diag_batch(
+                    &w_flat, &b_flat, &x_flat,
+                    bd.n_groups, bd.group_size, t,
+                );
+                y_flat.chunks(n_embd).map(|c| c.to_vec()).collect()
+            }
+            OutProjWeights::Dense(lw) => {
+                self.linear_batch(&lw.w, &lw.b, &regulated)
+            }
+        }
     }
 
     fn linear_batch(&self, w: &[Vec<f32>], b: &[f32], xs: &[Vec<f32>]) -> Vec<Vec<f32>> {

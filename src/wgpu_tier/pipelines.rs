@@ -79,6 +79,12 @@ pub struct GpuBackend {
     // FFT 512-point convolution (OFDM-inspired ODE acceleration)
     pub(crate) fft_convolve_pipeline: wgpu::ComputePipeline,
     pub(crate) fft_convolve_layout: wgpu::BindGroupLayout,
+    // Perturbative Kerr-ODE: single-dispatch analytical approximation (replaces 192-dispatch RK4)
+    pub(crate) kerr_perturbative_pipeline: wgpu::ComputePipeline,
+    pub(crate) kerr_perturbative_layout: wgpu::BindGroupLayout,
+    // Block-diagonal batched matvec: N groups of group_size dims (replaces dense matvec for out_proj)
+    pub(crate) matvec_block_diag_pipeline: wgpu::ComputePipeline,
+    pub(crate) matvec_block_diag_layout: wgpu::BindGroupLayout,
 }
 
 // ─── Uniform param structs ──────────────────────────────────────
@@ -243,6 +249,24 @@ pub(crate) struct KerrBwdBatchParams {
     pub n_pos: u32,
     pub alpha: f32,
     pub beta: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct PerturbativeParams {
+    pub n_bands: u32,
+    pub n_pos: u32,
+    pub alpha: f32,
+    pub beta: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct BlockDiagParams {
+    pub group_size: u32,
+    pub n_groups: u32,
+    pub n_pos: u32,
+    pub n_embd: u32,
 }
 
 // ─── Helper: build bind group layout entries ────────────────────
@@ -870,6 +894,58 @@ impl GpuBackend {
             entry_point: Some("fft_convolve"), compilation_options: Default::default(), cache: None,
         });
 
+        // ─── Compile perturbative Kerr-ODE shader (single-dispatch analytical) ──
+        let kp_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kerr_perturbative_batch"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/kerr_perturbative_batch.wgsl").into()),
+        });
+        // bindings: 0=r_in(ro), 1=s_in(ro), 2=r_out(rw), 3=s_out(rw),
+        //           4=decay(ro), 5=cos_w(ro), 6=sin_w(ro), 7=params(uniform)
+        let kerr_perturbative_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("kerr_perturbative_layout"),
+            entries: &[
+                storage_ro(0), storage_ro(1), storage_rw(2), storage_rw(3),
+                storage_ro(4), storage_ro(5), storage_ro(6), uniform_entry(7),
+            ],
+        });
+        let kp_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("kerr_perturbative_pl"),
+            bind_group_layouts: &[&kerr_perturbative_layout],
+            push_constant_ranges: &[],
+        });
+        let kerr_perturbative_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("kerr_perturbative_pipeline"),
+            layout: Some(&kp_pl),
+            module: &kp_module,
+            entry_point: Some("kerr_perturbative_batch"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ─── Compile block-diagonal batched matvec shader ──────────────
+        let bd_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("matvec_block_diagonal_batch"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/matvec_block_diagonal_batch.wgsl").into()),
+        });
+        // bindings: 0=w(ro), 1=x(ro), 2=b(ro), 3=y(rw), 4=params(uniform)
+        let matvec_block_diag_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("matvec_block_diag_layout"),
+            entries: &[storage_ro(0), storage_ro(1), storage_ro(2), storage_rw(3), uniform_entry(4)],
+        });
+        let bd_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("matvec_block_diag_pl"),
+            bind_group_layouts: &[&matvec_block_diag_layout],
+            push_constant_ranges: &[],
+        });
+        let matvec_block_diag_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("matvec_block_diag_pipeline"),
+            layout: Some(&bd_pl),
+            module: &bd_module,
+            entry_point: Some("matvec_block_diagonal_batch"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         Self {
             device,
             queue,
@@ -915,6 +991,10 @@ impl GpuBackend {
             vec_add_layout,
             fft_convolve_pipeline,
             fft_convolve_layout,
+            kerr_perturbative_pipeline,
+            kerr_perturbative_layout,
+            matvec_block_diag_pipeline,
+            matvec_block_diag_layout,
             pool: Mutex::new(GpuBufferPool::new()),
             resident: Mutex::new(None),
             ffn_block_counter: std::sync::atomic::AtomicUsize::new(0),

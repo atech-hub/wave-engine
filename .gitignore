@@ -5,6 +5,12 @@
 *.bin
 *.ckpt
 *.kwmf
+*.safetensors
+*.meta
+
+# Training logs
+training_log.jsonl
+block_diag_test.log
 
 # IDE
 .vscode/
@@ -17,24 +23,44 @@
 .DS_Store
 Thumbs.db
 
-# Large data files (download separately)
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Hybrid experiment (parked — MLP analysis showed no wave structure in trained weights)
+/hybrid/
+/wave-hybrid-Qwen2.5-0.5B/
+
+# Internal spec files (implementation notes for Code, not public documentation)
+HYBRID-*.md
+DISTILLATION-SPEC.md
+IMPLEMENT-*.md
+REFACTOR-*.md
+CONFIGURABLE-DIMS-SPEC.md
+VMM-INTEGRATION-SPEC.md
+WGPU-SHADER-OPTIMISATION-SPEC.md
+BLOCK-DIAGONAL-CONSISTENCY.md
+MODULE-ARCHITECTURE-SPEC.md
+RELEASE-SEQUENCE.md
+SCALING-SWEEP-SPEC.md
+
+# Large data files (download separately or generate)
 data/tokenizer.json
-
-# Raw audit logs (not useful for public)
-results/audit_*.txt
-
-# Large data files
 data/wikitext.txt
 data/wikitext.txt.bpe.tokens
 data/grammar_corpus.txt.char.tokens
 data/input.txt.char.tokens
-*.safetensors
-*.meta
-training_log.jsonl
-block_diag_test.log
-checkpoint.bin
-checkpoint_iter*.bin
 data/grammar/*.txt
 data/grammar_clean.txt
 data/grammar_corpus.txt
 data/grammar_plus_shakespeare.txt
+data/combined_distill.txt
+data/children.txt
+data/legal.txt
+
+# Raw audit logs
+results/audit_*.txt
+
+# Lab experiments (internal benchmarks)
+/lab/
