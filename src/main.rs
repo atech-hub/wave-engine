@@ -89,14 +89,18 @@ static PROFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 // ─── Config ──────────────────────────────────────────────────────
 
-// 24-layer build config (Phase 1)
+// Compile-time defaults (used as fallbacks when CLI flags not provided)
 const N_BANDS: usize = 384;
-const N_EMBD: usize = N_BANDS * 2; // 768
+const N_EMBD: usize = N_BANDS * 2;
 const N_HEAD: usize = 12;
-const N_LAYERS: usize = 24; // production config
-const MAESTRO_DIM: usize = 16; // validated: conductor ceiling at 16, 48:1 compression at 768-dim
+const N_LAYERS: usize = 24;
+const MAESTRO_DIM: usize = 16;
 const BLOCK_SIZE: usize = 256;
-const RK4_STEPS: usize = 16; // 8 causes NaN at 768-dim on CPU tier; Candle uses perturbative (no RK4)
+const RK4_STEPS: usize = 16;
+
+// These constants are still used by files that import them via `use crate::`.
+// They will be replaced by RuntimeConfig values when passed to functions.
+// TODO: Remove constants once all consumers use RuntimeConfig.
 
 // ─── Model ──────────────────────────────────────────────────────
 
@@ -822,6 +826,18 @@ fn print_help() {
     println!("    --lr F            Learning rate                          [default: 1e-4]");
     println!("    --layers N        Number of transformer blocks           [default: 24]");
     println!();
+    println!("ARCHITECTURE:");
+    println!("    --n-bands N       Harmonic frequency bands (n_embd = N×2) [default: 384]");
+    println!("    --n-head N        Number of attention heads               [default: 12]");
+    println!("    --maestro-dim N   Maestro bottleneck width                [default: 16]");
+    println!("    --rk4-steps N     ODE integration steps (CPU/wgpu only)   [default: 16]");
+    println!("    --out-proj-groups N  Block-diagonal groups (1=dense)      [default: 6]");
+    println!();
+    println!("    Common presets:");
+    println!("      768-dim:   --n-bands 384  --n-head 12  (default)");
+    println!("      4096-dim:  --n-bands 2048 --n-head 32  --out-proj-groups 32");
+    println!("      8192-dim:  --n-bands 4096 --n-head 64  --out-proj-groups 64");
+    println!();
     println!("RESUME:");
     println!("    --resume FILE     Resume training from checkpoint.");
     println!("                      CPU/wgpu: WCHK .bin file (restores weights + Adam + RNG)");
@@ -836,39 +852,48 @@ fn print_help() {
     println!("ACCELERATION:");
     println!("    --gpu             Enable wgpu GPU (Vulkan/Metal/DX12)");
     println!("    --candle          Use Candle CUDA backend (requires --features candle-backend)");
-    println!("    --monitor         Enable per-section pipeline timing");
     println!();
-    println!("ARCHITECTURE (compile-time, change in source):");
-    println!("    N_BANDS = 384     Harmonic frequency bands (768-dim embedding)");
-    println!("    N_HEAD = 12       Attention heads");
-    println!("    MAESTRO_DIM = 16  Maestro bottleneck width (48:1 compression)");
-    println!("    RK4_STEPS = 16    ODE integration steps per layer");
+    println!("MONITORS:");
+    println!("    --monitor         Enable per-section pipeline timing (forward profiling)");
     println!();
-    println!("CHECKPOINTS (saved every 500 iters):");
-    println!("    checkpoint.bin                       WCHK — wave-server compatible, all tiers");
-    println!("    candle_checkpoint_iter500.safetensors Candle resume format");
-    println!("    checkpoint_iter500.bin                CPU/wgpu resume format");
+    println!("    Always-on telemetry (no flag needed):");
+    println!("      training_log.jsonl   Per-iteration: loss, lr, time, vram_mb, nan_skips");
+    println!("      VRAM monitoring      CUDA memory usage via cudarc (Candle tier)");
+    println!("      Grad norm            Displayed every 10 iters (CPU/wgpu) or 50 (Candle)");
+    println!("      NaN recovery         Skips corrupted steps, logs count, continues");
+    println!("      Cosine LR schedule   Warmup 100 iters → cosine decay to 10% (Candle)");
+    println!();
+    println!("    Per-section profiling (--monitor flag):");
+    println!("      [FFN fwd]   mae_in, ODE, mae_out, out_proj — per block timing");
+    println!("      [FFN bwd]   out_proj backward timing");
+    println!("      [VRAM]      GPU memory at each pipeline stage (Candle, first 5 iters)");
+    println!();
+    println!("CHECKPOINTS (saved every 500 iters, WCHK v2):");
+    println!("    checkpoint.bin                              WCHK — wave-server compatible");
+    println!("    candle_checkpoint_iter500_loss6.82.safetensors  Candle resume (loss in name)");
+    println!("    checkpoint_iter500.bin                      CPU/wgpu resume");
+    println!("    NaN guard: corrupted checkpoints are NOT saved (loss=NaN/0.0 skipped)");
     println!();
     println!("EXAMPLES:");
     println!("    # Quick test (4 layers, char-level, 64 context)");
     println!("    wave-engine data/input.txt --layers 4 --iters 100 --seq 64");
     println!();
-    println!("    # Full BPE training with GPU");
-    println!("    wave-engine data/input.txt --bpe --gpu --iters 3000");
+    println!("    # Full BPE training with Candle CUDA");
+    println!("    wave-engine data/input.txt --candle --bpe --iters 3000 --batch 8");
     println!();
-    println!("    # Candle CUDA backend");
-    println!("    wave-engine data/input.txt --candle --bpe --iters 3000");
+    println!("    # Scaling test at 4096-dim");
+    println!("    wave-engine data/input.txt --candle --n-bands 2048 --n-head 32 --layers 4 --iters 10");
     println!();
-    println!("    # Resume from checkpoint (CPU/wgpu)");
-    println!("    wave-engine data/input.txt --resume checkpoint_iter2000.bin --iters 1000");
+    println!("    # Resume from checkpoint");
+    println!("    wave-engine data/input.txt --candle --resume candle_checkpoint_latest.safetensors --iters 2000");
     println!();
-    println!("    # Resume from checkpoint (Candle)");
-    println!("    wave-engine data/input.txt --candle --bpe --resume candle_checkpoint_iter2000.safetensors --iters 1000");
+    println!("    # CPU with monitors");
+    println!("    wave-engine data/input.txt --layers 4 --iters 50 --monitor");
     println!();
     println!("THREE TIERS:");
-    println!("    CPU       Any hardware, gold standard precision");
-    println!("    wgpu GPU  Any GPU via Vulkan/Metal/DX12 (--gpu)");
-    println!("    Candle    NVIDIA CUDA via cuBLAS (--candle --features candle-backend)");
+    println!("    CPU       Any hardware, RK4-16 ODE, gold standard precision");
+    println!("    wgpu GPU  Any GPU via Vulkan/Metal/DX12 (--gpu), fused GPU ODE");
+    println!("    Candle    NVIDIA CUDA (--candle), perturbative ODE, block-diagonal out_proj");
     println!();
     println!("SOURCE: https://github.com/atech-hub/wave-engine");
     println!("SERVER: https://github.com/atech-hub/wave-server");
@@ -884,10 +909,22 @@ fn main() {
 
     // Check for --candle flag first — routes to entirely different training path
     if std::env::args().any(|a| a == "--candle") {
+        fn pflag<T: std::str::FromStr>(name: &str, default: T) -> T {
+            std::env::args().skip_while(|a| a != name).nth(1)
+                .and_then(|s| s.parse().ok()).unwrap_or(default)
+        }
         let data_path = std::env::args().nth(1).unwrap_or("data/input.txt".to_string());
-        let n_iters: usize = std::env::args().skip_while(|a| a != "--iters").nth(1)
-            .and_then(|s| s.parse().ok()).unwrap_or(200);
-        match candle_engine::engine::train_candle(&data_path, n_iters) {
+        let n_iters: usize = pflag("--iters", 200);
+        let n_bands: usize = pflag("--n-bands", N_BANDS);
+        let n_head: usize = pflag("--n-head", N_HEAD);
+        let n_layers: usize = pflag("--layers", N_LAYERS);
+        let maestro_dim: usize = pflag("--maestro-dim", MAESTRO_DIM);
+        let rk4_steps: usize = pflag("--rk4-steps", RK4_STEPS);
+        let out_proj_groups: usize = pflag("--out-proj-groups", 6);
+
+        match candle_engine::engine::train_candle(
+            &data_path, n_iters, n_bands, n_head, n_layers, maestro_dim, rk4_steps, out_proj_groups,
+        ) {
             Ok(()) => return,
             Err(e) => { eprintln!("Candle error: {e:?}"); std::process::exit(1); }
         }

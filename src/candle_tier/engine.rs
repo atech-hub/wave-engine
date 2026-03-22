@@ -264,6 +264,12 @@ pub mod engine {
         lm_head: Tensor,
 
         device: Device,
+
+        // Runtime config
+        n_bands: usize,
+        n_embd: usize,
+        n_head: usize,
+        block_size: usize,
     }
 
     struct CandleBlock {
@@ -291,42 +297,51 @@ pub mod engine {
     }
 
     impl CandleWaveModel {
-        pub fn new(varmap: &VarMap, vocab_size: usize, device: &Device) -> Result<Self> {
+        pub fn new(varmap: &VarMap, vocab_size: usize, device: &Device,
+                   n_bands: usize, n_head: usize, n_layers: usize, maestro_dim: usize,
+                   rk4_steps: usize, out_proj_groups: usize) -> Result<Self> {
+            let n_embd = n_bands * 2;
+            let block_size = 256; // positional table size
+            // Save config for methods
+            let n_bands_cfg = n_bands;
+            let n_embd_cfg = n_embd;
+            let n_head_cfg = n_head;
+            let block_size_cfg = block_size;
             let mut rng = crate::rng::Rng::new(42);
 
             // Frozen embeddings
-            let wte_data = build_harmonic_table(vocab_size, N_BANDS);
+            let wte_data = build_harmonic_table(vocab_size, n_bands);
             let wte_flat: Vec<f32> = wte_data.iter().flat_map(|r| r.iter().copied()).collect();
-            let wte = Tensor::from_vec(wte_flat, (vocab_size, N_EMBD), device)?;
+            let wte = Tensor::from_vec(wte_flat, (vocab_size, n_embd), device)?;
 
-            let wpe_data = build_positional_table(BLOCK_SIZE, N_BANDS);
+            let wpe_data = build_positional_table(block_size, n_bands);
             let wpe_flat: Vec<f32> = wpe_data.iter().flat_map(|r| r.iter().copied()).collect();
-            let wpe = Tensor::from_vec(wpe_flat, (BLOCK_SIZE, N_EMBD), device)?;
+            let wpe = Tensor::from_vec(wpe_flat, (block_size, n_embd), device)?;
 
             let vs = VarBuilder::from_varmap(varmap, DType::F32, device);
 
             let mut blocks = Vec::new();
-            for layer in 0..N_LAYERS {
+            for layer in 0..n_layers {
                 let prefix = format!("block.{layer}");
                 let vs_block = vs.pp(&prefix);
 
                 // LN (trained)
-                let ln_w = vs_block.get_with_hints((N_EMBD,), "ln_w", candle_nn::Init::Const(1.0))?;
-                let ln_b = vs_block.get_with_hints((N_EMBD,), "ln_b", candle_nn::Init::Const(0.0))?;
+                let ln_w = vs_block.get_with_hints((n_embd,), "ln_w", candle_nn::Init::Const(1.0))?;
+                let ln_b = vs_block.get_with_hints((n_embd,), "ln_b", candle_nn::Init::Const(0.0))?;
 
                 // Attention heads (frozen)
-                let head_dim = N_EMBD / N_HEAD;
+                let head_dim = n_embd / n_head;
                 let mut phase_proj_ws = Vec::new();
                 let mut phase_proj_bs = Vec::new();
                 let mut v_proj_ws = Vec::new();
                 let mut v_proj_bs = Vec::new();
                 let mut harmonic_ns = Vec::new();
 
-                for h in 0..N_HEAD {
-                    let limit = 1.0 / (N_EMBD as f32).sqrt();
-                    let pw: Vec<f32> = (0..2*N_EMBD).map(|_| rng.uniform(limit)).collect();
+                for h in 0..n_head {
+                    let limit = 1.0 / (n_embd as f32).sqrt();
+                    let pw: Vec<f32> = (0..2*n_embd).map(|_| rng.uniform(limit)).collect();
                     let pb = vec![0.0f32; 2];
-                    phase_proj_ws.push(Tensor::from_vec(pw, (2, N_EMBD), device)?);
+                    phase_proj_ws.push(Tensor::from_vec(pw, (2, n_embd), device)?);
                     phase_proj_bs.push(Tensor::from_vec(pb, (2,), device)?);
 
                     let vlimit = 1.0 / (head_dim as f32).sqrt();
@@ -338,29 +353,29 @@ pub mod engine {
                     harmonic_ns.push(((h + 1) as f32 * 0.5f32).ln());
                 }
 
-                let olimit = 1.0 / (N_EMBD as f32).sqrt();
-                let ow: Vec<f32> = (0..N_EMBD*N_EMBD).map(|_| rng.uniform(olimit)).collect();
-                let ob = vec![0.0f32; N_EMBD];
-                let attn_out_proj_w = Tensor::from_vec(ow, (N_EMBD, N_EMBD), device)?;
-                let attn_out_proj_b = Tensor::from_vec(ob, (N_EMBD,), device)?;
+                let olimit = 1.0 / (n_embd as f32).sqrt();
+                let ow: Vec<f32> = (0..n_embd*n_embd).map(|_| rng.uniform(olimit)).collect();
+                let ob = vec![0.0f32; n_embd];
+                let attn_out_proj_w = Tensor::from_vec(ow, (n_embd, n_embd), device)?;
+                let attn_out_proj_b = Tensor::from_vec(ob, (n_embd,), device)?;
 
                 // FFN (trained)
-                let mae_in_sq = linear_uniform(N_EMBD, MAESTRO_DIM, vs_block.pp("mae_in_sq"))?;
-                let mae_in_pr = linear_uniform(MAESTRO_DIM, N_EMBD, vs_block.pp("mae_in_pr"))?;
-                let mae_out_sq = linear_uniform(N_EMBD, MAESTRO_DIM, vs_block.pp("mae_out_sq"))?;
-                let mae_out_pr = linear_uniform(MAESTRO_DIM, N_EMBD, vs_block.pp("mae_out_pr"))?;
+                let mae_in_sq = linear_uniform(n_embd, maestro_dim, vs_block.pp("mae_in_sq"))?;
+                let mae_in_pr = linear_uniform(maestro_dim, n_embd, vs_block.pp("mae_in_pr"))?;
+                let mae_out_sq = linear_uniform(n_embd, maestro_dim, vs_block.pp("mae_out_sq"))?;
+                let mae_out_pr = linear_uniform(maestro_dim, n_embd, vs_block.pp("mae_out_pr"))?;
                 let out_proj = crate::block_diagonal::block_diag::BlockDiagonalLinear::new(
-                    N_EMBD, 6, vs_block.pp("out_proj"),  // 6 groups of 128 dims — 6x param reduction
+                    n_embd, out_proj_groups, vs_block.pp("out_proj"),  // configurable groups
                 )?;
 
                 // ODE params (frozen)
                 let gamma_raw_val = ((0.1f32).exp() - 1.0).ln();
                 let ode_params = OdeParams {
-                    gamma_raw: vec![gamma_raw_val; N_BANDS],
-                    omega: (0..N_BANDS).map(|k| (k + 1) as f32 / N_BANDS as f32).collect(),
+                    gamma_raw: vec![gamma_raw_val; n_bands],
+                    omega: (0..n_bands).map(|k| (k + 1) as f32 / n_bands as f32).collect(),
                     alpha: 0.1,
                     beta: 0.1,
-                    rk4_n_steps: RK4_STEPS,
+                    rk4_n_steps: rk4_steps,
                 };
                 let gpu_ode_params = crate::gpu_ode::gpu_ode::GpuOdeParams::new(
                     &ode_params.gamma_raw, &ode_params.omega,
@@ -376,16 +391,17 @@ pub mod engine {
             }
 
             // Final LN + LM head (trained)
-            let ln_f_w = vs.get_with_hints((N_EMBD,), "ln_f_w", candle_nn::Init::Const(1.0))?;
-            let ln_f_b = vs.get_with_hints((N_EMBD,), "ln_f_b", candle_nn::Init::Const(0.0))?;
-            let lm_head = vs.get_with_hints((vocab_size, N_EMBD), "lm_head",
-                candle_nn::Init::Randn { mean: 0.0, stdev: 1.0 / (N_EMBD as f64).sqrt() })?;
+            let ln_f_w = vs.get_with_hints((n_embd,), "ln_f_w", candle_nn::Init::Const(1.0))?;
+            let ln_f_b = vs.get_with_hints((n_embd,), "ln_f_b", candle_nn::Init::Const(0.0))?;
+            let lm_head = vs.get_with_hints((vocab_size, n_embd), "lm_head",
+                candle_nn::Init::Randn { mean: 0.0, stdev: 1.0 / (n_embd as f64).sqrt() })?;
 
-            Ok(Self { wte, wpe, blocks, ln_f_w, ln_f_b, lm_head, device: device.clone() })
+            Ok(Self { wte, wpe, blocks, ln_f_w, ln_f_b, lm_head, device: device.clone(),
+                n_bands: n_bands_cfg, n_embd: n_embd_cfg, n_head: n_head_cfg, block_size: block_size_cfg })
         }
 
         pub fn forward(&self, token_ids: &[usize]) -> Result<Tensor> {
-            self.forward_with_curriculum(token_ids, &vec![1.0f32; N_BANDS])
+            self.forward_with_curriculum(token_ids, &vec![1.0f32; self.n_bands])
         }
 
         /// Forward with curriculum: soft-mask inactive bands on FFN path only.
@@ -393,30 +409,34 @@ pub mod engine {
         /// intermediate values during ramp transitions).
         /// Attention sees full vector (frozen). FFN sees masked vector (trains on active bands).
         pub fn forward_with_curriculum(&self, token_ids: &[usize], band_masks: &[f32]) -> Result<Tensor> {
+            let n_bands = self.n_bands;
+            let n_embd = self.n_embd;
+            let n_head = self.n_head;
+            let block_size = self.block_size;
             let n_pos = token_ids.len();
 
             // Build GPU-resident mask from per-band values
             let ffn_mask = if band_masks.iter().any(|&v| v < 1.0) {
-                let mut mask_data = vec![0.0f32; N_EMBD];
-                for k in 0..N_BANDS {
+                let mut mask_data = vec![0.0f32; n_embd];
+                for k in 0..n_bands {
                     mask_data[k * 2] = band_masks[k];
                     mask_data[k * 2 + 1] = band_masks[k];
                 }
-                Some(Tensor::from_vec(mask_data, (1, N_EMBD), &self.device)?)
+                Some(Tensor::from_vec(mask_data, (1, n_embd), &self.device)?)
             } else {
                 None
             };
 
             // Embedding: lookup + positional (NO masking — LN needs full vector)
-            let mut hidden_vecs = vec![0.0f32; n_pos * N_EMBD];
+            let mut hidden_vecs = vec![0.0f32; n_pos * n_embd];
             let wte_data = self.wte.to_vec2::<f32>()?;
             let wpe_data = self.wpe.to_vec2::<f32>()?;
             for (pos, &tok) in token_ids.iter().enumerate() {
-                for i in 0..N_EMBD {
-                    hidden_vecs[pos * N_EMBD + i] = wte_data[tok][i] + wpe_data[pos][i];
+                for i in 0..n_embd {
+                    hidden_vecs[pos * n_embd + i] = wte_data[tok][i] + wpe_data[pos][i];
                 }
             }
-            let mut hidden = Tensor::from_vec(hidden_vecs, (n_pos, N_EMBD), &self.device)?;
+            let mut hidden = Tensor::from_vec(hidden_vecs, (n_pos, n_embd), &self.device)?;
 
             for (block_idx, block) in self.blocks.iter().enumerate() {
                 let normed = layer_norm(&hidden, &block.ln_w, &block.ln_b)?;
@@ -499,8 +519,17 @@ pub mod engine {
 
     // ─── Training loop ───
 
-    pub fn train_candle(data_path: &str, n_iters: usize) -> Result<()> {
+    pub fn train_candle(
+        data_path: &str, n_iters: usize,
+        n_bands: usize, n_head: usize, n_layers: usize,
+        maestro_dim: usize, _rk4_steps: usize, out_proj_groups: usize,
+    ) -> Result<()> {
+        // Runtime config — lowercase variables used throughout
+        let n_embd = n_bands * 2;
+        let block_size = 256usize; // positional table size
+
         println!("Candle backend — wave-engine\n");
+        println!("  Config: {n_bands} bands, {n_head} heads, {n_layers} layers, {maestro_dim} maestro, {out_proj_groups} out_proj groups");
 
         // Device
         let device = Device::cuda_if_available(0)?;
@@ -543,10 +572,11 @@ pub mod engine {
 
         // Model
         let mut varmap = VarMap::new();
-        let model = CandleWaveModel::new(&varmap, vocab_size, &device)?;
+        let model = CandleWaveModel::new(&varmap, vocab_size, &device,
+            n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups)?;
         let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
         println!("  Trainable params: {n_params}");
-        println!("  Architecture: {N_LAYERS} layers, {N_HEAD} heads, {N_BANDS} bands");
+        println!("  Architecture: {n_layers} layers, {n_head} heads, {n_bands} bands");
 
         // Resume from checkpoint if --resume flag
         let resume_path: Option<String> = std::env::args().skip_while(|a| a != "--resume").nth(1);
@@ -580,7 +610,7 @@ pub mod engine {
         }
         let batch_size: usize = parse_flag_c("--batch", 4);
         let seq_len: usize = parse_flag_c("--seq", 256);
-        let lr: f64 = parse_flag_c("--lr", if N_BANDS > 256 { 1e-4 } else { 3e-4 });
+        let lr: f64 = parse_flag_c("--lr", if n_bands > 256 { 1e-4 } else { 3e-4 });
 
         // Optimizer
         use candle_nn::Optimizer;
@@ -593,9 +623,9 @@ pub mod engine {
         // Curriculum: soft-mask inactive bands (0.01 scale, not zero)
         let use_curriculum = !std::env::args().any(|a| a == "--no-curriculum");
         let curriculum = if use_curriculum {
-            crate::train::CurriculumSchedule::default_4stage(N_BANDS)
+            crate::train::CurriculumSchedule::default_4stage(n_bands)
         } else {
-            crate::train::CurriculumSchedule::none(N_BANDS)
+            crate::train::CurriculumSchedule::none(n_bands)
         };
 
         let total_iters = start_iter + n_iters;
@@ -625,7 +655,7 @@ pub mod engine {
         let train_start = Instant::now();
 
         for iter in start_iter..total_iters {
-            let band_masks = curriculum.band_masks(iter, total_iters, N_BANDS);
+            let band_masks = curriculum.band_masks(iter, total_iters, n_bands);
             let iter_start = Instant::now();
             let mut total_loss = 0.0f32;
 
@@ -722,11 +752,11 @@ pub mod engine {
                 let _ = varmap.save("candle_checkpoint_latest.safetensors");
                 std::fs::write("candle_checkpoint_latest.meta", &meta).ok();
 
-                let params = extract_wchk_params(&varmap, N_LAYERS, N_EMBD, MAESTRO_DIM, vocab_size);
+                let params = extract_wchk_params(&varmap, n_layers, n_embd, maestro_dim, vocab_size, out_proj_groups);
                 let dummy_adam = crate::train::Adam::new(lr as f32, params.len());
-                let out_proj_groups = 6; // Candle uses 6-group block-diagonal
+                // out_proj_groups from runtime config
                 crate::wave_checkpoint::save_checkpoint(
-                    &params, vocab_size, N_LAYERS, out_proj_groups, iter + 1, lr as f32,
+                    &params, vocab_size, n_layers, out_proj_groups, iter + 1, lr as f32,
                     &dummy_adam, 0, "checkpoint.bin",
                 );
                 } // end NaN guard else
@@ -743,7 +773,7 @@ pub mod engine {
     /// Extract params from VarMap in WCHK flatten_params order.
     /// Order: per block (ln_w, ln_b, ln_ffn_w, ln_ffn_b, mae_in_sq, mae_in_pr,
     ///   mae_out_sq, mae_out_pr, out_proj), then ln_f_w, ln_f_b, lm_head.
-    fn extract_wchk_params(varmap: &VarMap, n_layers: usize, n_embd: usize, maestro_dim: usize, vocab_size: usize) -> Vec<f32> {
+    fn extract_wchk_params(varmap: &VarMap, n_layers: usize, n_embd: usize, maestro_dim: usize, vocab_size: usize, out_proj_groups: usize) -> Vec<f32> {
         let mut params = Vec::new();
 
         let get_flat = |name: &str| -> Vec<f32> {
@@ -771,7 +801,7 @@ pub mod engine {
             params.extend(get_flat(&format!("{p}.mae_out_pr.bias")));
             // Out proj
             // Block-diagonal out_proj: 6 groups × (128×128 weight + 128 bias)
-            for g in 0..6 {
+            for g in 0..out_proj_groups {
                 params.extend(get_flat(&format!("{p}.out_proj.g{g}.weight")));
                 params.extend(get_flat(&format!("{p}.out_proj.g{g}.bias")));
             }
@@ -789,7 +819,7 @@ pub mod engine {
 // Stub when candle feature is not enabled
 #[cfg(not(feature = "candle-backend"))]
 pub mod engine {
-    pub fn train_candle(_data_path: &str, _n_iters: usize) -> std::result::Result<(), String> {
+    pub fn train_candle(_data_path: &str, _n_iters: usize, _n_bands: usize, _n_head: usize, _n_layers: usize, _maestro_dim: usize, _rk4_steps: usize, _out_proj_groups: usize) -> std::result::Result<(), String> {
         Err("Candle backend not enabled. Build with: cargo run --release --features candle-backend".to_string())
     }
 }
