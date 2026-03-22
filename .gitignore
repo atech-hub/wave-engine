@@ -34,3 +34,7 @@ training_log.jsonl
 block_diag_test.log
 checkpoint.bin
 checkpoint_iter*.bin
+data/grammar/*.txt
+data/grammar_clean.txt
+data/grammar_corpus.txt
+data/grammar_plus_shakespeare.txt
