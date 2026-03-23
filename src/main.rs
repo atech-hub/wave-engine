@@ -122,7 +122,7 @@ fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, 
     (w, b)
 }
 
-fn init_model(vocab_size: usize, seed: u64, n_layers: usize) -> WavePacketModel {
+fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: usize) -> WavePacketModel {
     let mut rng = Rng::new(seed);
 
     let wte = build_harmonic_table(vocab_size, N_BANDS);
@@ -165,8 +165,20 @@ fn init_model(vocab_size: usize, seed: u64, n_layers: usize) -> WavePacketModel 
             squeeze: LinearWeights { w: sq_w2, b: sq_b2 },
             process_1: LinearWeights { w: pr_w2, b: pr_b2 },
         };
-        let (op_w, op_b) = init_linear(&mut rng, N_EMBD, N_EMBD);
-        let ffn = KerrDualMaestroWeights { kerr, maestro_in, maestro_out, out_proj: OutProjWeights::dense(op_w, op_b) };
+        let out_proj = if out_proj_groups <= 1 {
+            let (op_w, op_b) = init_linear(&mut rng, N_EMBD, N_EMBD);
+            OutProjWeights::dense(op_w, op_b)
+        } else {
+            let group_size = N_EMBD / out_proj_groups;
+            let groups: Vec<LinearWeights> = (0..out_proj_groups).map(|_| {
+                let (w, b) = init_linear(&mut rng, group_size, group_size);
+                LinearWeights { w, b }
+            }).collect();
+            OutProjWeights::BlockDiagonal(BlockDiagonalWeights {
+                groups, n_groups: out_proj_groups, group_size,
+            })
+        };
+        let ffn = KerrDualMaestroWeights { kerr, maestro_in, maestro_out, out_proj };
 
         let ln_ffn = LayerNormWeights { weight: vec![1.0f32; N_EMBD], bias: vec![0.0f32; N_EMBD] };
         blocks.push(WaveBlockWeights { ln, ln_ffn, attn, ffn });
@@ -843,6 +855,7 @@ fn print_help() {
     println!("                      CPU/wgpu: WCHK .bin file (restores weights + Adam + RNG)");
     println!("                      Candle:   .safetensors file (restores weights only)");
     println!("    --no-curriculum   Disable progressive band curriculum (all bands from start)");
+    println!("    --checkpoint-name Save checkpoint to this filename          [default: checkpoint.bin]");
     println!();
     println!("TOKENIZER:");
     println!("    --bpe             Use BPE tokenizer (GPT-2 style)");
@@ -951,6 +964,8 @@ fn main() {
         use_curriculum: !std::env::args().any(|a| a == "--no-curriculum"),
         use_gpu: std::env::args().any(|a| a == "--gpu"),
         use_monitor: std::env::args().any(|a| a == "--monitor"),
+        out_proj_groups: parse_flag("--out-proj-groups", 6),
+        checkpoint_name: parse_flag("--checkpoint-name", "checkpoint.bin".to_string()),
     });
 }
 
