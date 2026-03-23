@@ -100,6 +100,21 @@ cargo run --release -- data/input.txt --n-bands 64 --n-head 4 --layers 4
 cargo run --release -- data/input.txt --n-bands 448 --n-head 14 --out-proj-groups 7
 ```
 
+### Analyse your trained model
+
+After training, inspect what the model learned using harmonic coherence diagnostics — the same `cos(n × Δθ)` math from the research framework:
+
+```bash
+# Wave structure report: semantic discrimination, depth curve, band census, phase clustering
+cargo run --release -- --analyze --resume checkpoint.bin --layers 4
+
+# With BPE tokenizer (for proper word-level semantic pairs)
+cargo run --release -- --analyze --resume checkpoint.bin --layers 24 --out-proj-groups 6 \
+    --bpe --tokenizer data/tokenizer.json
+```
+
+This runs a forward pass on curated test sentences, extracts phase angles at every layer, and sweeps harmonic coherence between known semantic pairs (cat/dog, noun/verb, etc.). Reports to console and `analysis/wave_report.json`.
+
 ### Serve your trained model
 
 After training, serve it with [wave-server](https://github.com/atech-hub/wave-server):

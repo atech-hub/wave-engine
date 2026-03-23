@@ -889,6 +889,16 @@ fn print_help() {
     println!("      [FFN bwd]   out_proj backward timing");
     println!("      [VRAM]      GPU memory at each pipeline stage (Candle, first 5 iters)");
     println!();
+    println!("ANALYSIS:");
+    println!("    --analyze         Run wave structure diagnostics on a trained model (no training)");
+    println!("                      Requires --resume <checkpoint>. Uses cos(n×Δθ) harmonic coherence.");
+    println!("                      Reports: semantic discrimination, depth curve, band census,");
+    println!("                      phase clustering, harmonic spectra. Output: console + analysis/wave_report.json");
+    println!();
+    println!("    Example:");
+    println!("    wave-engine --analyze --resume checkpoint.bin --layers 24 --out-proj-groups 6");
+    println!("    wave-engine --analyze --resume checkpoint.bin --layers 4 --bpe --tokenizer data/tokenizer.json");
+    println!();
     println!("CHECKPOINTS (saved every 500 iters, WCHK v2):");
     println!("    checkpoint.bin                              WCHK — wave-server compatible");
     println!("    candle_checkpoint_iter500_loss6.82.safetensors  Candle resume (loss in name)");
