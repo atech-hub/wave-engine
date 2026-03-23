@@ -30,10 +30,15 @@ impl Adam {
         (self.t, &self.m, &self.v)
     }
     pub fn step(&mut self, params: &mut [f32], grads: &[f32]) {
+        self.step_wd(params, grads, 0.01);
+    }
+    /// AdamW: weight decay applied before momentum update.
+    pub fn step_wd(&mut self, params: &mut [f32], grads: &[f32], wd: f32) {
         self.t += 1;
         let bc1 = 1.0 - self.beta1.powi(self.t as i32);
         let bc2 = 1.0 - self.beta2.powi(self.t as i32);
         for i in 0..params.len() {
+            if wd > 0.0 { params[i] -= self.lr * wd * params[i]; }
             self.m[i] = self.beta1 * self.m[i] + (1.0 - self.beta1) * grads[i];
             self.v[i] = self.beta2 * self.v[i] + (1.0 - self.beta2) * grads[i] * grads[i];
             let m_hat = self.m[i] / bc1;
@@ -294,6 +299,12 @@ pub fn run_training(config: TrainConfig) {
         total_loss /= batch_size as f32;
         for g in total_grads.iter_mut() { *g /= batch_size as f32; }
         monitor.record("reduce", t_reduce);
+
+        // NaN skip: discard batch if loss is NaN/Inf (ODE spike on unlucky data)
+        if total_loss.is_nan() || total_loss.is_infinite() {
+            if iter % 100 == 0 { eprintln!("  [NaN skip] iter {iter}"); }
+            continue;
+        }
 
         let t_optim = monitor.start();
         clip_grad_norm(&mut total_grads, 1.0);
