@@ -99,9 +99,26 @@ const MAESTRO_DIM: usize = 16;
 const BLOCK_SIZE: usize = 256;
 const RK4_STEPS: usize = 16;
 
-// These constants are still used by files that import them via `use crate::`.
-// They will be replaced by RuntimeConfig values when passed to functions.
-// TODO: Remove constants once all consumers use RuntimeConfig.
+/// Runtime model dimensions — replaces compile-time constants.
+/// Passed through init_model, forward, backward, and analyze.
+#[derive(Clone, Copy)]
+pub struct Dims {
+    pub n_bands: usize,
+    pub n_embd: usize,
+    pub n_head: usize,
+    pub maestro_dim: usize,
+    pub block_size: usize,
+    pub rk4_steps: usize,
+}
+
+impl Dims {
+    pub fn from_cli(n_bands: usize, n_head: usize, maestro_dim: usize, block_size: usize, rk4_steps: usize) -> Self {
+        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps }
+    }
+    pub fn defaults() -> Self {
+        Self::from_cli(N_BANDS, N_HEAD, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+    }
+}
 
 // ─── Model ──────────────────────────────────────────────────────
 
@@ -123,19 +140,19 @@ fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, 
     (w, b)
 }
 
-fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: usize) -> WavePacketModel {
+fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: usize, d: Dims) -> WavePacketModel {
     let mut rng = Rng::new(seed);
 
-    let wte = build_harmonic_table(vocab_size, N_BANDS);
-    let wpe = build_positional_table(BLOCK_SIZE, N_BANDS);
+    let wte = build_harmonic_table(vocab_size, d.n_bands);
+    let wpe = build_positional_table(d.block_size, d.n_bands);
 
     let mut blocks = Vec::new();
     for _ in 0..n_layers {
-        let ln = LayerNormWeights { weight: vec![1.0f32; N_EMBD], bias: vec![0.0f32; N_EMBD] };
+        let ln = LayerNormWeights { weight: vec![1.0f32; d.n_embd], bias: vec![0.0f32; d.n_embd] };
 
-        let head_dim = N_EMBD / N_HEAD;
-        let heads: Vec<WaveAttnHeadWeights> = (0..N_HEAD).map(|h| {
-            let (phase_w, phase_b) = init_linear(&mut rng, 2, N_EMBD);
+        let head_dim = d.n_embd / d.n_head;
+        let heads: Vec<WaveAttnHeadWeights> = (0..d.n_head).map(|h| {
+            let (phase_w, phase_b) = init_linear(&mut rng, 2, d.n_embd);
             let (v_w, v_b) = init_linear(&mut rng, head_dim, head_dim);
             WaveAttnHeadWeights {
                 harmonic_raw: ((h + 1) as f32 * 0.5f32).ln(),
@@ -145,32 +162,32 @@ fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: us
                 v_proj_b: v_b,
             }
         }).collect();
-        let (out_w, out_b) = init_linear(&mut rng, N_EMBD, N_EMBD);
+        let (out_w, out_b) = init_linear(&mut rng, d.n_embd, d.n_embd);
         let attn = WaveAttnWeights { heads, out_proj_w: out_w, out_proj_b: out_b };
 
         let gamma_raw_val = ((0.1f32).exp() - 1.0).ln();
         let kerr = KerrWeights {
-            gamma_raw: vec![gamma_raw_val; N_BANDS],
-            omega: (0..N_BANDS).map(|k| (k + 1) as f32 / N_BANDS as f32).collect(),
-            alpha: 0.1, beta: 0.1, rk4_n_steps: RK4_STEPS,
+            gamma_raw: vec![gamma_raw_val; d.n_bands],
+            omega: (0..d.n_bands).map(|k| (k + 1) as f32 / d.n_bands as f32).collect(),
+            alpha: 0.1, beta: 0.1, rk4_n_steps: d.rk4_steps,
         };
-        let (sq_w, sq_b) = init_linear(&mut rng, MAESTRO_DIM, N_EMBD);
-        let (pr_w, pr_b) = init_linear(&mut rng, N_EMBD, MAESTRO_DIM);
+        let (sq_w, sq_b) = init_linear(&mut rng, d.maestro_dim, d.n_embd);
+        let (pr_w, pr_b) = init_linear(&mut rng, d.n_embd, d.maestro_dim);
         let maestro_in = MaestroWeights {
             squeeze: LinearWeights { w: sq_w, b: sq_b },
             process_1: LinearWeights { w: pr_w, b: pr_b },
         };
-        let (sq_w2, sq_b2) = init_linear(&mut rng, MAESTRO_DIM, N_EMBD);
-        let (pr_w2, pr_b2) = init_linear(&mut rng, N_EMBD, MAESTRO_DIM);
+        let (sq_w2, sq_b2) = init_linear(&mut rng, d.maestro_dim, d.n_embd);
+        let (pr_w2, pr_b2) = init_linear(&mut rng, d.n_embd, d.maestro_dim);
         let maestro_out = MaestroWeights {
             squeeze: LinearWeights { w: sq_w2, b: sq_b2 },
             process_1: LinearWeights { w: pr_w2, b: pr_b2 },
         };
         let out_proj = if out_proj_groups <= 1 {
-            let (op_w, op_b) = init_linear(&mut rng, N_EMBD, N_EMBD);
+            let (op_w, op_b) = init_linear(&mut rng, d.n_embd, d.n_embd);
             OutProjWeights::dense(op_w, op_b)
         } else {
-            let group_size = N_EMBD / out_proj_groups;
+            let group_size = d.n_embd / out_proj_groups;
             let groups: Vec<LinearWeights> = (0..out_proj_groups).map(|_| {
                 let (w, b) = init_linear(&mut rng, group_size, group_size);
                 LinearWeights { w, b }
@@ -181,14 +198,14 @@ fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: us
         };
         let ffn = KerrDualMaestroWeights { kerr, maestro_in, maestro_out, out_proj };
 
-        let ln_ffn = LayerNormWeights { weight: vec![1.0f32; N_EMBD], bias: vec![0.0f32; N_EMBD] };
+        let ln_ffn = LayerNormWeights { weight: vec![1.0f32; d.n_embd], bias: vec![0.0f32; d.n_embd] };
         blocks.push(WaveBlockWeights { ln, ln_ffn, attn, ffn });
     }
 
-    let ln_f = LayerNormWeights { weight: vec![1.0f32; N_EMBD], bias: vec![0.0f32; N_EMBD] };
-    let limit = 1.0 / (N_EMBD as f32).sqrt();
+    let ln_f = LayerNormWeights { weight: vec![1.0f32; d.n_embd], bias: vec![0.0f32; d.n_embd] };
+    let limit = 1.0 / (d.n_embd as f32).sqrt();
     let lm_head: Vec<Vec<f32>> = (0..vocab_size)
-        .map(|_| (0..N_EMBD).map(|_| rng.uniform(limit)).collect())
+        .map(|_| (0..d.n_embd).map(|_| rng.uniform(limit)).collect())
         .collect();
 
     WavePacketModel { wte, wpe, blocks, ln_f, lm_head, vocab_size }
@@ -226,6 +243,7 @@ struct ForwardCache {
 fn forward_with_cache(
     model: &WavePacketModel,
     tokens: &[usize],
+    d: Dims,
     gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>,
     ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>,
     full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>,
@@ -235,7 +253,7 @@ fn forward_with_cache(
     let profile = PROFILE.load(std::sync::atomic::Ordering::Relaxed);
     let t = tokens.len();
     let _t0 = std::time::Instant::now();
-    let mut hidden = embed_tokens(tokens, &model.wte, &model.wpe, N_EMBD);
+    let mut hidden = embed_tokens(tokens, &model.wte, &model.wpe, d.n_embd);
     let mut block_caches = Vec::new();
     let mut _attn_total = std::time::Duration::ZERO;
     let mut _ffn_total = std::time::Duration::ZERO;
@@ -264,14 +282,14 @@ fn forward_with_cache(
 
         // Attention (CPU — frozen, harmonic coherence scoring)
         let _ta = std::time::Instant::now();
-        let (attn_out, att_weights) = wave_attention_forward(&block.attn, &normed, N_BANDS, gpu);
+        let (attn_out, att_weights) = wave_attention_forward(&block.attn, &normed, d.n_bands, gpu);
         let attn_dur = _ta.elapsed();
         _attn_total += attn_dur;
         _ffn_total += ffn_dur;
 
         let output: Vec<Vec<f32>> = (0..t).map(|i| {
-            let mut v = vec![0.0f32; N_EMBD];
-            for j in 0..N_EMBD { v[j] = hidden[i][j] + attn_out[i][j] + ffn_out[i][j]; }
+            let mut v = vec![0.0f32; d.n_embd];
+            for j in 0..d.n_embd { v[j] = hidden[i][j] + attn_out[i][j] + ffn_out[i][j]; }
             v
         }).collect();
 
@@ -300,7 +318,7 @@ fn forward_with_cache(
         let mut l = vec![0.0f32; model.vocab_size];
         for v in 0..model.vocab_size {
             let mut sum = 0.0f32;
-            for j in 0..N_EMBD { sum += model.lm_head[v][j] * normed[j]; }
+            for j in 0..d.n_embd { sum += model.lm_head[v][j] * normed[j]; }
             l[v] = sum;
         }
         l
@@ -384,34 +402,34 @@ struct Gradients {
     lm_head: Vec<Vec<f32>>,
 }
 
-fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>, ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>, full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>) -> (f32, Gradients) {
+fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], d: Dims, gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>, ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>, full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>) -> (f32, Gradients) {
     let t = cache.logits.len();
     let vocab_size = model.vocab_size;
 
     // Init gradients
     let n_blocks = model.blocks.len();
     let mut grads = Gradients {
-        block_ln_w: vec![vec![0.0; N_EMBD]; n_blocks],
-        block_ln_b: vec![vec![0.0; N_EMBD]; n_blocks],
-        block_ln_ffn_w: vec![vec![0.0; N_EMBD]; n_blocks],
-        block_ln_ffn_b: vec![vec![0.0; N_EMBD]; n_blocks],
-        block_ffn_kerr_gamma_raw: vec![vec![0.0; N_BANDS]; n_blocks],
-        block_ffn_kerr_omega: vec![vec![0.0; N_BANDS]; n_blocks],
+        block_ln_w: vec![vec![0.0; d.n_embd]; n_blocks],
+        block_ln_b: vec![vec![0.0; d.n_embd]; n_blocks],
+        block_ln_ffn_w: vec![vec![0.0; d.n_embd]; n_blocks],
+        block_ln_ffn_b: vec![vec![0.0; d.n_embd]; n_blocks],
+        block_ffn_kerr_gamma_raw: vec![vec![0.0; d.n_bands]; n_blocks],
+        block_ffn_kerr_omega: vec![vec![0.0; d.n_bands]; n_blocks],
         block_ffn_kerr_alpha: vec![0.0; n_blocks],
         block_ffn_kerr_beta: vec![0.0; n_blocks],
-        block_ffn_mae_in_sq_w: vec![vec![vec![0.0; N_EMBD]; MAESTRO_DIM]; n_blocks],
-        block_ffn_mae_in_sq_b: vec![vec![0.0; MAESTRO_DIM]; n_blocks],
-        block_ffn_mae_in_pr_w: vec![vec![vec![0.0; MAESTRO_DIM]; N_EMBD]; n_blocks],
-        block_ffn_mae_in_pr_b: vec![vec![0.0; N_EMBD]; n_blocks],
-        block_ffn_mae_out_sq_w: vec![vec![vec![0.0; N_EMBD]; MAESTRO_DIM]; n_blocks],
-        block_ffn_mae_out_sq_b: vec![vec![0.0; MAESTRO_DIM]; n_blocks],
-        block_ffn_mae_out_pr_w: vec![vec![vec![0.0; MAESTRO_DIM]; N_EMBD]; n_blocks],
-        block_ffn_mae_out_pr_b: vec![vec![0.0; N_EMBD]; n_blocks],
-        block_ffn_out_proj_w: vec![vec![vec![0.0; N_EMBD]; N_EMBD]; n_blocks],
-        block_ffn_out_proj_b: vec![vec![0.0; N_EMBD]; n_blocks],
-        ln_f_w: vec![0.0; N_EMBD],
-        ln_f_b: vec![0.0; N_EMBD],
-        lm_head: vec![vec![0.0; N_EMBD]; vocab_size],
+        block_ffn_mae_in_sq_w: vec![vec![vec![0.0; d.n_embd]; d.maestro_dim]; n_blocks],
+        block_ffn_mae_in_sq_b: vec![vec![0.0; d.maestro_dim]; n_blocks],
+        block_ffn_mae_in_pr_w: vec![vec![vec![0.0; d.maestro_dim]; d.n_embd]; n_blocks],
+        block_ffn_mae_in_pr_b: vec![vec![0.0; d.n_embd]; n_blocks],
+        block_ffn_mae_out_sq_w: vec![vec![vec![0.0; d.n_embd]; d.maestro_dim]; n_blocks],
+        block_ffn_mae_out_sq_b: vec![vec![0.0; d.maestro_dim]; n_blocks],
+        block_ffn_mae_out_pr_w: vec![vec![vec![0.0; d.maestro_dim]; d.n_embd]; n_blocks],
+        block_ffn_mae_out_pr_b: vec![vec![0.0; d.n_embd]; n_blocks],
+        block_ffn_out_proj_w: vec![vec![vec![0.0; d.n_embd]; d.n_embd]; n_blocks],
+        block_ffn_out_proj_b: vec![vec![0.0; d.n_embd]; n_blocks],
+        ln_f_w: vec![0.0; d.n_embd],
+        ln_f_b: vec![0.0; d.n_embd],
+        lm_head: vec![vec![0.0; d.n_embd]; vocab_size],
     };
 
     // Loss + d_logits
@@ -430,19 +448,20 @@ fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], gp
 
     // Backward through LM head (no bias)
     // d_hidden: parallelised over positions (each independent, ~768 floats output)
+    let n_embd = d.n_embd; // local alias for closures
     let mut d_hidden: Vec<Vec<f32>> = (0..t).into_par_iter().map(|pos| {
-        let mut d_h = vec![0.0f32; N_EMBD];
-        for j in 0..N_EMBD {
+        let mut d_h = vec![0.0f32; n_embd];
+        for j in 0..n_embd {
             for v in 0..vocab_size {
                 d_h[j] += model.lm_head[v][j] * d_logits[pos][v];
             }
         }
         d_h
     }).collect();
-    // lm_head weight gradients — sequential (50K×768 shared accumulator, no temp allocation)
+    // lm_head weight gradients — sequential (shared accumulator, no temp allocation)
     for pos in 0..t {
         for v in 0..vocab_size {
-            for j in 0..N_EMBD {
+            for j in 0..d.n_embd {
                 grads.lm_head[v][j] += d_logits[pos][v] * cache.post_ln_f[pos][j];
             }
         }
@@ -452,7 +471,7 @@ fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], gp
     let mut d_pre_ln_f: Vec<Vec<f32>> = Vec::with_capacity(t);
     for pos in 0..t {
         let (d_x, d_w, d_b) = layer_norm_backward(&d_hidden[pos], &cache.pre_ln_f[pos], &model.ln_f.weight);
-        for i in 0..N_EMBD {
+        for i in 0..d.n_embd {
             grads.ln_f_w[i] += d_w[i];
             grads.ln_f_b[i] += d_b[i];
         }
@@ -480,7 +499,7 @@ fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], gp
             );
             // Accumulate weight gradients
             for i in 0..fg.d_out_proj_w.len() { for j in 0..fg.d_out_proj_w[i].len() { grads.block_ffn_out_proj_w[block_idx][i][j] += fg.d_out_proj_w[i][j]; } }
-            for i in 0..N_EMBD { grads.block_ffn_out_proj_b[block_idx][i] += fg.d_out_proj_b[i]; }
+            for i in 0..fg.d_out_proj_b.len() { grads.block_ffn_out_proj_b[block_idx][i] += fg.d_out_proj_b[i]; }
             for i in 0..fg.d_mae_out_pr_w.len() { for j in 0..fg.d_mae_out_pr_w[i].len() { grads.block_ffn_mae_out_pr_w[block_idx][i][j] += fg.d_mae_out_pr_w[i][j]; } }
             for i in 0..fg.d_mae_out_pr_b.len() { grads.block_ffn_mae_out_pr_b[block_idx][i] += fg.d_mae_out_pr_b[i]; }
             for i in 0..fg.d_mae_out_sq_w.len() { for j in 0..fg.d_mae_out_sq_w[i].len() { grads.block_ffn_mae_out_sq_w[block_idx][i][j] += fg.d_mae_out_sq_w[i][j]; } }
@@ -491,7 +510,7 @@ fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], gp
             for i in 0..fg.d_mae_in_sq_b.len() { grads.block_ffn_mae_in_sq_b[block_idx][i] += fg.d_mae_in_sq_b[i]; }
             d_input
         } else {
-            ffn_backward(&block.ffn, &bc.normed, &d_ffn_out, &mut grads, block_idx, bc, gpu, ping_pong)
+            ffn_backward(&block.ffn, &bc.normed, &d_ffn_out, &mut grads, block_idx, bc, d, gpu, ping_pong)
         };
 
         // ─── LN backward (shared LN, FFN gradients only — attention frozen) ───
@@ -500,13 +519,13 @@ fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], gp
             let (d_x, d_w, d_b) = layer_norm_backward(
                 &d_normed_from_ffn[pos], &bc.input[pos], &block.ln.weight,
             );
-            for i in 0..N_EMBD {
+            for i in 0..d.n_embd {
                 grads.block_ln_w[block_idx][i] += d_w[i];
                 grads.block_ln_b[block_idx][i] += d_b[i];
             }
             // Residual: d_hidden passes through to input
             let mut d_h = d_x;
-            for i in 0..N_EMBD { d_h[i] += d_hidden[pos][i]; }
+            for i in 0..d.n_embd { d_h[i] += d_hidden[pos][i]; }
             d_input.push(d_h);
         }
         d_hidden = d_input;
@@ -522,6 +541,7 @@ fn ffn_backward(
     grads: &mut Gradients,
     block_idx: usize,
     bc: &BlockCache,
+    d: Dims,
     gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>,
     ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>,
 ) -> Vec<Vec<f32>> {
@@ -543,14 +563,14 @@ fn ffn_backward(
         let cpu_sq = linear_forward(&weights.maestro_in.squeeze.w, &weights.maestro_in.squeeze.b, &normed[pos]);
         let cpu_act: Vec<f32> = cpu_sq.iter().map(|&v| wave_block::gelu(v)).collect();
         let cpu_mae_in = linear_forward(&weights.maestro_in.process_1.w, &weights.maestro_in.process_1.b, &cpu_act);
-        let mut cpu_precond = vec![0.0f32; N_EMBD];
-        for i in 0..N_EMBD { cpu_precond[i] = normed[pos][i] + cpu_mae_in[i]; }
+        let mut cpu_precond = vec![0.0f32; d.n_embd];
+        for i in 0..d.n_embd { cpu_precond[i] = normed[pos][i] + cpu_mae_in[i]; }
         let cpu_kerr = kerr_ode_forward_cpu_standalone(&weights.kerr, &cpu_precond);
         let cpu_sq2 = linear_forward(&weights.maestro_out.squeeze.w, &weights.maestro_out.squeeze.b, &cpu_kerr);
         let cpu_act2: Vec<f32> = cpu_sq2.iter().map(|&v| wave_block::gelu(v)).collect();
         let cpu_mae_out = linear_forward(&weights.maestro_out.process_1.w, &weights.maestro_out.process_1.b, &cpu_act2);
-        let mut cpu_regulated = vec![0.0f32; N_EMBD];
-        for i in 0..N_EMBD { cpu_regulated[i] = cpu_kerr[i] + cpu_mae_out[i]; }
+        let mut cpu_regulated = vec![0.0f32; d.n_embd];
+        for i in 0..d.n_embd { cpu_regulated[i] = cpu_kerr[i] + cpu_mae_out[i]; }
         // CPU out_proj
         let cpu_output = weights.out_proj.forward(&cpu_regulated);
 
@@ -573,8 +593,8 @@ fn ffn_backward(
     }).collect();
     // Accumulate d_W and d_b
     let (d_w, d_b) = weights.out_proj.backward_dw_db(d_ffn_out, regulated_all);
-    for i in 0..N_EMBD {
-        for j in 0..N_EMBD { grads.block_ffn_out_proj_w[block_idx][i][j] += d_w[i][j]; }
+    for i in 0..d_w.len() {
+        for j in 0..d_w[i].len() { grads.block_ffn_out_proj_w[block_idx][i][j] += d_w[i][j]; }
         grads.block_ffn_out_proj_b[block_idx][i] += d_b[i];
     }
 
@@ -585,9 +605,9 @@ fn ffn_backward(
         let d_mae_out = &d_regulated[pos]; // same gradient (additive)
 
         // process backward
-        let mut d_act2 = vec![0.0f32; MAESTRO_DIM];
-        for i in 0..N_EMBD {
-            for j in 0..MAESTRO_DIM {
+        let mut d_act2 = vec![0.0f32; d.maestro_dim];
+        for i in 0..d.n_embd {
+            for j in 0..d.maestro_dim {
                 d_act2[j] += weights.maestro_out.process_1.w[i][j] * d_mae_out[i];
                 grads.block_ffn_mae_out_pr_w[block_idx][i][j] += d_mae_out[i] * mae_out_act_all[pos][j];
             }
@@ -595,7 +615,7 @@ fn ffn_backward(
         }
 
         // GELU backward
-        let d_sq2: Vec<f32> = (0..MAESTRO_DIM).map(|i| {
+        let d_sq2: Vec<f32> = (0..d.maestro_dim).map(|i| {
             let x = mae_out_sq_all[pos][i];
             let c = 0.7978845608_f32;
             let inner = c * (x + 0.044715 * x * x * x);
@@ -606,9 +626,9 @@ fn ffn_backward(
         }).collect();
 
         // squeeze backward
-        let mut d_kerr = vec![0.0f32; N_EMBD];
-        for i in 0..MAESTRO_DIM {
-            for j in 0..N_EMBD {
+        let mut d_kerr = vec![0.0f32; d.n_embd];
+        for i in 0..d.maestro_dim {
+            for j in 0..d.n_embd {
                 d_kerr[j] += weights.maestro_out.squeeze.w[i][j] * d_sq2[i];
                 grads.block_ffn_mae_out_sq_w[block_idx][i][j] += d_sq2[i] * kerr_out_all[pos][j];
             }
@@ -616,7 +636,7 @@ fn ffn_backward(
         }
 
         // d_kerr_out = d_regulated (residual) + d_kerr (from maestro_out squeeze backward)
-        for i in 0..N_EMBD { d_kerr[i] += d_regulated[pos][i]; }
+        for i in 0..d.n_embd { d_kerr[i] += d_regulated[pos][i]; }
         d_kerr_out.push(d_kerr);
     }
 
@@ -630,9 +650,9 @@ fn ffn_backward(
         let d_mae_in = &d_precond[pos]; // residual from precond = normed + mae_in
 
         // process backward
-        let mut d_act = vec![0.0f32; MAESTRO_DIM];
-        for i in 0..N_EMBD {
-            for j in 0..MAESTRO_DIM {
+        let mut d_act = vec![0.0f32; d.maestro_dim];
+        for i in 0..d.n_embd {
+            for j in 0..d.maestro_dim {
                 d_act[j] += weights.maestro_in.process_1.w[i][j] * d_mae_in[i];
                 grads.block_ffn_mae_in_pr_w[block_idx][i][j] += d_mae_in[i] * mae_in_act_all[pos][j];
             }
@@ -640,7 +660,7 @@ fn ffn_backward(
         }
 
         // GELU backward
-        let d_sq: Vec<f32> = (0..MAESTRO_DIM).map(|i| {
+        let d_sq: Vec<f32> = (0..d.maestro_dim).map(|i| {
             let x = mae_in_sq_all[pos][i];
             let c = 0.7978845608_f32;
             let inner = c * (x + 0.044715 * x * x * x);
@@ -651,9 +671,9 @@ fn ffn_backward(
         }).collect();
 
         // squeeze backward → d_normed
-        let mut d_n = vec![0.0f32; N_EMBD];
-        for i in 0..MAESTRO_DIM {
-            for j in 0..N_EMBD {
+        let mut d_n = vec![0.0f32; d.n_embd];
+        for i in 0..d.maestro_dim {
+            for j in 0..d.n_embd {
                 d_n[j] += weights.maestro_in.squeeze.w[i][j] * d_sq[i];
                 grads.block_ffn_mae_in_sq_w[block_idx][i][j] += d_sq[i] * normed[pos][j];
             }
@@ -661,7 +681,7 @@ fn ffn_backward(
         }
 
         // d_normed = d_precond (residual from precond = normed + mae_in) + d_squeeze_input
-        for i in 0..N_EMBD { d_n[i] += d_precond[pos][i]; }
+        for i in 0..d.n_embd { d_n[i] += d_precond[pos][i]; }
         d_normed.push(d_n);
     }
 
@@ -734,19 +754,21 @@ fn rk4_step_standalone(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f3
 // ─── Flatten / Unflatten (trainable params only) ────────────────
 
 fn count_trainable(model: &WavePacketModel) -> usize {
+    // Derive dimensions from model structure — no constants needed
+    let n_embd = model.ln_f.weight.len();
+    let maestro_dim = model.blocks[0].ffn.maestro_in.squeeze.w.len();
     let mut n = 0;
     for block in &model.blocks {
-        n += N_EMBD * 2; // LN
-        n += N_EMBD * 2; // LN_FFN
-        // FFN: maestro_in + maestro_out + out_proj (kerr frozen for now)
-        n += MAESTRO_DIM * N_EMBD + MAESTRO_DIM; // mae_in squeeze
-        n += N_EMBD * MAESTRO_DIM + N_EMBD;       // mae_in process
-        n += MAESTRO_DIM * N_EMBD + MAESTRO_DIM; // mae_out squeeze
-        n += N_EMBD * MAESTRO_DIM + N_EMBD;       // mae_out process
+        n += n_embd * 2; // LN
+        n += n_embd * 2; // LN_FFN
+        n += maestro_dim * n_embd + maestro_dim; // mae_in squeeze
+        n += n_embd * maestro_dim + n_embd;       // mae_in process
+        n += maestro_dim * n_embd + maestro_dim; // mae_out squeeze
+        n += n_embd * maestro_dim + n_embd;       // mae_out process
         n += block.ffn.out_proj.param_count();      // out_proj (dense or block-diagonal)
     }
-    n += N_EMBD * 2; // ln_f
-    n += model.vocab_size * N_EMBD; // lm_head
+    n += n_embd * 2; // ln_f
+    n += model.vocab_size * n_embd; // lm_head
     n
 }
 
@@ -798,25 +820,27 @@ fn flatten_grads(grads: &Gradients) -> Vec<f32> {
 }
 
 fn unflatten_params(model: &mut WavePacketModel, params: &[f32]) {
+    let n_embd = model.ln_f.weight.len();
+    let maestro_dim = model.blocks[0].ffn.maestro_in.squeeze.w.len();
     let mut idx = 0;
     for block in &mut model.blocks {
-        block.ln.weight.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
-        block.ln.bias.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
-        block.ln_ffn.weight.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
-        block.ln_ffn.bias.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
-        for row in &mut block.ffn.maestro_in.squeeze.w { row.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD; }
-        block.ffn.maestro_in.squeeze.b.copy_from_slice(&params[idx..idx+MAESTRO_DIM]); idx += MAESTRO_DIM;
-        for row in &mut block.ffn.maestro_in.process_1.w { row.copy_from_slice(&params[idx..idx+MAESTRO_DIM]); idx += MAESTRO_DIM; }
-        block.ffn.maestro_in.process_1.b.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
-        for row in &mut block.ffn.maestro_out.squeeze.w { row.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD; }
-        block.ffn.maestro_out.squeeze.b.copy_from_slice(&params[idx..idx+MAESTRO_DIM]); idx += MAESTRO_DIM;
-        for row in &mut block.ffn.maestro_out.process_1.w { row.copy_from_slice(&params[idx..idx+MAESTRO_DIM]); idx += MAESTRO_DIM; }
-        block.ffn.maestro_out.process_1.b.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
+        block.ln.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
+        block.ln.bias.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
+        block.ln_ffn.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
+        block.ln_ffn.bias.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
+        for row in &mut block.ffn.maestro_in.squeeze.w { row.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd; }
+        block.ffn.maestro_in.squeeze.b.copy_from_slice(&params[idx..idx+maestro_dim]); idx += maestro_dim;
+        for row in &mut block.ffn.maestro_in.process_1.w { row.copy_from_slice(&params[idx..idx+maestro_dim]); idx += maestro_dim; }
+        block.ffn.maestro_in.process_1.b.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
+        for row in &mut block.ffn.maestro_out.squeeze.w { row.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd; }
+        block.ffn.maestro_out.squeeze.b.copy_from_slice(&params[idx..idx+maestro_dim]); idx += maestro_dim;
+        for row in &mut block.ffn.maestro_out.process_1.w { row.copy_from_slice(&params[idx..idx+maestro_dim]); idx += maestro_dim; }
+        block.ffn.maestro_out.process_1.b.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
         block.ffn.out_proj.unflatten_from(params, &mut idx);
     }
-    model.ln_f.weight.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
-    model.ln_f.bias.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD;
-    for row in &mut model.lm_head { row.copy_from_slice(&params[idx..idx+N_EMBD]); idx += N_EMBD; }
+    model.ln_f.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
+    model.ln_f.bias.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
+    for row in &mut model.lm_head { row.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd; }
     assert_eq!(idx, params.len());
 }
 
@@ -1094,20 +1118,23 @@ fn main() {
         let (params, ck_vocab, _ck_iter, _ck_lr, _ck_rng, _adam_t, _adam_m, _adam_v, _ck_groups) =
             wave_checkpoint::load_checkpoint(&resume_path);
         let effective_vocab = vocab_size.max(ck_vocab);
-        let mut model = init_model(effective_vocab, 42, n_layers, out_proj_groups);
+        let n_bands_cli: usize = parse_flag("--n-bands", N_BANDS);
+        let n_head_cli: usize = parse_flag("--n-head", N_HEAD);
+        let dims = Dims::from_cli(n_bands_cli, n_head_cli, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS);
+        let mut model = init_model(effective_vocab, 42, n_layers, out_proj_groups, dims);
         unflatten_params(&mut model, &params);
         println!("  Loaded {} params from {}", params.len(), resume_path);
 
         // Forward pass
-        let stencil = fft_ode::StencilFft::new(N_BANDS);
-        let cache = forward_with_cache(&model, &token_ids, None, None, None, Some(&stencil), None);
+        let stencil = fft_ode::StencilFft::new(dims.n_bands);
+        let cache = forward_with_cache(&model, &token_ids, dims, None, None, None, Some(&stencil), None);
 
         // Extract per-layer phases
         let mut per_layer_phases: Vec<Vec<Vec<f32>>> = Vec::new();
         for bc in &cache.block_caches {
-            per_layer_phases.push(wa::extract_all_phases(&bc.input, N_BANDS));
+            per_layer_phases.push(wa::extract_all_phases(&bc.input, dims.n_bands));
         }
-        per_layer_phases.push(wa::extract_all_phases(&cache.post_ln_f, N_BANDS));
+        per_layer_phases.push(wa::extract_all_phases(&cache.post_ln_f, dims.n_bands));
 
         // Build token labels for display (use related pair words where available)
         let display_labels: Vec<String> = token_strings.iter()
@@ -1116,7 +1143,7 @@ fn main() {
 
         // Run full report
         wa::print_report(
-            &resume_path, n_layers, N_BANDS, token_ids.len(),
+            &resume_path, n_layers, dims.n_bands, token_ids.len(),
             &per_layer_phases, &related_pairs, &random_pairs, &display_labels,
         );
 
@@ -1124,14 +1151,14 @@ fn main() {
         std::fs::create_dir_all("analysis").ok();
         let deep = per_layer_phases.last().unwrap();
         let disc = wa::semantic_discrimination(deep, &related_pairs, &random_pairs, 12);
-        let census = wa::band_census(deep, N_BANDS);
-        let clustering = wa::phase_clustering(deep, N_BANDS);
+        let census = wa::band_census(deep, dims.n_bands);
+        let clustering = wa::phase_clustering(deep, dims.n_bands);
         let curve = wa::depth_curve(&per_layer_phases, &related_pairs, &random_pairs, 12);
 
         let report = serde_json::json!({
             "checkpoint": resume_path,
             "n_layers": n_layers,
-            "n_bands": N_BANDS,
+            "n_bands": dims.n_bands,
             "n_tokens": token_ids.len(),
             "semantic_discrimination": {
                 "related_mean": disc.related_mean,
@@ -1169,6 +1196,8 @@ fn main() {
         use_monitor: std::env::args().any(|a| a == "--monitor"),
         out_proj_groups: parse_flag("--out-proj-groups", 6),
         checkpoint_name: parse_flag("--checkpoint-name", "checkpoint.bin".to_string()),
+        n_bands: parse_flag("--n-bands", N_BANDS),
+        n_head: parse_flag("--n-head", N_HEAD),
     });
 }
 

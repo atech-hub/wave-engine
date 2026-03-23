@@ -144,6 +144,8 @@ pub struct TrainConfig {
     pub use_monitor: bool,
     pub out_proj_groups: usize,
     pub checkpoint_name: String,
+    pub n_bands: usize,
+    pub n_head: usize,
 }
 
 pub fn run_training(config: TrainConfig) {
@@ -190,7 +192,7 @@ pub fn run_training(config: TrainConfig) {
         println!("Resuming from checkpoint: {ckpt}");
         let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v, _ck_groups) = wave_checkpoint::load_checkpoint(ckpt);
         assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
-        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups);
+        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS));
         unflatten_params(&mut m, &params);
         model = m;
         start_iter = ck_iter;
@@ -199,7 +201,7 @@ pub fn run_training(config: TrainConfig) {
         println!("  Resuming from iter {start_iter}");
     } else {
         println!("Initializing model (seed=42)...");
-        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups);
+        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS));
         start_iter = 0;
         let n_t = count_trainable(&model);
         optimizer = Adam::new(config.lr, n_t);
@@ -208,7 +210,7 @@ pub fn run_training(config: TrainConfig) {
 
     let n_trainable = count_trainable(&model);
     println!("  Trainable parameters: {n_trainable} (attention frozen, FFN+LN+lm_head trainable)");
-    println!("  Architecture: {} parallel blocks, {N_HEAD} harmonic heads, {N_BANDS} bands", config.n_layers);
+    println!("  Architecture: {} parallel blocks, {} harmonic heads, {} bands ({}-dim)", config.n_layers, config.n_head, config.n_bands, config.n_bands * 2);
 
     // GPU
     let mut monitor = monitor::PipelineMonitor::new(config.use_monitor);
@@ -228,11 +230,14 @@ pub fn run_training(config: TrainConfig) {
         diagnose_ode_gpu_vs_cpu(be);
     }
 
+    // Runtime dimensions
+    let dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS);
+
     // Curriculum
     let curriculum = if config.use_curriculum {
-        CurriculumSchedule::default_4stage(N_BANDS)
+        CurriculumSchedule::default_4stage(dims.n_bands)
     } else {
-        CurriculumSchedule::none(N_BANDS)
+        CurriculumSchedule::none(dims.n_bands)
     };
 
     let total_iters = start_iter + config.n_iters;
@@ -270,8 +275,8 @@ pub fn run_training(config: TrainConfig) {
                 let gk_ref: Option<(&fft_ode::GpuKernelFft, &gpu_pipelines::GpuBackend)> =
                     gpu_backend.as_ref().map(|be| (&gpu_kernel, be));
                 s.spawn(move || {
-                    let cache = forward_with_cache(model_ref, input, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref);
-                    let (loss, grads) = backward(model_ref, &cache, target, gpu_ref, pp_ref, fg_ref);
+                    let cache = forward_with_cache(model_ref, input, dims, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref);
+                    let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref);
                     (loss, flatten_grads(&grads))
                 })
             }).collect();
