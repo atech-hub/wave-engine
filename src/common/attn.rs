@@ -9,7 +9,7 @@
 //! Key difference from the failed Harmonic Attention Q/K experiment:
 //! that added coherence ON TOP of dot product. This REPLACES it entirely.
 
-use std::f32::consts::PI;
+use rayon::prelude::*;
 
 /// Weights for harmonic coherence attention (one head).
 #[derive(Clone)]
@@ -66,19 +66,18 @@ pub fn wave_attention_forward(
 
     fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
 
-    let mut att_weights_all: Vec<Vec<Vec<f32>>> = vec![vec![vec![0.0f32; t]; t]; n_head];
-    let mut out = vec![vec![0.0f32; n_embd]; t];
-
-    for head in 0..n_head {
+    // Parallel over attention heads — each head is fully independent.
+    // 12 heads on 28 threads: ~4-6x speedup at 24 layers.
+    let head_results: Vec<(Vec<Vec<f32>>, Vec<Vec<f32>>)> = (0..n_head).into_par_iter().map(|head| {
         let harmonic_n = softplus(weights.heads[head].harmonic_raw);
         let offset = head * head_dim;
 
-        // Phase 1: Precompute phase angles — CPU (scalar, fast)
+        // Phase 1: Precompute phase angles
         let phases: Vec<f32> = (0..t).map(|pos| {
             project_phase(&x[pos], &weights.heads[head].phase_proj_w, &weights.heads[head].phase_proj_b)
         }).collect();
 
-        // Phase 2: Batch value projection — CPU (small matrices, dispatch overhead > compute)
+        // Phase 2: Batch value projection
         let v_all: Vec<Vec<f32>> = (0..t).map(|pos| {
             let mut v = vec![0.0f32; head_dim];
             for d in 0..head_dim {
@@ -91,32 +90,29 @@ pub fn wave_attention_forward(
             v
         }).collect();
 
-        // Phase 3: Phase-hashed sparse attention — O(T × T/B) instead of O(T²)
-        // Hash phase angles into B buckets. Only attend within same + adjacent buckets.
-        // Coherence between distant phase buckets is near-zero by definition.
+        // Phase 3: Phase-hashed sparse attention
         const N_BUCKETS: usize = 8;
         let bucket_width = std::f32::consts::TAU / N_BUCKETS as f32;
 
-        // Assign each position to a phase bucket
         let buckets: Vec<usize> = phases.iter().map(|&p| {
-            // Normalize phase to [0, 2π) then bucket
             let normalized = ((p % std::f32::consts::TAU) + std::f32::consts::TAU) % std::f32::consts::TAU;
             ((normalized / bucket_width) as usize).min(N_BUCKETS - 1)
         }).collect();
 
-        // Build per-bucket position lists for fast lookup
         let mut bucket_positions: Vec<Vec<usize>> = vec![Vec::new(); N_BUCKETS];
         for (pos, &b) in buckets.iter().enumerate() {
             bucket_positions[b].push(pos);
         }
 
+        // Per-head outputs: head_out[qi][d] and att_w[qi][ki]
+        let mut head_out = vec![vec![0.0f32; head_dim]; t];
+        let mut att_w = vec![vec![0.0f32; t]; t];
+
         for qi in 0..t {
             let qi_bucket = buckets[qi];
             let mut scores = vec![f32::NEG_INFINITY; t];
 
-            // Score only positions in same bucket + adjacent buckets (causal)
             for db in 0..=2 {
-                // Buckets: qi_bucket-1, qi_bucket, qi_bucket+1 (wrapping)
                 let target_bucket = if db == 0 {
                     (qi_bucket + N_BUCKETS - 1) % N_BUCKETS
                 } else if db == 1 {
@@ -126,22 +122,20 @@ pub fn wave_attention_forward(
                 };
 
                 for &ki in &bucket_positions[target_bucket] {
-                    if ki > qi { continue; } // causal mask
+                    if ki > qi { continue; }
                     let delta = phases[qi] - phases[ki];
                     scores[ki] = (harmonic_n * delta).cos();
                 }
             }
 
-            // Always attend to self and immediate neighbours (locality bias)
             if qi > 0 && scores[qi - 1] == f32::NEG_INFINITY {
                 let delta = phases[qi] - phases[qi - 1];
                 scores[qi - 1] = (harmonic_n * delta).cos();
             }
             if scores[qi] == f32::NEG_INFINITY {
-                scores[qi] = 1.0; // self-attention always on
+                scores[qi] = 1.0;
             }
 
-            // Softmax over scored positions only
             let max_s = scores[..=qi].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut exp_sum = 0.0f32;
             for ki in 0..=qi {
@@ -156,16 +150,31 @@ pub fn wave_attention_forward(
                 for ki in 0..=qi { scores[ki] /= exp_sum; }
             }
 
-            att_weights_all[head][qi] = scores.clone();
+            att_w[qi] = scores.clone();
 
-            // Weighted sum — only non-zero scores contribute
             for d in 0..head_dim {
                 let mut sum = 0.0f32;
                 for ki in 0..=qi {
                     if scores[ki] > 0.0 { sum += scores[ki] * v_all[ki][d]; }
                 }
-                out[qi][offset + d] = sum;
+                head_out[qi][d] = sum;
             }
+        }
+
+        (head_out, att_w)
+    }).collect();
+
+    // Merge head outputs into combined arrays
+    let mut att_weights_all: Vec<Vec<Vec<f32>>> = vec![vec![vec![0.0f32; t]; t]; n_head];
+    let mut out = vec![vec![0.0f32; n_embd]; t];
+    for head in 0..n_head {
+        let offset = head * head_dim;
+        let (ref head_out, ref att_w) = head_results[head];
+        for qi in 0..t {
+            for d in 0..head_dim {
+                out[qi][offset + d] = head_out[qi][d];
+            }
+            att_weights_all[head][qi] = att_w[qi].clone();
         }
     }
 

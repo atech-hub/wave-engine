@@ -84,6 +84,7 @@ use wave_embed::*;
 use wave_attn::*;
 use wave_block::*;
 use rng::Rng;
+use rayon::prelude::*;
 
 static PROFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -295,7 +296,7 @@ fn forward_with_cache(
         .map(|h| layer_norm(h, &model.ln_f.weight, &model.ln_f.bias))
         .collect();
 
-    let logits: Vec<Vec<f32>> = post_ln_f.iter().map(|normed| {
+    let logits: Vec<Vec<f32>> = post_ln_f.par_iter().map(|normed| {
         let mut l = vec![0.0f32; model.vocab_size];
         for v in 0..model.vocab_size {
             let mut sum = 0.0f32;
@@ -428,16 +429,18 @@ fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], gp
     total_loss /= t as f32;
 
     // Backward through LM head (no bias)
-    let mut d_hidden: Vec<Vec<f32>> = Vec::with_capacity(t);
-    for pos in 0..t {
+    // d_hidden: parallelised over positions (each independent, ~768 floats output)
+    let mut d_hidden: Vec<Vec<f32>> = (0..t).into_par_iter().map(|pos| {
         let mut d_h = vec![0.0f32; N_EMBD];
         for j in 0..N_EMBD {
             for v in 0..vocab_size {
                 d_h[j] += model.lm_head[v][j] * d_logits[pos][v];
             }
         }
-        d_hidden.push(d_h);
-        // lm_head weight gradients
+        d_h
+    }).collect();
+    // lm_head weight gradients — sequential (50K×768 shared accumulator, no temp allocation)
+    for pos in 0..t {
         for v in 0..vocab_size {
             for j in 0..N_EMBD {
                 grads.lm_head[v][j] += d_logits[pos][v] * cache.post_ln_f[pos][j];
@@ -866,6 +869,10 @@ fn print_help() {
     println!("    --gpu             Enable wgpu GPU (Vulkan/Metal/DX12)");
     println!("    --candle          Use Candle CUDA backend (requires --features candle-backend)");
     println!();
+    println!("PERFORMANCE:");
+    println!("    --threads N       Rayon thread pool size (default: half available cores)");
+    println!("                      Higher = faster CPU, but leaves less for OS/GPU/Desktop");
+    println!();
     println!("MONITORS:");
     println!("    --monitor         Enable per-section pipeline timing (forward profiling)");
     println!("    --debug-nan       Enable per-layer NaN detection (Candle only, ~6x slower)");
@@ -919,7 +926,20 @@ fn main() {
         return;
     }
 
-    println!("wave-engine v0.1.0\n");
+    // Rayon thread pool — configurable via --threads (default: half available cores)
+    fn parse_flag_early<T: std::str::FromStr>(name: &str, default: T) -> T {
+        std::env::args().skip_while(|a| a != name).nth(1)
+            .and_then(|s| s.parse().ok()).unwrap_or(default)
+    }
+    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let n_threads: usize = parse_flag_early("--threads", available / 2);
+    let n_threads = n_threads.max(1);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build_global()
+        .ok();
+
+    println!("wave-engine v0.1.0  ({n_threads} threads, {available} available)\n");
 
     // Check for --candle flag first — routes to entirely different training path
     if std::env::args().any(|a| a == "--candle") {

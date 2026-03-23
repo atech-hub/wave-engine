@@ -26,6 +26,9 @@ serde_json = "1"
 # FFT for OFDM-inspired ODE acceleration
 rustfft = "6.2"
 
+# Parallel attention heads
+rayon = "1.10"
+
 # Candle backend (optional, with CUDA support)
 candle-core = { version = "0.9", optional = true, features = ["cuda"] }
 candle-nn = { version = "0.9", optional = true }
