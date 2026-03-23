@@ -217,6 +217,56 @@ pub fn run_training(config: TrainConfig) {
     println!("  Trainable parameters: {n_trainable} (attention frozen, FFN+LN+lm_head trainable)");
     println!("  Architecture: {} parallel blocks, {} harmonic heads, {} bands ({}-dim)", config.n_layers, config.n_head, config.n_bands, config.n_bands * 2);
 
+    // Runtime dimensions (needed by pre-flight, forward, backward)
+    let dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS);
+
+    // ─── Pre-flight diagnostics ──────────────────────────────────────
+    {
+        let n_embd = dims.n_embd;
+
+        // Check 1: Embedding geometric separation
+        let self_dot: f32 = model.wte[0].iter().map(|v| v * v).sum();
+        let adj_dot: f32 = if model.wte.len() > 1 {
+            model.wte[0].iter().zip(&model.wte[1]).map(|(a, b)| a * b).sum()
+        } else { self_dot };
+        let separation = self_dot - adj_dot;
+        let tokens_per_band = vocab_size as f32 / dims.n_bands as f32;
+        if separation < 0.01 {
+            eprintln!("  [preflight] WARNING: Embedding separation {:.6} < 0.01", separation);
+            eprintln!("              {} vocab at {} bands is geometrically degenerate.", vocab_size, dims.n_bands);
+            eprintln!("              Reduce vocab or increase bands. Min bands: ~{}", (vocab_size as f32 * 0.008) as usize);
+        } else if separation < 0.1 {
+            eprintln!("  [preflight] CAUTION: Embedding separation {:.6} < 0.1 ({:.1} tokens/band)", separation, tokens_per_band);
+        } else {
+            println!("  [preflight] Embedding separation: {:.4} OK ({:.1} tokens/band)", separation, tokens_per_band);
+        }
+
+        // Check 2: Parameter balance
+        let lm_head_params = vocab_size * n_embd;
+        let model_params = n_trainable.saturating_sub(lm_head_params);
+        let lm_pct = lm_head_params as f32 / n_trainable as f32 * 100.0;
+        if lm_pct > 95.0 {
+            eprintln!("  [preflight] WARNING: lm_head is {:.1}% of params — ODE gets <{:.1}% gradient", lm_pct, 100.0 - lm_pct);
+        } else if lm_pct > 90.0 {
+            eprintln!("  [preflight] CAUTION: lm_head is {:.1}% of params", lm_pct);
+        } else {
+            println!("  [preflight] Parameter balance: {:.1}% model, {:.1}% lm_head — OK", 100.0 - lm_pct, lm_pct);
+        }
+
+        // Check 3: ODE stability estimate
+        let alpha = model.blocks[0].ffn.kerr.alpha;
+        let beta = model.blocks[0].ffn.kerr.beta;
+        let delta_phi = (alpha + 4.0 * beta) * 4.0; // phase shift at M=2.0
+        let degrees = delta_phi * 180.0 / std::f32::consts::PI;
+        if degrees > 90.0 {
+            let safe = 0.5 / 5.0 / 4.0;
+            eprintln!("  [preflight] WARNING: ODE phase shift {:.0}° at M=2.0 — chaotic regime", degrees);
+            eprintln!("              Reduce alpha/beta. Suggested: {:.3}", safe);
+        } else {
+            println!("  [preflight] ODE stability: {:.0}° at M=2.0, alpha={:.4} beta={:.4} — OK", degrees, alpha, beta);
+        }
+    }
+
     // GPU
     let mut monitor = monitor::PipelineMonitor::new(config.use_monitor);
     if config.use_monitor { PROFILE.store(true, std::sync::atomic::Ordering::Relaxed); }
@@ -235,9 +285,6 @@ pub fn run_training(config: TrainConfig) {
         diagnose_ode_gpu_vs_cpu(be);
     }
 
-    // Runtime dimensions
-    let dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS);
-
     // Curriculum
     let curriculum = if config.use_curriculum {
         CurriculumSchedule::default_4stage(dims.n_bands)
@@ -249,6 +296,12 @@ pub fn run_training(config: TrainConfig) {
     let batch_size = config.batch_size;
     let seq_len = config.seq_len;
     let lr = config.lr;
+
+    // JSONL telemetry — matches Candle tier format for analyze_training.py
+    let log_file = std::fs::File::create("training_log.jsonl")
+        .expect("Failed to create training_log.jsonl");
+    let mut log_writer = std::io::BufWriter::new(log_file);
+    let mut nan_skip_count = 0usize;
 
     println!("\nTraining for {} iterations (batch={batch_size}, seq={seq_len}, lr={lr})", config.n_iters);
     if config.resume_path.is_some() { println!("  Resuming from iter {start_iter}, target iter {total_iters}"); }
@@ -300,9 +353,18 @@ pub fn run_training(config: TrainConfig) {
         for g in total_grads.iter_mut() { *g /= batch_size as f32; }
         monitor.record("reduce", t_reduce);
 
-        // NaN skip: discard batch if loss is NaN/Inf (ODE spike on unlucky data)
+        // NaN skip with post-mortem: discard batch, diagnose cause
         if total_loss.is_nan() || total_loss.is_infinite() {
-            if iter % 100 == 0 { eprintln!("  [NaN skip] iter {iter}"); }
+            nan_skip_count += 1;
+            // Post-mortem: which batch elements caused it?
+            let nan_elements: Vec<usize> = batch_results.iter().enumerate()
+                .filter(|(_, (loss, _))| loss.is_nan() || loss.is_infinite())
+                .map(|(i, _)| i).collect();
+            let has_nan_grad = total_grads.iter().any(|g| g.is_nan());
+            if iter % 100 == 0 || iter < 10 {
+                eprintln!("  [NaN skip iter {}] {}/{} bad elements, nan_grad={}, total_skips={}",
+                    iter, nan_elements.len(), batch_size, has_nan_grad, nan_skip_count);
+            }
             continue;
         }
 
@@ -314,6 +376,30 @@ pub fn run_training(config: TrainConfig) {
         monitor.record("optimizer", t_optim);
 
         let grad_norm: f32 = total_grads.iter().map(|g| g * g).sum::<f32>().sqrt();
+
+        // First-10 health check: per-component gradient norms + weight growth
+        if iter < 10 {
+            let lm_head_size = model.vocab_size * model.ln_f.weight.len();
+            let lm_start = n_trainable.saturating_sub(lm_head_size);
+            let model_gn: f32 = total_grads[..lm_start].iter().map(|g| g * g).sum::<f32>().sqrt();
+            let head_gn: f32 = total_grads[lm_start..].iter().map(|g| g * g).sum::<f32>().sqrt();
+            let total_gn = grad_norm.max(0.001);
+            let alpha = model.blocks[0].ffn.kerr.alpha;
+            let beta = model.blocks[0].ffn.kerr.beta;
+            eprintln!("  [health {}] loss={:.2} model_gn={:.2} head_gn={:.2} head%={:.1} alpha={:.4} beta={:.4}",
+                iter, total_loss, model_gn, head_gn, head_gn / total_gn * 100.0, alpha, beta);
+            if head_gn / total_gn > 0.95 {
+                eprintln!("  [health {}] ALERT: lm_head gradient dominance {:.1}%", iter, head_gn / total_gn * 100.0);
+            }
+        }
+
+        // JSONL telemetry — every iteration
+        use std::io::Write;
+        writeln!(log_writer,
+            r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{}}}"#,
+            iter, total_loss, lr, iter_start.elapsed().as_millis(), nan_skip_count
+        ).ok();
+        log_writer.flush().ok();
 
         if iter % 10 == 0 || iter == total_iters - 1 {
             println!("{:>6} {:>10.4} {:>10.1?}  gnorm={:.2}", iter, total_loss, iter_start.elapsed(), grad_norm);
