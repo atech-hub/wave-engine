@@ -10,3 +10,4 @@ pub mod token_cache;
 pub mod monitor;
 pub mod data;
 pub mod fft_ode;
+pub mod wave_analysis;

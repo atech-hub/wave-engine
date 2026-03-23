@@ -971,6 +971,179 @@ fn main() {
             .and_then(|s| s.parse().ok()).unwrap_or(default)
     }
 
+    // ─── Analyze mode: forward pass + wave structure diagnostics ───
+    if std::env::args().any(|a| a == "--analyze") {
+        use common::wave_analysis as wa;
+
+        let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)
+            .expect("--analyze requires --resume <checkpoint>");
+        let n_layers: usize = parse_flag("--layers", N_LAYERS);
+        let out_proj_groups: usize = parse_flag("--out-proj-groups", 6);
+        let use_bpe = std::env::args().any(|a| a == "--bpe");
+        let tokenizer_path: String = parse_flag("--tokenizer", "data/tokenizer.json".to_string());
+
+        println!("Analyze mode: harmonic coherence diagnostics\n");
+
+        // Curated test sentences — covering semantics, grammar, and registers
+        let test_text = concat!(
+            "The cat sat on the mat. ",
+            "The dog sat on the rug. ",
+            "A noun is the name of something. ",
+            "A verb is a word for action. ",
+            "The boy kicked the ball. ",
+            "The ball was kicked by the boy. ",
+            "To be or not to be that is the question. ",
+            "The contract shall be binding upon execution. ",
+            "The rate of change increases with temperature. ",
+            "How are you doing today my friend. ",
+            "Love is patient and kind. ",
+            "War brings destruction and death. ",
+        );
+
+        // Tokenize — BPE or char-level
+        let (token_ids, vocab_size, token_strings) = if use_bpe {
+            let bpe = bpe::BpeTokenizer::from_file(&tokenizer_path);
+            let ids: Vec<usize> = bpe.encode(test_text);
+            let strings: Vec<String> = ids.iter().map(|&id| bpe.decode(&[id])).collect();
+            let vs: usize = ids.iter().max().copied().unwrap_or(0) + 1; // conservative vocab bound
+            (ids, vs, strings)
+        } else {
+            let chars: Vec<char> = test_text.chars().collect();
+            let mut vc: Vec<char> = chars.iter().cloned()
+                .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            vc.sort();
+            let c2i: std::collections::HashMap<char, usize> = vc.iter()
+                .enumerate().map(|(i, &c)| (c, i)).collect();
+            let ids: Vec<usize> = chars.iter().map(|c| c2i[c]).collect();
+            let strings: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
+            (ids, vc.len(), strings)
+        };
+
+        // Find token positions for known semantic pairs
+        // Search for specific words in the token strings
+        let find_token = |word: &str| -> Option<usize> {
+            token_strings.iter().position(|t| {
+                let t_clean = t.trim().to_lowercase();
+                t_clean == word || t_clean == format!(" {word}") || t_clean == format!("{word}")
+                    || t.to_lowercase().contains(word)
+            })
+        };
+
+        println!("  Test text: {} tokens", token_ids.len());
+        println!("  Tokenizer: {}", if use_bpe { "BPE" } else { "char-level" });
+
+        // Build semantic pairs from known relationships
+        let mut related_pairs: Vec<(usize, usize)> = Vec::new();
+        let mut related_labels: Vec<(String, String)> = Vec::new();
+        let mut random_pairs: Vec<(usize, usize)> = Vec::new();
+
+        let semantic_pairs = [
+            ("cat", "dog"),         // same category (animals)
+            ("sat", "kicked"),      // same category (verbs)
+            ("boy", "ball"),        // subject-object in same sentence
+            ("noun", "verb"),       // same category (grammar terms)
+            ("love", "war"),        // semantic opposites
+            ("mat", "rug"),         // synonyms
+        ];
+        let random_pair_words = [
+            ("cat", "contract"),
+            ("verb", "temperature"),
+            ("boy", "question"),
+            ("dog", "execution"),
+            ("sat", "binding"),
+            ("mat", "change"),
+        ];
+
+        for (w1, w2) in &semantic_pairs {
+            if let (Some(a), Some(b)) = (find_token(w1), find_token(w2)) {
+                related_pairs.push((a, b));
+                related_labels.push((w1.to_string(), w2.to_string()));
+                println!("    Related: ({w1}@{a}, {w2}@{b})");
+            }
+        }
+        for (w1, w2) in &random_pair_words {
+            if let (Some(a), Some(b)) = (find_token(w1), find_token(w2)) {
+                random_pairs.push((a, b));
+            }
+        }
+
+        if related_pairs.is_empty() {
+            println!("  WARNING: No semantic pairs found in tokens. Using positional fallback.");
+            let t = token_ids.len();
+            for i in (0..t.min(20)).step_by(2) {
+                if i + 1 < t { related_pairs.push((i, i + 1)); }
+            }
+            for i in 0..t.min(10).min(t / 2) {
+                random_pairs.push((i, (i + t / 2) % t));
+            }
+        }
+
+        println!("  Pairs: {} related, {} random", related_pairs.len(), random_pairs.len());
+
+        // Load model from checkpoint
+        let (params, ck_vocab, _ck_iter, _ck_lr, _ck_rng, _adam_t, _adam_m, _adam_v, _ck_groups) =
+            wave_checkpoint::load_checkpoint(&resume_path);
+        let effective_vocab = vocab_size.max(ck_vocab);
+        let mut model = init_model(effective_vocab, 42, n_layers, out_proj_groups);
+        unflatten_params(&mut model, &params);
+        println!("  Loaded {} params from {}", params.len(), resume_path);
+
+        // Forward pass
+        let stencil = fft_ode::StencilFft::new(N_BANDS);
+        let cache = forward_with_cache(&model, &token_ids, None, None, None, Some(&stencil), None);
+
+        // Extract per-layer phases
+        let mut per_layer_phases: Vec<Vec<Vec<f32>>> = Vec::new();
+        for bc in &cache.block_caches {
+            per_layer_phases.push(wa::extract_all_phases(&bc.input, N_BANDS));
+        }
+        per_layer_phases.push(wa::extract_all_phases(&cache.post_ln_f, N_BANDS));
+
+        // Build token labels for display (use related pair words where available)
+        let display_labels: Vec<String> = token_strings.iter()
+            .map(|s| s.trim().replace('\n', "\\n").chars().take(12).collect())
+            .collect();
+
+        // Run full report
+        wa::print_report(
+            &resume_path, n_layers, N_BANDS, token_ids.len(),
+            &per_layer_phases, &related_pairs, &random_pairs, &display_labels,
+        );
+
+        // Save JSON report
+        std::fs::create_dir_all("analysis").ok();
+        let deep = per_layer_phases.last().unwrap();
+        let disc = wa::semantic_discrimination(deep, &related_pairs, &random_pairs, 12);
+        let census = wa::band_census(deep, N_BANDS);
+        let clustering = wa::phase_clustering(deep, N_BANDS);
+        let curve = wa::depth_curve(&per_layer_phases, &related_pairs, &random_pairs, 12);
+
+        let report = serde_json::json!({
+            "checkpoint": resume_path,
+            "n_layers": n_layers,
+            "n_bands": N_BANDS,
+            "n_tokens": token_ids.len(),
+            "semantic_discrimination": {
+                "related_mean": disc.related_mean,
+                "random_mean": disc.random_mean,
+                "ratio": disc.ratio,
+            },
+            "band_census": {
+                "universal": census.universal,
+                "word_specific": census.word_specific,
+                "bimodal": census.bimodal,
+                "mean_cv": census.mean_circular_variance,
+            },
+            "phase_clustering": clustering,
+            "depth_curve": curve,
+            "related_pairs": related_labels.iter().map(|(a, b)| format!("{a}/{b}")).collect::<Vec<_>>(),
+        });
+        std::fs::write("analysis/wave_report.json",
+            serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        println!("\nSaved: analysis/wave_report.json");
+        return;
+    }
+
     train::run_training(train::TrainConfig {
         data_path: std::env::args().nth(1).unwrap_or("data/input.txt".to_string()),
         n_iters: parse_flag("--iters", 500),
