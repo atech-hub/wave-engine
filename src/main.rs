@@ -169,9 +169,11 @@ fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: us
         let kerr = KerrWeights {
             gamma_raw: vec![gamma_raw_val; d.n_bands],
             omega: (0..d.n_bands).map(|k| (k + 1) as f32 / d.n_bands as f32).collect(),
-            // Scale coupling with band count — 0.1 at 384 bands, proportionally less at fewer
-            alpha: 0.1 * (d.n_bands as f32 / 384.0).sqrt(),
-            beta: 0.1 * (d.n_bands as f32 / 384.0).sqrt(),
+            // ODE coupling: scales with band count. Proven values:
+            //   84 bands (168-dim): 0.01 (2K BPE)
+            //   384 bands (768-dim): 0.1 (50K BPE)
+            alpha: if d.n_bands <= 128 { 0.01 } else { 0.1 },
+            beta: if d.n_bands <= 128 { 0.01 } else { 0.1 },
             rk4_n_steps: d.rk4_steps,
         };
         let (sq_w, sq_b) = init_linear(&mut rng, d.maestro_dim, d.n_embd);
