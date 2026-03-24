@@ -11,22 +11,23 @@ Part of the [Wave Coherence as a Computational Primitive](https://github.com/ate
 cargo build --release
 
 # Train on CPU (best quality, any hardware)
-cargo run --release -- data/input.txt --iters 200
+./target/release/wave-engine data/input.txt --iters 200
 
 # Train with GPU acceleration (any GPU — NVIDIA, AMD, Intel, Apple)
-cargo run --release -- data/input.txt --iters 200 --gpu
+./target/release/wave-engine data/input.txt --iters 200 --gpu
 
 # Train with NVIDIA CUDA (requires --features candle-backend)
-cargo run --release --features candle-backend -- data/input.txt --iters 200 --candle
+cargo build --release --features candle-backend
+./target/release/wave-engine data/input.txt --iters 200 --candle
 
 # Train with BPE tokenizer
-cargo run --release -- data/input.txt --iters 200 --bpe --tokenizer data/tokenizer.json
+./target/release/wave-engine data/input.txt --iters 200 --bpe --tokenizer data/tokenizer.json
 
 # See all options
-cargo run --release -- --help
+./target/release/wave-engine --help
 ```
 
-No Python. No pip. No CUDA toolkit. One `cargo run` command.
+No Python. No pip. No CUDA toolkit. Build once, run anywhere.
 
 ## Examples
 
@@ -35,7 +36,7 @@ No Python. No pip. No CUDA toolkit. One `cargo run` command.
 Download any plain text file (Shakespeare, Wikipedia, a novel — anything works) and save it as `data/input.txt`. Then:
 
 ```bash
-cargo run --release -- data/input.txt --layers 4 --iters 200
+./target/release/wave-engine data/input.txt --layers 4 --iters 200
 ```
 
 This trains a 4-layer model on CPU for 200 iterations. You'll see loss descending from ~4.5 to ~2.5. The model saves to `checkpoint.bin` when done.
@@ -45,7 +46,7 @@ This trains a 4-layer model on CPU for 200 iterations. You'll see loss descendin
 If you have any GPU (NVIDIA, AMD, Intel, Apple Silicon):
 
 ```bash
-cargo run --release -- data/input.txt --layers 4 --iters 200 --gpu
+./target/release/wave-engine data/input.txt --layers 4 --iters 200 --gpu
 ```
 
 Same model, same results, GPU-accelerated. The `--gpu` flag works on any GPU vendor — no CUDA required.
@@ -56,7 +57,7 @@ If you have an NVIDIA GPU and want maximum speed:
 
 ```bash
 cargo build --release --features candle-backend
-cargo run --release --features candle-backend -- data/input.txt --candle --layers 4 --iters 200
+./target/release/wave-engine data/input.txt --candle --layers 4 --iters 200
 ```
 
 This uses the Candle/CUDA backend with perturbative ODE and block-diagonal output projection. 2.4x faster than CPU.
@@ -67,7 +68,7 @@ Character-level tokenization is fine for experiments, but BPE produces better mo
 
 ```bash
 # Download a GPT-2 tokenizer (or any HuggingFace tokenizer.json)
-cargo run --release -- data/input.txt --iters 1000 --bpe --tokenizer data/tokenizer.json
+./target/release/wave-engine data/input.txt --iters 1000 --bpe --tokenizer data/tokenizer.json
 ```
 
 ### Production training (24 layers, diverse corpus)
@@ -79,7 +80,7 @@ For a real model that generates English:
 cat grammar.txt literature.txt > data/training.txt
 
 # Train 24 layers with BPE on CUDA (fastest)
-cargo run --release --features candle-backend -- data/training.txt --candle \
+./target/release/wave-engine data/training.txt --candle \
     --layers 24 --iters 5000 --seq 256 --batch 4 --lr 1e-4 \
     --bpe --tokenizer data/tokenizer.json
 ```
@@ -87,7 +88,7 @@ cargo run --release --features candle-backend -- data/training.txt --candle \
 ### Resume training from a checkpoint
 
 ```bash
-cargo run --release -- data/input.txt --iters 5000 --resume checkpoint.bin
+./target/release/wave-engine data/input.txt --iters 5000 --resume checkpoint.bin
 ```
 
 ### Custom architecture dimensions
@@ -96,14 +97,14 @@ All tiers (CPU, wgpu, Candle) support runtime-configurable dimensions:
 
 ```bash
 # 168-dim diagnostic model (fast, 57ms/iter CPU, use 512 BPE)
-cargo run --release -- data/input.txt --n-bands 84 --n-head 4 --layers 4 \
+./target/release/wave-engine data/input.txt --n-bands 84 --n-head 4 --layers 4 \
     --bpe --tokenizer data/tokenizer_512.json
 
 # 384-dim (coherent English, use 2K-4K BPE)
-cargo run --release -- data/input.txt --n-bands 192 --n-head 8 --layers 8
+./target/release/wave-engine data/input.txt --n-bands 192 --n-head 8 --layers 8
 
 # 768-dim default (production, 50K BPE)
-cargo run --release -- data/input.txt --bpe --tokenizer data/tokenizer.json
+./target/release/wave-engine data/input.txt --bpe --tokenizer data/tokenizer.json
 ```
 
 Recommended BPE vocab per dimension (harmonic embedding minimum):
@@ -117,10 +118,10 @@ After training, inspect what the model learned using harmonic coherence diagnost
 
 ```bash
 # Wave structure report: semantic discrimination, depth curve, band census, phase clustering
-cargo run --release -- --analyze --resume checkpoint.bin --layers 4
+./target/release/wave-engine --analyze --resume checkpoint.bin --layers 4
 
 # With BPE tokenizer (for proper word-level semantic pairs)
-cargo run --release -- --analyze --resume checkpoint.bin --layers 24 --out-proj-groups 6 \
+./target/release/wave-engine --analyze --resume checkpoint.bin --layers 24 --out-proj-groups 6 \
     --bpe --tokenizer data/tokenizer.json
 ```
 
@@ -132,7 +133,7 @@ After training, serve it with [wave-server](https://github.com/atech-hub/wave-se
 
 ```bash
 # In the wave-server repo:
-cargo run --release -- ../wave-engine/checkpoint.bin --bpe ../wave-engine/data/tokenizer.json --port 8080
+./target/release/wave-server ../wave-engine/checkpoint.bin --bpe ../wave-engine/data/tokenizer.json --port 8080
 
 # Then connect any OpenAI-compatible chat UI to http://localhost:8080/v1
 ```
@@ -282,7 +283,7 @@ The engine includes 32+ WGSL compute shaders covering matvec, outer product, att
 ### Candle/CUDA (NVIDIA)
 
 ```bash
-cargo run --release --features candle-backend -- data/input.txt --iters 200 --candle
+./target/release/wave-engine data/input.txt --iters 200 --candle
 ```
 
 The Candle backend uses cuBLAS for all matrix operations with automatic forward/backward consistency via autograd. The Kerr-ODE runs as a `CustomOp1` with identity backward (ODE parameters frozen, gradient passthrough). Requires NVIDIA GPU with CUDA support.
