@@ -73,6 +73,20 @@ pub fn harmonic_spectrum(phases_a: &[f32], phases_b: &[f32], max_n: usize) -> Ve
     }).collect()
 }
 
+/// Average phases across a span of token positions (for multi-token words).
+/// Uses circular mean: atan2(mean(sin), mean(cos)) per band.
+pub fn average_phases_over_span(phases: &[Vec<f32>], positions: &[usize]) -> Vec<f32> {
+    if positions.len() == 1 {
+        return phases[positions[0]].clone();
+    }
+    let n_bands = phases[0].len();
+    (0..n_bands).map(|band| {
+        let sum_cos: f32 = positions.iter().map(|&p| phases[p][band].cos()).sum();
+        let sum_sin: f32 = positions.iter().map(|&p| phases[p][band].sin()).sum();
+        sum_sin.atan2(sum_cos) // circular mean
+    }).collect()
+}
+
 // ─── Diagnostic 1: Semantic Discrimination ──────────────────────
 
 pub struct DiscriminationResult {
@@ -96,6 +110,34 @@ pub fn semantic_discrimination(
     let random_mean = if random_pairs.is_empty() { 0.0 } else {
         random_pairs.iter().map(|&(a, b)| {
             best_harmonic_coherence(&phases[a], &phases[b], max_harmonic).0
+        }).sum::<f32>() / random_pairs.len() as f32
+    };
+
+    let ratio = related_mean / random_mean.max(0.001);
+    DiscriminationResult { related_mean, random_mean, ratio }
+}
+
+/// Span-based discrimination: words may span multiple BPE tokens.
+/// Each word is represented by its span of positions; phases are averaged via circular mean.
+pub fn semantic_discrimination_spans(
+    phases: &[Vec<f32>],
+    related_pairs: &[(Vec<usize>, Vec<usize>)],  // (word_a_positions, word_b_positions)
+    random_pairs: &[(Vec<usize>, Vec<usize>)],
+    max_harmonic: usize,
+) -> DiscriminationResult {
+    let related_mean = if related_pairs.is_empty() { 0.0 } else {
+        related_pairs.iter().map(|(span_a, span_b)| {
+            let avg_a = average_phases_over_span(phases, span_a);
+            let avg_b = average_phases_over_span(phases, span_b);
+            best_harmonic_coherence(&avg_a, &avg_b, max_harmonic).0
+        }).sum::<f32>() / related_pairs.len() as f32
+    };
+
+    let random_mean = if random_pairs.is_empty() { 0.0 } else {
+        random_pairs.iter().map(|(span_a, span_b)| {
+            let avg_a = average_phases_over_span(phases, span_a);
+            let avg_b = average_phases_over_span(phases, span_b);
+            best_harmonic_coherence(&avg_a, &avg_b, max_harmonic).0
         }).sum::<f32>() / random_pairs.len() as f32
     };
 

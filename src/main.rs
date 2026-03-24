@@ -955,23 +955,35 @@ fn main() {
             (ids, vc.len(), strings)
         };
 
-        // Find token positions for known semantic pairs
-        // Search for specific words in the token strings
-        let find_token = |word: &str| -> Option<usize> {
-            token_strings.iter().position(|t| {
-                let t_clean = t.trim().to_lowercase();
-                t_clean == word || t_clean == format!(" {word}") || t_clean == format!("{word}")
-                    || t.to_lowercase().contains(word)
-            })
+        // Find word spans — a word may be 1 token (char-level) or multiple (BPE sub-tokens).
+        // Concatenate adjacent token strings and find where the target word appears.
+        // Find the token span for a word. BPE tokens may have leading space (Ġ → " ").
+        // "cat" could be [" c", "at"] or [" cat"] depending on vocab size.
+        let find_word_span = |word: &str| -> Option<Vec<usize>> {
+            let word_lower = word.to_lowercase();
+            for start in 0..token_strings.len() {
+                let mut concat = String::new();
+                for end in start..token_strings.len().min(start + 5) {
+                    concat.push_str(&token_strings[end]);
+                    // Clean: strip leading BPE space marker, lowercase, trim
+                    let clean = concat.replace('\u{0120}', " ").to_lowercase();
+                    let clean = clean.trim();
+                    // Exact match: the concatenated tokens form exactly this word
+                    if clean == word_lower || clean == format!(" {word_lower}") {
+                        return Some((start..=end).collect());
+                    }
+                }
+            }
+            None
         };
 
         println!("  Test text: {} tokens", token_ids.len());
         println!("  Tokenizer: {}", if use_bpe { "BPE" } else { "char-level" });
 
-        // Build semantic pairs from known relationships
-        let mut related_pairs: Vec<(usize, usize)> = Vec::new();
+        // Build semantic pairs — works with both single-token and multi-token words
+        let mut related_span_pairs: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
         let mut related_labels: Vec<(String, String)> = Vec::new();
-        let mut random_pairs: Vec<(usize, usize)> = Vec::new();
+        let mut random_span_pairs: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
 
         let semantic_pairs = [
             ("cat", "dog"),         // same category (animals)
@@ -991,26 +1003,36 @@ fn main() {
         ];
 
         for (w1, w2) in &semantic_pairs {
-            if let (Some(a), Some(b)) = (find_token(w1), find_token(w2)) {
-                related_pairs.push((a, b));
+            if let (Some(span_a), Some(span_b)) = (find_word_span(w1), find_word_span(w2)) {
+                println!("    Related: ({w1}@{:?}, {w2}@{:?})", span_a, span_b);
                 related_labels.push((w1.to_string(), w2.to_string()));
-                println!("    Related: ({w1}@{a}, {w2}@{b})");
+                related_span_pairs.push((span_a, span_b));
             }
         }
         for (w1, w2) in &random_pair_words {
-            if let (Some(a), Some(b)) = (find_token(w1), find_token(w2)) {
-                random_pairs.push((a, b));
+            if let (Some(span_a), Some(span_b)) = (find_word_span(w1), find_word_span(w2)) {
+                random_span_pairs.push((span_a, span_b));
             }
         }
 
-        if related_pairs.is_empty() {
+        // Also build single-position pairs for backward compatibility (band census, clustering)
+        let mut related_pairs: Vec<(usize, usize)> = related_span_pairs.iter()
+            .map(|(a, b)| (a[0], b[0])).collect();
+        let mut random_pairs: Vec<(usize, usize)> = random_span_pairs.iter()
+            .map(|(a, b)| (a[0], b[0])).collect();
+
+        if related_span_pairs.is_empty() {
             println!("  WARNING: No semantic pairs found in tokens. Using positional fallback.");
             let t = token_ids.len();
             for i in (0..t.min(20)).step_by(2) {
-                if i + 1 < t { related_pairs.push((i, i + 1)); }
+                if i + 1 < t {
+                    related_pairs.push((i, i + 1));
+                    related_span_pairs.push((vec![i], vec![i + 1]));
+                }
             }
             for i in 0..t.min(10).min(t / 2) {
                 random_pairs.push((i, (i + t / 2) % t));
+                random_span_pairs.push((vec![i], vec![(i + t / 2) % t]));
             }
         }
 
@@ -1043,7 +1065,30 @@ fn main() {
             .map(|s| s.trim().replace('\n', "\\n").chars().take(12).collect())
             .collect();
 
-        // Run full report
+        // Run full report (uses span-based discrimination for proper multi-token words)
+        {
+            let deep = per_layer_phases.last().unwrap();
+            let disc = wa::semantic_discrimination_spans(deep, &related_span_pairs, &random_span_pairs, 12);
+            let verdict = if disc.ratio > 2.0 { "STRONG SEMANTIC STRUCTURE" }
+                else if disc.ratio > 1.5 { "EMERGING STRUCTURE" }
+                else { "NOT YET" };
+            println!("\n=== Wave Structure Report ===");
+            println!("Checkpoint: {resume_path}");
+            println!("Layers: {n_layers}, Bands: {}, Tokens: {}", dims.n_bands, token_ids.len());
+            println!("\n1. Semantic Discrimination (span-averaged for multi-token words)");
+            println!("   Related: {:.3}    Random: {:.3}    Ratio: {:.1}x    {verdict}",
+                disc.related_mean, disc.random_mean, disc.ratio);
+            // Print matched pairs
+            for (label, (span_a, span_b)) in related_labels.iter().zip(&related_span_pairs) {
+                let avg_a = wa::average_phases_over_span(deep, span_a);
+                let avg_b = wa::average_phases_over_span(deep, span_b);
+                let spectrum = wa::harmonic_spectrum(&avg_a, &avg_b, 12);
+                let (best_coh, best_n) = wa::best_harmonic_coherence(&avg_a, &avg_b, 12);
+                println!("   ({}, {}): peak n={best_n} ({best_coh:.2})  spans {:?} {:?}",
+                    label.0, label.1, span_a, span_b);
+            }
+        }
+        // Rest of report (band census, clustering, depth curve use positional pairs)
         wa::print_report(
             &resume_path, n_layers, dims.n_bands, token_ids.len(),
             &per_layer_phases, &related_pairs, &random_pairs, &display_labels,
@@ -1052,7 +1097,7 @@ fn main() {
         // Save JSON report
         std::fs::create_dir_all("analysis").ok();
         let deep = per_layer_phases.last().unwrap();
-        let disc = wa::semantic_discrimination(deep, &related_pairs, &random_pairs, 12);
+        let disc = wa::semantic_discrimination_spans(deep, &related_span_pairs, &random_span_pairs, 12);
         let census = wa::band_census(deep, dims.n_bands);
         let clustering = wa::phase_clustering(deep, dims.n_bands);
         let curve = wa::depth_curve(&per_layer_phases, &related_pairs, &random_pairs, 12);
