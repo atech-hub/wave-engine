@@ -46,6 +46,21 @@ pub mod engine {
         let n_bands = params.gamma_raw.len();
         let n_embd = n_bands * 2;
 
+        // Per-band magnitude clamp — must match CPU tier (src/common/ffn.rs)
+        let max_band_mag = 2.5f32;
+        let mut clamped = x.to_vec();
+        for k in 0..n_bands {
+            let r = clamped[k * 2];
+            let s = clamped[k * 2 + 1];
+            let mag_sq = r * r + s * s;
+            if mag_sq > max_band_mag * max_band_mag {
+                let scale = max_band_mag / mag_sq.sqrt();
+                clamped[k * 2] *= scale;
+                clamped[k * 2 + 1] *= scale;
+            }
+        }
+        let x = &clamped;
+
         fn softplus(v: f32) -> f32 { if v > 20.0 { v } else { (1.0 + v.exp()).ln() } }
         let gamma: Vec<f32> = params.gamma_raw.iter().map(|&g| softplus(g)).collect();
 
@@ -380,8 +395,9 @@ pub mod engine {
                 let ode_params = OdeParams {
                     gamma_raw: vec![gamma_raw_val; n_bands],
                     omega: (0..n_bands).map(|k| (k + 1) as f32 / n_bands as f32).collect(),
-                    alpha: 0.1,
-                    beta: 0.1,
+                    // Scale coupling with band count — must match CPU tier (main.rs)
+                    alpha: if n_bands <= 128 { 0.01 } else { 0.1 },
+                    beta: if n_bands <= 128 { 0.01 } else { 0.1 },
                     rk4_n_steps: rk4_steps,
                 };
                 let gpu_ode_params = crate::gpu_ode::gpu_ode::GpuOdeParams::new(
@@ -653,6 +669,30 @@ pub mod engine {
             crate::train::CurriculumSchedule::none(n_bands)
         };
 
+        // ─── Pre-flight diagnostics (must match CPU tier) ───────────
+        {
+            // Check 1: Embedding separation
+            let self_dot: f32 = wte_data[0].iter().map(|v| v * v).sum();
+            let adj_dot: f32 = if wte_data.len() > 1 {
+                wte_data[0].iter().zip(&wte_data[1]).map(|(a, b)| a * b).sum()
+            } else { self_dot };
+            let separation = self_dot - adj_dot;
+            if separation < 0.01 {
+                eprintln!("  [preflight] WARNING: Embedding separation {:.6} — geometrically degenerate", separation);
+            } else {
+                println!("  [preflight] Embedding separation: {:.4} OK", separation);
+            }
+
+            // Check 2: ODE stability
+            let alpha = if n_bands <= 128 { 0.01f32 } else { 0.1 };
+            let degrees = (alpha + 4.0 * alpha) * 4.0 * 180.0 / std::f32::consts::PI;
+            if degrees > 90.0 {
+                eprintln!("  [preflight] WARNING: ODE phase shift {:.0}° at M=2.0", degrees);
+            } else {
+                println!("  [preflight] ODE stability: {:.0}° at M=2.0, alpha={:.4} — OK", degrees, alpha);
+            }
+        }
+
         let total_iters = start_iter + n_iters;
         println!("\nTraining for {n_iters} iters (batch={batch_size}, seq={seq_len}, lr={lr})");
         if start_iter > 0 { println!("  Resuming from iter {start_iter}, target {total_iters}"); }
@@ -662,6 +702,7 @@ pub mod engine {
 
         // JSONL telemetry log (persists across crashes)
         let log_file = std::fs::File::create("training_log.jsonl").ok();
+        let mut log_writer = log_file.map(|f| std::io::BufWriter::new(f));
         let mut nan_skip_count = 0usize;
 
         // Cosine LR schedule with warmup
@@ -748,14 +789,14 @@ pub mod engine {
                 .map(|(free, total)| (total - free) / (1024 * 1024))
                 .unwrap_or(0);
 
-            // JSONL telemetry (survives crashes)
-            if let Some(ref log) = log_file {
+            // JSONL telemetry (survives crashes — flush after each write)
+            if let Some(ref mut writer) = log_writer {
                 use std::io::Write;
-                let entry = format!(
-                    "{{\"iter\":{},\"loss\":{:.4},\"lr\":{:.6},\"time_ms\":{},\"vram_mb\":{},\"nan_skips\":{}}}\n",
+                let _ = writeln!(writer,
+                    "{{\"iter\":{},\"loss\":{:.4},\"lr\":{:.6},\"time_ms\":{},\"vram_mb\":{},\"nan_skips\":{}}}",
                     iter, total_loss, current_lr, iter_time.as_millis(), vram_used_mb, nan_skip_count
                 );
-                let _ = (&*log).write_all(entry.as_bytes());
+                let _ = writer.flush();
             }
 
             if iter % 50 == 0 || iter == total_iters - 1 {
