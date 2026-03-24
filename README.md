@@ -92,13 +92,24 @@ cargo run --release -- data/input.txt --iters 5000 --resume checkpoint.bin
 
 ### Custom architecture dimensions
 
-```bash
-# Smaller model (faster experiments)
-cargo run --release -- data/input.txt --n-bands 64 --n-head 4 --layers 4
+All tiers (CPU, wgpu, Candle) support runtime-configurable dimensions:
 
-# Larger model (more capacity)
-cargo run --release -- data/input.txt --n-bands 448 --n-head 14 --out-proj-groups 7
+```bash
+# 168-dim diagnostic model (fast, 57ms/iter CPU, use 512 BPE)
+cargo run --release -- data/input.txt --n-bands 84 --n-head 4 --layers 4 \
+    --bpe --tokenizer data/tokenizer_512.json
+
+# 384-dim (coherent English, use 2K-4K BPE)
+cargo run --release -- data/input.txt --n-bands 192 --n-head 8 --layers 8
+
+# 768-dim default (production, 50K BPE)
+cargo run --release -- data/input.txt --bpe --tokenizer data/tokenizer.json
 ```
+
+Recommended BPE vocab per dimension (harmonic embedding minimum):
+- 168-dim (84 bands): 512 vocab
+- 384-dim (192 bands): 2K-4K vocab
+- 768-dim (384 bands): 50K vocab
 
 ### Analyse your trained model
 
