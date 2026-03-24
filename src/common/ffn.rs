@@ -31,8 +31,26 @@ pub fn ffn_forward_via_backend(
     let mae_in_out = cpu.linear_batch(&weights.maestro_in.process_1.w, &weights.maestro_in.process_1.b, &mae_in_act);
 
     // 2. Residual: precond = x + mae_in_out (CPU — element-wise, trivial)
-    let precond = cpu.vec_add_batch(x, &mae_in_out);
+    let mut precond = cpu.vec_add_batch(x, &mae_in_out);
     let _mae_in_dur = _t_mae_in.elapsed();
+
+    // Per-band magnitude clamp before ODE — prevents phase wrapping.
+    // At α=0.01, β=0.01: δφ = 0.05 × M² per RK4 step. At M=3.0: 26° per step,
+    // 416° over 16 steps → wrap. Clamp at 2.5 keeps δφ < 20° per step.
+    let n_bands = n_embd / 2;
+    let max_band_mag = 2.5f32;
+    for pos_vec in precond.iter_mut() {
+        for k in 0..n_bands {
+            let r = pos_vec[k * 2];
+            let s = pos_vec[k * 2 + 1];
+            let mag_sq = r * r + s * s;
+            if mag_sq > max_band_mag * max_band_mag {
+                let scale = max_band_mag / mag_sq.sqrt();
+                pos_vec[k * 2] *= scale;
+                pos_vec[k * 2 + 1] *= scale;
+            }
+        }
+    }
 
     // 3. ODE: GPU fused when available (one submit, zero readbacks between steps),
     //    CPU FFT fallback, sequential last resort
