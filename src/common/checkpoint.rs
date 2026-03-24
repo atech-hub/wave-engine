@@ -7,10 +7,10 @@
 //!   groups=1 (Dense): n_embd×n_embd weight + n_embd bias
 //!   groups=N (BlockDiagonal): N × (group_size×group_size weight + group_size bias)
 
-use crate::{N_BANDS, N_EMBD, N_HEAD, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS};
 use crate::train::Adam;
 
 /// Save model checkpoint in WCHK v2 format.
+/// Config fields use runtime values (Dims), not compile-time constants.
 pub fn save_checkpoint(
     params: &[f32],
     vocab_size: usize,
@@ -21,6 +21,7 @@ pub fn save_checkpoint(
     optimizer: &Adam,
     rng_state: u64,
     path: &str,
+    dims: crate::Dims,
 ) {
     use std::io::Write;
     let mut f = std::fs::File::create(path).expect("Failed to create checkpoint file");
@@ -29,14 +30,14 @@ pub fn save_checkpoint(
     f.write_all(b"WCHK").unwrap();
     f.write_all(&2u32.to_le_bytes()).unwrap();
 
-    // Config (7 fields in v2)
-    f.write_all(&(N_BANDS as u32).to_le_bytes()).unwrap();
-    f.write_all(&(N_HEAD as u32).to_le_bytes()).unwrap();
+    // Config (7 fields in v2) — uses runtime Dims, not compile-time constants
+    f.write_all(&(dims.n_bands as u32).to_le_bytes()).unwrap();
+    f.write_all(&(dims.n_head as u32).to_le_bytes()).unwrap();
     f.write_all(&(n_layers as u32).to_le_bytes()).unwrap();
-    f.write_all(&(MAESTRO_DIM as u32).to_le_bytes()).unwrap();
-    f.write_all(&(BLOCK_SIZE as u32).to_le_bytes()).unwrap();
-    f.write_all(&(RK4_STEPS as u32).to_le_bytes()).unwrap();
-    f.write_all(&(out_proj_groups as u32).to_le_bytes()).unwrap(); // NEW in v2
+    f.write_all(&(dims.maestro_dim as u32).to_le_bytes()).unwrap();
+    f.write_all(&(dims.block_size as u32).to_le_bytes()).unwrap();
+    f.write_all(&(dims.rk4_steps as u32).to_le_bytes()).unwrap();
+    f.write_all(&(out_proj_groups as u32).to_le_bytes()).unwrap();
 
     // Metadata
     f.write_all(&(vocab_size as u64).to_le_bytes()).unwrap();
@@ -90,23 +91,22 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
         1 // v1 = dense out_proj
     };
 
-    assert_eq!(ck_bands, N_BANDS, "Checkpoint bands mismatch");
-    assert_eq!(ck_head, N_HEAD, "Checkpoint heads mismatch");
-    assert_eq!(ck_maestro, MAESTRO_DIM, "Checkpoint maestro_dim mismatch");
+    // Use config from checkpoint header — no compile-time constant assertions
+    let n_embd = ck_bands * 2;
 
     let vocab_size = read_u64(&mut f) as usize;
     let iter = read_u64(&mut f) as usize;
     let lr = read_f32_single(&mut f);
     let rng_state = read_u64(&mut f);
 
-    // Compute param count based on out_proj_groups
-    let gs = N_EMBD / out_proj_groups;
+    // Compute param count from checkpoint config (not compile-time constants)
+    let gs = n_embd / out_proj_groups;
     let out_proj_params = out_proj_groups * (gs * gs + gs);
-    let per_block = N_EMBD*2 + N_EMBD*2
-        + MAESTRO_DIM*N_EMBD + MAESTRO_DIM + N_EMBD*MAESTRO_DIM + N_EMBD
-        + MAESTRO_DIM*N_EMBD + MAESTRO_DIM + N_EMBD*MAESTRO_DIM + N_EMBD
+    let per_block = n_embd*2 + n_embd*2
+        + ck_maestro*n_embd + ck_maestro + n_embd*ck_maestro + n_embd
+        + ck_maestro*n_embd + ck_maestro + n_embd*ck_maestro + n_embd
         + out_proj_params;
-    let n_params = ck_layers * per_block + N_EMBD*2 + vocab_size*N_EMBD;
+    let n_params = ck_layers * per_block + n_embd*2 + vocab_size*n_embd;
 
     let adam_t = read_u64(&mut f) as usize;
     let read_f32_vec = |f: &mut std::fs::File, n: usize| -> Vec<f32> {

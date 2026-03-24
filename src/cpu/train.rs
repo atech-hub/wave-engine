@@ -427,7 +427,7 @@ pub fn run_training(config: TrainConfig) {
             let params = flatten_params(&model);
             let path = format!("checkpoint_iter{}.bin", iter + 1);
             let groups = model.blocks[0].ffn.out_proj.n_groups();
-            wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), groups, iter + 1, lr, &optimizer, rng.state(), &path);
+            wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), groups, iter + 1, lr, &optimizer, rng.state(), &path, dims);
             println!("  Checkpoint: {path}");
         }
     }
@@ -437,6 +437,6 @@ pub fn run_training(config: TrainConfig) {
     // Final checkpoint
     let params = flatten_params(&model);
     let groups = model.blocks[0].ffn.out_proj.n_groups();
-    wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), groups, total_iters, lr, &optimizer, rng.state(), &config.checkpoint_name);
+    wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), groups, total_iters, lr, &optimizer, rng.state(), &config.checkpoint_name, dims);
     println!("Checkpoint saved to {}", config.checkpoint_name);
 }
