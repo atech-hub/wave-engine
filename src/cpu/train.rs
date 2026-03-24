@@ -10,7 +10,7 @@ use crate::rng::Rng;
 // ─── Adam optimizer ─────────────────────────────────────────────
 
 pub struct Adam {
-    lr: f32,
+    pub lr: f32,
     beta1: f32,
     beta2: f32,
     eps: f32,
@@ -311,8 +311,21 @@ pub fn run_training(config: TrainConfig) {
 
     let train_start = std::time::Instant::now();
 
+    let warmup_iters = 100usize;
+    let min_lr_ratio = 0.1f32; // decay to 10% of base LR
+
     for iter in start_iter..total_iters {
         let iter_start = std::time::Instant::now();
+
+        // Cosine LR schedule with warmup — matches Candle tier
+        let current_lr = if iter < warmup_iters {
+            lr * (iter as f32 + 1.0) / warmup_iters as f32
+        } else {
+            let progress = (iter - warmup_iters) as f32 / (total_iters - warmup_iters).max(1) as f32;
+            let min_lr = lr * min_lr_ratio;
+            min_lr + 0.5 * (lr - min_lr) * (1.0 + (progress * std::f32::consts::PI).cos())
+        };
+        optimizer.lr = current_lr;
 
         let starts: Vec<usize> = (0..batch_size)
             .map(|_| (rng.next_u64() as usize) % (train_data.len() - seq_len - 1))
@@ -397,12 +410,12 @@ pub fn run_training(config: TrainConfig) {
         use std::io::Write;
         writeln!(log_writer,
             r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{}}}"#,
-            iter, total_loss, lr, iter_start.elapsed().as_millis(), nan_skip_count
+            iter, total_loss, current_lr, iter_start.elapsed().as_millis(), nan_skip_count
         ).ok();
         log_writer.flush().ok();
 
         if iter % 10 == 0 || iter == total_iters - 1 {
-            println!("{:>6} {:>10.4} {:>10.1?}  gnorm={:.2}", iter, total_loss, iter_start.elapsed(), grad_norm);
+            println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  gnorm={:.2}", iter, total_loss, iter_start.elapsed(), current_lr, grad_norm);
             if monitor.enabled() {
                 monitor.report(if iter == 0 { 1 } else { 50.min(iter) });
                 monitor.reset();
