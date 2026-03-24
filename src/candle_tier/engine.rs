@@ -671,10 +671,11 @@ pub mod engine {
 
         // ─── Pre-flight diagnostics (must match CPU tier) ───────────
         {
-            // Check 1: Embedding separation
-            let self_dot: f32 = wte_data[0].iter().map(|v| v * v).sum();
-            let adj_dot: f32 = if wte_data.len() > 1 {
-                wte_data[0].iter().zip(&wte_data[1]).map(|(a, b)| a * b).sum()
+            // Check 1: Embedding separation (rebuild table to check)
+            let pf_wte = crate::wave_embed::build_harmonic_table(vocab_size, n_bands);
+            let self_dot: f32 = pf_wte[0].iter().map(|v| v * v).sum();
+            let adj_dot: f32 = if pf_wte.len() > 1 {
+                pf_wte[0].iter().zip(&pf_wte[1]).map(|(a, b)| a * b).sum()
             } else { self_dot };
             let separation = self_dot - adj_dot;
             if separation < 0.01 {
@@ -821,9 +822,10 @@ pub mod engine {
                 let params = extract_wchk_params(&varmap, n_layers, n_embd, maestro_dim, vocab_size, out_proj_groups);
                 let dummy_adam = crate::train::Adam::new(lr as f32, params.len());
                 // out_proj_groups from runtime config
+                let ck_dims = crate::Dims::from_cli(n_bands, n_head, maestro_dim, 256, _rk4_steps);
                 crate::wave_checkpoint::save_checkpoint(
                     &params, vocab_size, n_layers, out_proj_groups, iter + 1, lr as f32,
-                    &dummy_adam, 0, "checkpoint.bin",
+                    &dummy_adam, 0, "checkpoint.bin", ck_dims,
                 );
                 } // end NaN guard else
             }
