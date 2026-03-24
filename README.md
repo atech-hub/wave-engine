@@ -29,6 +29,25 @@ cargo build --release --features candle-backend
 
 No Python. No pip. No CUDA toolkit. Build once, run anywhere.
 
+## Model Configurations
+
+Proven configurations for each dimension tier, with recommended settings, training results, and ideal use cases. Start with the tier that matches your hardware and goals.
+
+| Tier | Dimension | Params | Speed | Best For | Details |
+|------|-----------|--------|-------|----------|--------|
+| **Research / Specialist** | 168-dim | 186K | 57-80ms | Small-vocab structured tasks — music, code, chemistry, DNA, arithmetic. Trains in minutes on any CPU. 0.988 phase clustering, bimodal band census confirmed. | [168-dim config](configs/168-dim/CONFIG.md) |
+| **Mid-Range** | 256-dim | 258-579K | 140-210ms | Domain-specific text, structured English, code generation. Bridge between research and production. | [256-dim config](configs/256-dim/CONFIG.md) |
+| **Power User** | 384-dim | ~500K | ~200ms | Coherent English with word-level BPE. Enough capacity for sentence-level generation. | [384-dim config](configs/384-dim/CONFIG.md) |
+| **Production** | 768-dim | ~4M | 1.2s CPU / 4.3s GPU | Full English, 50K BPE vocabulary. 24-layer models trained on Candle/CUDA. | [768-dim config](configs/768-dim/CONFIG.md) |
+
+Key scaling rules discovered through systematic testing:
+- **Gradient balance:** Model params need ≥44% of total for effective learning. Below this, the lm_head starves the ODE/maestro.
+- **Vocab matching:** Larger vocabularies need larger dimensions — 512 BPE for 168-dim, up to 50K BPE for 768-dim.
+- **Multi-grid embeddings:** Required for BPE below 768-dim. Coprime dual-circle mapping gives 101x-11,800x token separation improvement.
+- **Per-band ODE clamp:** Max magnitude 2.5 before ODE — prevents phase wrapping at all dimensions.
+
+See [configs/README.md](configs/README.md) for the complete guide.
+
 ## Examples
 
 ### Your first training run

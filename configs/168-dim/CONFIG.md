@@ -105,6 +105,27 @@ For single-token whole words, you need ≥4K vocab which requires ≥384-dim. Se
 
 ---
 
+## Ideal Use Cases for 168-dim
+
+The 168-dim model has 84 harmonic bands, ~100K model params, and trains at 57-80ms/iter. It builds near-perfect wave structure (0.988 phase clustering) but can't fit enough patterns for general English. This makes it ideal for tasks with **small vocabularies and deep structural patterns** — exactly where harmonic coherence shines.
+
+| Use Case | Vocab | Why 168-dim fits | What it demonstrates |
+|----------|-------|-----------------|---------------------|
+| **MIDI music generation** | ~88 (notes) | 88 notes = 87% model gradient share. Musical harmony IS harmonic coherence — octaves (n=2), fifths (n=3), fourths (n=4) map directly to the ODE's frequency bands | Wave architecture generating music from its native mathematical substrate |
+| **Simple arithmetic** | ~15 (0-9 + ops) | Tiny vocab, learnable rules, verifiable output. "2+3=5" is a pattern a 100K model can memorise completely | Proof that wave-engine learns logical rules, not just statistics |
+| **DNA sequences** | 4 (A,T,G,C) | 4 tokens on 84 bands = maximally separated. Codon patterns, promoter regions, repeats — deep structure in tiny vocab | Bioinformatics on a laptop with no GPU |
+| **Chemical formulas** | ~120 (elements) | Small vocab, strict grammar. Harmonic coherence maps to chemical bonding — n=2 for double bonds, n=3 for resonance structures | Domain-specific language model for chemistry |
+| **Code keywords** | ~50-200 | Python has ~35 keywords + operators. Pattern space is small but structure is deep (nesting, scope, indentation) | Structured reasoning at tiny scale |
+| **Chess/game moves** | ~200 | Small move vocabulary, deep positional patterns. Phase-based attention could encode board state as angles | Game AI from harmonic dynamics |
+| **Morse/signal patterns** | 3-10 | Trivial vocab, rhythmic temporal structure — natural fit for coupled oscillators | Signal processing proof of concept |
+| **Wave structure research** | Any small vocab | Fast iteration (57ms/iter), full diagnostic pipeline, bimodal band census confirmed | Architecture experiments before scaling up |
+
+**The principle:** 168-dim excels when vocab is small enough that the model has >50% gradient share AND the task has structural relationships that map to harmonic coherence. The smaller the vocab relative to the dimension, the more of the model's capacity goes to learning structure rather than distinguishing tokens.
+
+**For the 148 cloners:** If your task has <200 tokens and structural patterns, 168-dim trains in minutes on any CPU and might outperform much larger models that waste capacity on vocabulary overhead. The wave architecture's efficiency advantage is strongest at small scale with structured data.
+
+---
+
 ## Known Limitations
 
 1. **Training window limited to ~10K iterations** — the model learns effectively for one corpus pass (~5K-10K iters). Beyond that, the rolling average rises and the model diverges by iter 25K. This is not instability (zero NaN throughout) but a capacity limitation: 100K model params memorise patterns from the first pass and overfit on subsequent passes.
@@ -171,6 +192,14 @@ If any pre-flight check warns or fails, the training configuration needs adjustm
 ```
 
 **Note:** The wave-server must have multi-grid embeddings and per-band ODE clamp matching the engine's forward pass. Models trained with multi-grid will produce garbage if served with single-grid embeddings.
+
+### Serving Test Result (6L, 512 BPE, iter 7000, loss 3.95)
+
+Prompt: "The cat sat on the" → Output: English fragments ("may", "will", "the") but not coherent sentences.
+
+The model recognises common sub-word patterns but cannot compose them into language at this scale. 100K model params is below the threshold for sentence-level generation. This is expected — the model's wave structure diagnostics show it IS building harmonic organisation (0.94 clustering, bimodal bands), it just lacks the capacity to translate that structure into coherent output.
+
+**For coherent English output, use 384-dim (Model B) or larger.**
 
 ---
 

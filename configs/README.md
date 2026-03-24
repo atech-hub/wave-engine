@@ -6,7 +6,8 @@ Start with the tier that matches your hardware and goals:
 
 | Tier | Dimension | Vocab | Params | Speed | Use Case |
 |------|-----------|-------|--------|-------|----------|
-| [**Research**](168-dim/CONFIG.md) | 168 | 512 BPE / char | 186K | 57-80ms/iter | Fast iteration, diagnostics, architecture experiments |
+| [**Research / Specialist**](168-dim/CONFIG.md) | 168 | 512 BPE / char | 186K | 57-80ms/iter | Small-vocab structured tasks (music, code, chemistry, DNA, arithmetic), diagnostics, architecture experiments |
+| [**Mid-Range**](256-dim/CONFIG.md) | 256 | 512-1K BPE | 258-579K | ~140-210ms/iter | Domain-specific text, structured English, code — bridge tier *(initial test done, needs longer runs)* |
 | **Power User** | 384 | 8K BPE | ~500K | ~200ms/iter | Coherent English, scaled diagnostics *(coming soon)* |
 | **Production** | 768 | 50K BPE | ~4M | ~1.2s/iter (CPU) / 4.3s (GPU 24L) | Full English, reasoning *(coming soon)* |
 
