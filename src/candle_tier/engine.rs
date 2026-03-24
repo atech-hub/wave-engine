@@ -711,9 +711,11 @@ pub mod engine {
         println!("{:>6} {:>10} {:>10}", "Iter", "Loss", "Time");
         println!("{}", "-".repeat(35));
 
-        // JSONL telemetry log (persists across crashes)
-        let log_file = std::fs::File::create("training_log.jsonl").ok();
+        // JSONL telemetry — tier-specific filename to prevent overwrites
+        let log_name = "training_log_candle.jsonl";
+        let log_file = std::fs::File::create(log_name).ok();
         let mut log_writer = log_file.map(|f| std::io::BufWriter::new(f));
+        println!("  Telemetry: {log_name}");
         let mut nan_skip_count = 0usize;
 
         // Cosine LR schedule with warmup

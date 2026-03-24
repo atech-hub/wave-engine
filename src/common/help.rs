@@ -59,7 +59,9 @@ pub fn print_help() {
     println!("    --debug-nan       Enable per-layer NaN detection (Candle only, ~6x slower)");
     println!();
     println!("    Always-on telemetry (no flag needed):");
-    println!("      training_log.jsonl   Per-iteration: loss, lr, time_ms, nan_skips (all tiers)");
+    println!("      training_log_cpu.jsonl    CPU tier telemetry (per-iteration)");
+    println!("      training_log_wgpu.jsonl   wgpu tier telemetry");
+    println!("      training_log_candle.jsonl Candle tier telemetry");
     println!("      Cosine LR schedule   Warmup 100 iters, cosine decay to 10% (all tiers)");
     println!("      Pre-flight checks    Embedding separation, param balance, ODE stability");
     println!("      First-10 health      Gradient norms, component balance (first 10 iters)");

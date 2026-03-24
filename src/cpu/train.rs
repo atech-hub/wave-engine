@@ -297,9 +297,11 @@ pub fn run_training(config: TrainConfig) {
     let seq_len = config.seq_len;
     let lr = config.lr;
 
-    // JSONL telemetry — matches Candle tier format for analyze_training.py
-    let log_file = std::fs::File::create("training_log.jsonl")
-        .expect("Failed to create training_log.jsonl");
+    // JSONL telemetry — tier-specific filenames to prevent overwrites
+    let log_name = if config.use_gpu { "training_log_wgpu.jsonl" } else { "training_log_cpu.jsonl" };
+    let log_file = std::fs::File::create(log_name)
+        .expect(&format!("Failed to create {log_name}"));
+    println!("  Telemetry: {log_name}");
     let mut log_writer = std::io::BufWriter::new(log_file);
     let mut nan_skip_count = 0usize;
 
