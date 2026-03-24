@@ -684,7 +684,17 @@ pub mod engine {
                 println!("  [preflight] Embedding separation: {:.4} OK", separation);
             }
 
-            // Check 2: ODE stability
+            // Check 2: Parameter balance
+            let lm_head_params = vocab_size * n_embd;
+            let total_params = n_params;
+            let lm_pct = lm_head_params as f32 / total_params.max(1) as f32 * 100.0;
+            if lm_pct > 95.0 {
+                eprintln!("  [preflight] WARNING: lm_head is {:.1}% of params — ODE gets <{:.1}% gradient", lm_pct, 100.0 - lm_pct);
+            } else {
+                println!("  [preflight] Parameter balance: {:.1}% model, {:.1}% lm_head — OK", 100.0 - lm_pct, lm_pct);
+            }
+
+            // Check 3: ODE stability
             let alpha = if n_bands <= 128 { 0.01f32 } else { 0.1 };
             let degrees = (alpha + 4.0 * alpha) * 4.0 * 180.0 / std::f32::consts::PI;
             if degrees > 90.0 {
