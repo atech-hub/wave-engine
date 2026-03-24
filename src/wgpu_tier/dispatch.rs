@@ -518,11 +518,26 @@ impl ComputeBackend for GpuBackend {
             .flat_map(|v| v.iter().map(|&val| gelu_cpu(val))).collect();
         let mae_in_act_vecs: Vec<Vec<f32>> = mae_in_act.chunks(maestro_dim).map(|c| c.to_vec()).collect();
         let mae_in_out = self.linear_batch(&weights.maestro_in.process_1.w, &weights.maestro_in.process_1.b, &mae_in_act_vecs);
-        let precond: Vec<Vec<f32>> = (0..t).map(|pos| {
+        let mut precond: Vec<Vec<f32>> = (0..t).map(|pos| {
             let mut p = vec![0.0f32; n_embd];
             for i in 0..n_embd { p[i] = x[pos][i] + mae_in_out[pos][i]; }
             p
         }).collect();
+        // Per-band magnitude clamp — must match CPU tier (src/common/ffn.rs)
+        let n_bands = n_embd / 2;
+        let max_band_mag = 2.5f32;
+        for pv in precond.iter_mut() {
+            for k in 0..n_bands {
+                let r = pv[k * 2];
+                let s = pv[k * 2 + 1];
+                let mag_sq = r * r + s * s;
+                if mag_sq > max_band_mag * max_band_mag {
+                    let scale = max_band_mag / mag_sq.sqrt();
+                    pv[k * 2] *= scale;
+                    pv[k * 2 + 1] *= scale;
+                }
+            }
+        }
         let kerr_outs = self.kerr_ode_batch(&weights.kerr, &precond);
         if kerr_outs.iter().any(|h| h.iter().any(|v| v.is_nan())) {
             eprintln!("    [NaN source: dual-maestro Kerr-ODE output]");
