@@ -38,24 +38,27 @@ pub fn ffn_forward_via_backend(
     let mut precond = cpu.vec_add_batch(x, &mae_in_out);
     let _mae_in_dur = _t_mae_in.elapsed();
 
-    // Per-band magnitude clamp before ODE — prevents phase wrapping.
+    // Soft clamp (tanh compression) before ODE — prevents phase wrapping
+    // without hard clipping. Like a compressor instead of a limiter.
+    // At low magnitudes: passes through unchanged. At high: smoothly compresses.
+    // No hard wall → no gradient discontinuity → maestro finds equilibrium naturally.
     let n_bands = n_embd / 2;
-    let max_band_mag = 2.5f32;
-    let mut clamp_count = 0usize;
+    let threshold = 5.0f32; // compression knee — magnitudes above this get progressively squashed
+    let mut clamp_count = 0usize; // tracks how many bands are in compression region
     let mut max_pre_clamp_mag = 0.0f32;
     for pos_vec in precond.iter_mut() {
         for k in 0..n_bands {
             let r = pos_vec[k * 2];
             let s = pos_vec[k * 2 + 1];
-            let mag_sq = r * r + s * s;
-            if mag_sq > max_pre_clamp_mag * max_pre_clamp_mag {
-                max_pre_clamp_mag = mag_sq.sqrt();
-            }
-            if mag_sq > max_band_mag * max_band_mag {
-                let scale = max_band_mag / mag_sq.sqrt();
+            let mag = (r * r + s * s).sqrt();
+            if mag > max_pre_clamp_mag { max_pre_clamp_mag = mag; }
+            if mag > 0.001 {
+                // tanh soft compression: asymptotically approaches threshold
+                let compressed_mag = threshold * (mag / threshold).tanh();
+                let scale = compressed_mag / mag;
                 pos_vec[k * 2] *= scale;
                 pos_vec[k * 2 + 1] *= scale;
-                clamp_count += 1;
+                if mag > threshold { clamp_count += 1; } // count bands in compression zone
             }
         }
     }
