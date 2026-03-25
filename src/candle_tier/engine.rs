@@ -815,13 +815,25 @@ pub mod engine {
                 .map(|(free, total)| (total - free) / (1024 * 1024))
                 .unwrap_or(0);
 
-            // JSONL telemetry (survives crashes — flush after each write)
+            // JSONL telemetry — with AGC diagnostics every 100 iters
             if let Some(ref mut writer) = log_writer {
                 use std::io::Write;
-                let _ = writeln!(writer,
-                    "{{\"iter\":{},\"loss\":{:.4},\"lr\":{:.6},\"time_ms\":{},\"vram_mb\":{},\"nan_skips\":{}}}",
-                    iter, total_loss, current_lr, iter_time.as_millis(), vram_used_mb, nan_skip_count
-                );
+                if iter % 100 == 0 {
+                    // AGC + ODE stats from shared FFN module
+                    let clamp_count = crate::ffn_backend::ODE_CLAMP_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                    let max_mag = f32::from_bits(crate::ffn_backend::ODE_MAX_MAG.load(std::sync::atomic::Ordering::Relaxed));
+                    let agc = crate::ffn_backend::agc_stats();
+                    let _ = writeln!(writer,
+                        "{{\"iter\":{},\"loss\":{:.4},\"lr\":{:.6},\"time_ms\":{},\"vram_mb\":{},\"nan_skips\":{},\"ode_clamps\":{},\"ode_max_mag\":{:.2},\"agc_threshold\":{:.3},\"agc_mean\":{:.3},\"agc_std\":{:.3}}}",
+                        iter, total_loss, current_lr, iter_time.as_millis(), vram_used_mb, nan_skip_count,
+                        clamp_count, max_mag, agc.threshold, agc.ema_mean, agc.ema_std
+                    );
+                } else {
+                    let _ = writeln!(writer,
+                        "{{\"iter\":{},\"loss\":{:.4},\"lr\":{:.6},\"time_ms\":{},\"vram_mb\":{},\"nan_skips\":{}}}",
+                        iter, total_loss, current_lr, iter_time.as_millis(), vram_used_mb, nan_skip_count
+                    );
+                }
                 let _ = writer.flush();
             }
 
