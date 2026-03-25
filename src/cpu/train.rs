@@ -408,12 +408,39 @@ pub fn run_training(config: TrainConfig) {
             }
         }
 
-        // JSONL telemetry — every iteration
+        // JSONL telemetry — every iteration, with gradient diagnostics every 100
         use std::io::Write;
-        writeln!(log_writer,
-            r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{}}}"#,
-            iter, total_loss, current_lr, iter_start.elapsed().as_millis(), nan_skip_count
-        ).ok();
+        let lm_head_size = model.vocab_size * model.ln_f.weight.len();
+        let lm_start = n_trainable.saturating_sub(lm_head_size);
+        if iter % 100 == 0 {
+            // Gradient balance: model vs lm_head
+            let model_gn: f32 = total_grads[..lm_start].iter().map(|g| g * g).sum::<f32>().sqrt();
+            let head_gn: f32 = total_grads[lm_start..].iter().map(|g| g * g).sum::<f32>().sqrt();
+            let head_pct = head_gn / grad_norm.max(0.001) * 100.0;
+            // Per-layer gradient norms (model params only, split by layer)
+            let n_layers = model.blocks.len();
+            let model_params = lm_start;
+            let per_layer = model_params / n_layers.max(1);
+            let layer_gns: Vec<f32> = (0..n_layers).map(|l| {
+                let start = l * per_layer;
+                let end = ((l + 1) * per_layer).min(lm_start);
+                total_grads[start..end].iter().map(|g| g * g).sum::<f32>().sqrt()
+            }).collect();
+            let layer_str: String = layer_gns.iter().map(|g| format!("{:.3}", g)).collect::<Vec<_>>().join(",");
+            // ODE clamp stats from FFN forward
+            let clamp_count = crate::ffn_backend::ODE_CLAMP_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            let max_mag = f32::from_bits(crate::ffn_backend::ODE_MAX_MAG.load(std::sync::atomic::Ordering::Relaxed));
+            writeln!(log_writer,
+                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2}}}"#,
+                iter, total_loss, current_lr, iter_start.elapsed().as_millis(), nan_skip_count,
+                model_gn, head_gn, head_pct, layer_str, clamp_count, max_mag
+            ).ok();
+        } else {
+            writeln!(log_writer,
+                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{}}}"#,
+                iter, total_loss, current_lr, iter_start.elapsed().as_millis(), nan_skip_count
+            ).ok();
+        }
         log_writer.flush().ok();
 
         if iter % 10 == 0 || iter == total_iters - 1 {

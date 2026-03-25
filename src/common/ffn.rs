@@ -7,6 +7,10 @@
 use crate::backend::ComputeBackend;
 use crate::wave_block::{KerrDualMaestroWeights, gelu};
 
+/// ODE input clamp monitoring — read from training loop for diagnostics
+pub static ODE_CLAMP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static ODE_MAX_MAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// FFN forward through backend. Hybrid routing: big ops on `backend` (GPU when available),
 /// small ops (maestro dim=16) always on CPU for precision.
 /// When ping_pong is Some, out_proj routes through GPU ping-pong buffers (13ms→~1ms).
@@ -35,22 +39,29 @@ pub fn ffn_forward_via_backend(
     let _mae_in_dur = _t_mae_in.elapsed();
 
     // Per-band magnitude clamp before ODE — prevents phase wrapping.
-    // At α=0.01, β=0.01: δφ = 0.05 × M² per RK4 step. At M=3.0: 26° per step,
-    // 416° over 16 steps → wrap. Clamp at 2.5 keeps δφ < 20° per step.
     let n_bands = n_embd / 2;
     let max_band_mag = 2.5f32;
+    let mut clamp_count = 0usize;
+    let mut max_pre_clamp_mag = 0.0f32;
     for pos_vec in precond.iter_mut() {
         for k in 0..n_bands {
             let r = pos_vec[k * 2];
             let s = pos_vec[k * 2 + 1];
             let mag_sq = r * r + s * s;
+            if mag_sq > max_pre_clamp_mag * max_pre_clamp_mag {
+                max_pre_clamp_mag = mag_sq.sqrt();
+            }
             if mag_sq > max_band_mag * max_band_mag {
                 let scale = max_band_mag / mag_sq.sqrt();
                 pos_vec[k * 2] *= scale;
                 pos_vec[k * 2 + 1] *= scale;
+                clamp_count += 1;
             }
         }
     }
+    // Store clamp stats for monitoring (thread-safe atomic)
+    ODE_CLAMP_COUNT.store(clamp_count, std::sync::atomic::Ordering::Relaxed);
+    ODE_MAX_MAG.store(max_pre_clamp_mag.to_bits(), std::sync::atomic::Ordering::Relaxed);
 
     // 3. ODE: GPU fused when available (one submit, zero readbacks between steps),
     //    CPU FFT fallback, sequential last resort
