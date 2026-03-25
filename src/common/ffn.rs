@@ -7,9 +7,18 @@
 use crate::backend::ComputeBackend;
 use crate::wave_block::{KerrDualMaestroWeights, gelu};
 
-/// ODE input clamp monitoring — read from training loop for diagnostics
+/// ODE input monitoring — read from training loop for diagnostics
 pub static ODE_CLAMP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static ODE_MAX_MAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Global AGC — shared across all FFN calls within an iteration.
+static AGC: std::sync::LazyLock<std::sync::Mutex<crate::common::agc::OdeAgc>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::common::agc::OdeAgc::new()));
+
+/// Get current AGC stats for JSONL logging.
+pub fn agc_stats() -> crate::common::agc::AgcStats {
+    AGC.lock().unwrap().stats()
+}
 
 /// FFN forward through backend. Hybrid routing: big ops on `backend` (GPU when available),
 /// small ops (maestro dim=16) always on CPU for precision.
@@ -38,31 +47,15 @@ pub fn ffn_forward_via_backend(
     let mut precond = cpu.vec_add_batch(x, &mae_in_out);
     let _mae_in_dur = _t_mae_in.elapsed();
 
-    // Soft clamp (tanh compression) before ODE — prevents phase wrapping
-    // without hard clipping. Like a compressor instead of a limiter.
-    // At low magnitudes: passes through unchanged. At high: smoothly compresses.
-    // No hard wall → no gradient discontinuity → maestro finds equilibrium naturally.
+    // AGC (Automatic Gain Control) — adaptive knee compression before ODE.
+    // The model finds its own operating range via EMA of observed magnitudes.
+    // Below threshold: signal passes UNCHANGED. Above: smooth compression on excess only.
+    // Threshold = EMA_mean + 3σ (adapts over ~200 iters).
     let n_bands = n_embd / 2;
-    let threshold = 5.0f32; // compression knee — magnitudes above this get progressively squashed
-    let mut clamp_count = 0usize; // tracks how many bands are in compression region
-    let mut max_pre_clamp_mag = 0.0f32;
-    for pos_vec in precond.iter_mut() {
-        for k in 0..n_bands {
-            let r = pos_vec[k * 2];
-            let s = pos_vec[k * 2 + 1];
-            let mag = (r * r + s * s).sqrt();
-            if mag > max_pre_clamp_mag { max_pre_clamp_mag = mag; }
-            if mag > 0.001 {
-                // tanh soft compression: asymptotically approaches threshold
-                let compressed_mag = threshold * (mag / threshold).tanh();
-                let scale = compressed_mag / mag;
-                pos_vec[k * 2] *= scale;
-                pos_vec[k * 2 + 1] *= scale;
-                if mag > threshold { clamp_count += 1; } // count bands in compression zone
-            }
-        }
-    }
-    // Store clamp stats for monitoring (thread-safe atomic)
+    let (clamp_count, max_pre_clamp_mag) = {
+        let mut agc = AGC.lock().unwrap();
+        agc.process(&mut precond, n_bands)
+    };
     ODE_CLAMP_COUNT.store(clamp_count, std::sync::atomic::Ordering::Relaxed);
     ODE_MAX_MAG.store(max_pre_clamp_mag.to_bits(), std::sync::atomic::Ordering::Relaxed);
 

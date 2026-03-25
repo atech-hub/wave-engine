@@ -427,13 +427,15 @@ pub fn run_training(config: TrainConfig) {
                 total_grads[start..end].iter().map(|g| g * g).sum::<f32>().sqrt()
             }).collect();
             let layer_str: String = layer_gns.iter().map(|g| format!("{:.3}", g)).collect::<Vec<_>>().join(",");
-            // ODE clamp stats from FFN forward
+            // ODE clamp stats + AGC state from FFN forward
             let clamp_count = crate::ffn_backend::ODE_CLAMP_COUNT.load(std::sync::atomic::Ordering::Relaxed);
             let max_mag = f32::from_bits(crate::ffn_backend::ODE_MAX_MAG.load(std::sync::atomic::Ordering::Relaxed));
+            let agc = crate::ffn_backend::agc_stats();
             writeln!(log_writer,
-                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2}}}"#,
+                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}}}"#,
                 iter, total_loss, current_lr, iter_start.elapsed().as_millis(), nan_skip_count,
-                model_gn, head_gn, head_pct, layer_str, clamp_count, max_mag
+                model_gn, head_gn, head_pct, layer_str, clamp_count, max_mag,
+                agc.threshold, agc.ema_mean, agc.ema_std
             ).ok();
         } else {
             writeln!(log_writer,
