@@ -39,7 +39,7 @@
 | ODE solver | RK4-16 (CPU tier) | 16 integration steps |
 | ODE coupling | α=0.01, β=0.01 | Scaled for ≤128 bands |
 | Embeddings | Multi-grid coprime | Two incommensurate circles (Pattern 53) |
-| Per-band clamp | 2.5 max magnitude | Prevents ODE phase wrapping |
+| ODE regulation | AGC with knee compressor | Adaptive threshold, physics ceiling at 6.0 |
 
 ---
 
@@ -78,20 +78,35 @@ For single-token whole words, you need ≥4K vocab which requires ≥384-dim. Se
 
 ## Training Results
 
-### 6L, 512 BPE, 83K iterations (1.5 hour run)
+### 6L, 512 BPE, 20K iterations — AGC (current best)
+
+| Metric | Value |
+|--------|-------|
+| Best loss | **3.76** (at iter 10646) |
+| Rolling avg at 8-10K | 5.87 (descending) |
+| Rolling avg at 14-16K | 5.91 (stable) |
+| Rolling avg at 18-20K | 5.90 (stable) |
+| V-shape | **None** |
+| Divergence | **None through 20K** |
+| NaN skips | 0 |
+| AGC threshold | Adapted 3.25 → 6.0, held at ceiling |
+| Maestro max magnitude | 7.95 (knee compressor manages outliers) |
+| Speed | 83ms/iter average |
+
+### Previous results (hard clamp 2.5 — superseded)
 
 | Metric | Value |
 |--------|-------|
 | Best loss | 3.95 (at iter 6641) |
 | Best rolling avg | ~5.85 (iter 4K-7K window) |
-| Divergence onset | iter ~25K (loss > 10) |
-| NaN skips | 0 (stable throughout, even during divergence) |
-| Total time | ~95 minutes |
-| Speed | 75ms/iter average |
+| Divergence onset | iter ~10K (rolling avg rising) |
+| NaN skips | 0 |
 
-**Training window:** The model learns effectively for ~5K-10K iterations (0.5-1 corpus pass). After iter 10K, the rolling average drifts upward. By iter 25K it diverges to loss > 10. This is a capacity limitation — 100K model params memorise a subset of patterns in the first pass, then overfit and forget on subsequent passes.
+**Note:** The previous 3.95 best loss and 10K training window were **clamp artifacts**. The hard clamp at 2.5 throttled the maestro, causing V-shape divergence. With AGC, best loss improved to 3.76 and training is stable through 20K+.
 
-**Recommended approach:** Use `--iters 10000` with cosine LR for 168-dim BPE. The LR decays fast enough to lock in gains from the first pass. Checkpoint at iter 7000 is typically the best model. Longer runs waste power — the model's useful training window is ~10K iters at this dimension.
+**Training window (with AGC):** The model trains stably through 20K+ iterations with no divergence. Rolling averages descend monotonically from 6.10 to 5.87 and hold at 5.90 through 20K. Previous results showing a "10K training window" and divergence at 25K were **clamp artifacts** — the hard clamp at 2.5 caused the maestro to fight the ceiling, producing gradient distortion and eventual V-shape divergence. With AGC, the maestro self-regulates within the ODE's physics limit and no divergence occurs.
+
+**Recommended approach:** Use `--iters 20000` with cosine LR for 168-dim BPE. Checkpoint around iter 10K-15K is typically the best model.
 
 ### Wave Structure Diagnostics (at iter 3500)
 
@@ -128,9 +143,9 @@ The 168-dim model has 84 harmonic bands, ~100K model params, and trains at 57-80
 
 ## Known Limitations
 
-1. **Training window limited to ~10K iterations** — the model learns effectively for one corpus pass (~5K-10K iters). Beyond that, the rolling average rises and the model diverges by iter 25K. This is not instability (zero NaN throughout) but a capacity limitation: 100K model params memorise patterns from the first pass and overfit on subsequent passes.
+1. ~~**Training window limited to ~10K iterations**~~ — **CORRECTED:** With AGC, training is stable through 20K+ iterations. The previous "10K limit" was a clamp artifact. The model still has capacity limitations (100K params) but no longer diverges.
 
-2. **High loss variance** — the model learns ~20% of BPE patterns well but guesses on the rest. Easy batches → loss 4.0. Hard batches → loss 7.0+. Best single-batch loss reaches 3.95 but rolling average stays around 5.8-6.0. This is a capacity limitation, not instability.
+2. **High loss variance** — the model learns ~20% of BPE patterns well but guesses on the rest. Easy batches → loss 4.0. Hard batches → loss 7.0+. Best single-batch loss reaches 3.76 but rolling average stays around 5.9. This is a capacity limitation, not instability.
 
 3. **Semantic discrimination untestable** — at 512 BPE, words like "cat" and "dog" are split into sub-tokens. The `--analyze` tool can't find semantic pairs. Use char-level for semantic pair analysis.
 
@@ -145,8 +160,8 @@ These findings were discovered during 168-dim development and apply to all dimen
 ### 1. Multi-Grid Harmonic Embeddings (Pattern 53)
 Single-circle harmonic embeddings degenerate at high vocab/bands ratio. Two coprime modular circles provide 101x-11,800x improvement in token separation. Required for any BPE training below 768-dim.
 
-### 2. Per-Band ODE Input Clamping
-The maestro pre-conditioner can push individual bands past the ODE's stability threshold (δφ > 90° per step). Clamping per-band input magnitude to 2.5 before the ODE prevents phase wrapping without limiting the maestro's directional learning.
+### 2. ODE Magnitude Regulation (AGC)
+The maestro pre-conditioner pushes band magnitudes higher as training progresses. A fixed clamp (2.5 or 5.0) creates a ceiling the maestro fights, causing V-shape divergence. The fix is Automatic Gain Control (AGC) with a knee compressor: adaptive threshold tracks the maestro's operating range via EMA, physics ceiling at 6.0 prevents exceeding ODE stability. See `investigations/ode-regulation/INVESTIGATION.md` in the research repo.
 
 ### 3. ODE Coupling Scales with Band Count
 α=β=0.1 (calibrated for 64 bands at char-level) causes NaN at 84 bands with BPE. α=β=0.01 is stable. The coupling must be weaker at lower band counts to prevent chaotic phase accumulation.

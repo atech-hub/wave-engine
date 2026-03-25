@@ -47,15 +47,16 @@ pub mod engine {
         let n_embd = n_bands * 2;
 
         // Per-band magnitude clamp — must match CPU tier (src/common/ffn.rs)
-        // Soft clamp (tanh compression) — must match CPU tier (common/ffn.rs)
-        let threshold = 5.0f32;
+        // Knee compressor at ODE stability ceiling — matches AGC ceiling from CPU tier
+        let threshold = 6.0f32;
         let mut clamped = x.to_vec();
         for k in 0..n_bands {
             let r = clamped[k * 2];
             let s = clamped[k * 2 + 1];
             let mag = (r * r + s * s).sqrt();
-            if mag > 0.001 {
-                let compressed = threshold * (mag / threshold).tanh();
+            if mag > threshold && mag > 0.001 {
+                let excess = mag - threshold;
+                let compressed = threshold + threshold * (excess / threshold).tanh();
                 let scale = compressed / mag;
                 clamped[k * 2] *= scale;
                 clamped[k * 2 + 1] *= scale;
@@ -504,6 +505,16 @@ pub mod engine {
                 let mae_in = mae_in.gelu()?;
                 let mae_in = block.mae_in_pr.forward(&mae_in)?;
                 let precond = (&ffn_input + &mae_in)?;
+
+                // AGC knee compression — CPU round-trip (~0.1ms, negligible vs ODE)
+                let precond = {
+                    let mut pv: Vec<Vec<f32>> = precond.to_vec2()?;
+                    let nb = pv[0].len() / 2;
+                    let mut agc = crate::ffn_backend::AGC.lock().unwrap();
+                    agc.process(&mut pv, nb);
+                    drop(agc);
+                    candle_core::Tensor::new(pv, precond.device())?
+                };
 
                 if self.debug_nan {
                     let precond_vals = precond.to_vec2::<f32>()?;
