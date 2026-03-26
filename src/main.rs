@@ -28,6 +28,7 @@ pub use common::attn as wave_attn;
 pub use common::block as wave_block;
 #[allow(unused_imports)]
 pub use common::ffn as ffn_backend;
+pub use common::wave_model::{WavePacketModel, init_model, init_linear, count_trainable, flatten_params, unflatten_params};
 #[allow(unused_imports)]
 pub use common::checkpoint as wave_checkpoint;
 #[allow(unused_imports)]
@@ -120,98 +121,9 @@ impl Dims {
     }
 }
 
-// ─── Model ──────────────────────────────────────────────────────
+// ─── Model (struct + init + flatten in common/wave_model.rs) ─────
 
-struct WavePacketModel {
-    wte: Vec<Vec<f32>>,
-    wpe: Vec<Vec<f32>>,
-    blocks: Vec<WaveBlockWeights>,
-    ln_f: LayerNormWeights,
-    lm_head: Vec<Vec<f32>>,
-    vocab_size: usize,
-}
-
-fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
-    let limit = 1.0 / (in_dim as f32).sqrt();
-    let w: Vec<Vec<f32>> = (0..out_dim)
-        .map(|_| (0..in_dim).map(|_| rng.uniform(limit)).collect())
-        .collect();
-    let b = vec![0.0f32; out_dim];
-    (w, b)
-}
-
-fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: usize, d: Dims, alpha: f32, beta: f32) -> WavePacketModel {
-    let mut rng = Rng::new(seed);
-
-    let wte = build_harmonic_table(vocab_size, d.n_bands);
-    let wpe = build_positional_table(d.block_size, d.n_bands);
-
-    let mut blocks = Vec::new();
-    for _ in 0..n_layers {
-        let ln = LayerNormWeights { weight: vec![1.0f32; d.n_embd], bias: vec![0.0f32; d.n_embd] };
-
-        let head_dim = d.n_embd / d.n_head;
-        let heads: Vec<WaveAttnHeadWeights> = (0..d.n_head).map(|h| {
-            let (phase_w, phase_b) = init_linear(&mut rng, 2, d.n_embd);
-            let (v_w, v_b) = init_linear(&mut rng, head_dim, head_dim);
-            WaveAttnHeadWeights {
-                harmonic_raw: ((h + 1) as f32 * 0.5f32).ln(),
-                phase_proj_w: phase_w,
-                phase_proj_b: phase_b,
-                v_proj_w: v_w,
-                v_proj_b: v_b,
-            }
-        }).collect();
-        let (out_w, out_b) = init_linear(&mut rng, d.n_embd, d.n_embd);
-        let attn = WaveAttnWeights { heads, out_proj_w: out_w, out_proj_b: out_b };
-
-        let gamma_raw_val = ((0.1f32).exp() - 1.0).ln();
-        let kerr = KerrWeights {
-            gamma_raw: vec![gamma_raw_val; d.n_bands],
-            omega: (0..d.n_bands).map(|k| (k + 1) as f32 / d.n_bands as f32).collect(),
-            alpha,
-            beta,
-            rk4_n_steps: d.rk4_steps,
-        };
-        let (sq_w, sq_b) = init_linear(&mut rng, d.maestro_dim, d.n_embd);
-        let (pr_w, pr_b) = init_linear(&mut rng, d.n_embd, d.maestro_dim);
-        let maestro_in = MaestroWeights {
-            squeeze: LinearWeights { w: sq_w, b: sq_b },
-            process_1: LinearWeights { w: pr_w, b: pr_b },
-        };
-        let (sq_w2, sq_b2) = init_linear(&mut rng, d.maestro_dim, d.n_embd);
-        let (pr_w2, pr_b2) = init_linear(&mut rng, d.n_embd, d.maestro_dim);
-        let maestro_out = MaestroWeights {
-            squeeze: LinearWeights { w: sq_w2, b: sq_b2 },
-            process_1: LinearWeights { w: pr_w2, b: pr_b2 },
-        };
-        let out_proj = if out_proj_groups <= 1 {
-            let (op_w, op_b) = init_linear(&mut rng, d.n_embd, d.n_embd);
-            OutProjWeights::dense(op_w, op_b)
-        } else {
-            let group_size = d.n_embd / out_proj_groups;
-            let groups: Vec<LinearWeights> = (0..out_proj_groups).map(|_| {
-                let (w, b) = init_linear(&mut rng, group_size, group_size);
-                LinearWeights { w, b }
-            }).collect();
-            OutProjWeights::BlockDiagonal(BlockDiagonalWeights {
-                groups, n_groups: out_proj_groups, group_size,
-            })
-        };
-        let ffn = KerrDualMaestroWeights { kerr, maestro_in, maestro_out, out_proj };
-
-        let ln_ffn = LayerNormWeights { weight: vec![1.0f32; d.n_embd], bias: vec![0.0f32; d.n_embd] };
-        blocks.push(WaveBlockWeights { ln, ln_ffn, attn, ffn });
-    }
-
-    let ln_f = LayerNormWeights { weight: vec![1.0f32; d.n_embd], bias: vec![0.0f32; d.n_embd] };
-    let limit = 1.0 / (d.n_embd as f32).sqrt();
-    let lm_head: Vec<Vec<f32>> = (0..vocab_size)
-        .map(|_| (0..d.n_embd).map(|_| rng.uniform(limit)).collect())
-        .collect();
-
-    WavePacketModel { wte, wpe, blocks, ln_f, lm_head, vocab_size }
-}
+// init_model, init_linear → common/wave_model.rs
 
 // ─── Forward with cache ─────────────────────────────────────────
 
@@ -753,49 +665,7 @@ fn rk4_step_standalone(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f3
     (rn, sn)
 }
 
-// ─── Flatten / Unflatten (trainable params only) ────────────────
-
-fn count_trainable(model: &WavePacketModel) -> usize {
-    // Derive dimensions from model structure — no constants needed
-    let n_embd = model.ln_f.weight.len();
-    let maestro_dim = model.blocks[0].ffn.maestro_in.squeeze.w.len();
-    let mut n = 0;
-    for block in &model.blocks {
-        n += n_embd * 2; // LN
-        n += n_embd * 2; // LN_FFN
-        n += maestro_dim * n_embd + maestro_dim; // mae_in squeeze
-        n += n_embd * maestro_dim + n_embd;       // mae_in process
-        n += maestro_dim * n_embd + maestro_dim; // mae_out squeeze
-        n += n_embd * maestro_dim + n_embd;       // mae_out process
-        n += block.ffn.out_proj.param_count();      // out_proj (dense or block-diagonal)
-    }
-    n += n_embd * 2; // ln_f
-    n += model.vocab_size * n_embd; // lm_head
-    n
-}
-
-fn flatten_params(model: &WavePacketModel) -> Vec<f32> {
-    let mut p = Vec::new();
-    for block in &model.blocks {
-        p.extend_from_slice(&block.ln.weight);
-        p.extend_from_slice(&block.ln.bias);
-        p.extend_from_slice(&block.ln_ffn.weight);
-        p.extend_from_slice(&block.ln_ffn.bias);
-        for row in &block.ffn.maestro_in.squeeze.w { p.extend_from_slice(row); }
-        p.extend_from_slice(&block.ffn.maestro_in.squeeze.b);
-        for row in &block.ffn.maestro_in.process_1.w { p.extend_from_slice(row); }
-        p.extend_from_slice(&block.ffn.maestro_in.process_1.b);
-        for row in &block.ffn.maestro_out.squeeze.w { p.extend_from_slice(row); }
-        p.extend_from_slice(&block.ffn.maestro_out.squeeze.b);
-        for row in &block.ffn.maestro_out.process_1.w { p.extend_from_slice(row); }
-        p.extend_from_slice(&block.ffn.maestro_out.process_1.b);
-        block.ffn.out_proj.flatten_into(&mut p);
-    }
-    p.extend_from_slice(&model.ln_f.weight);
-    p.extend_from_slice(&model.ln_f.bias);
-    for row in &model.lm_head { p.extend_from_slice(row); }
-    p
-}
+// flatten_params, unflatten_params, count_trainable → common/wave_model.rs
 
 fn flatten_grads(grads: &Gradients) -> Vec<f32> {
     let mut g = Vec::new();
@@ -820,34 +690,8 @@ fn flatten_grads(grads: &Gradients) -> Vec<f32> {
     for row in &grads.lm_head { g.extend_from_slice(row); }
     g
 }
-
-fn unflatten_params(model: &mut WavePacketModel, params: &[f32]) {
-    let n_embd = model.ln_f.weight.len();
-    let maestro_dim = model.blocks[0].ffn.maestro_in.squeeze.w.len();
-    let mut idx = 0;
-    for block in &mut model.blocks {
-        block.ln.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-        block.ln.bias.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-        block.ln_ffn.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-        block.ln_ffn.bias.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-        for row in &mut block.ffn.maestro_in.squeeze.w { row.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd; }
-        block.ffn.maestro_in.squeeze.b.copy_from_slice(&params[idx..idx+maestro_dim]); idx += maestro_dim;
-        for row in &mut block.ffn.maestro_in.process_1.w { row.copy_from_slice(&params[idx..idx+maestro_dim]); idx += maestro_dim; }
-        block.ffn.maestro_in.process_1.b.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-        for row in &mut block.ffn.maestro_out.squeeze.w { row.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd; }
-        block.ffn.maestro_out.squeeze.b.copy_from_slice(&params[idx..idx+maestro_dim]); idx += maestro_dim;
-        for row in &mut block.ffn.maestro_out.process_1.w { row.copy_from_slice(&params[idx..idx+maestro_dim]); idx += maestro_dim; }
-        block.ffn.maestro_out.process_1.b.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-        block.ffn.out_proj.unflatten_from(params, &mut idx);
-    }
-    model.ln_f.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-    model.ln_f.bias.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-    for row in &mut model.lm_head { row.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd; }
-    assert_eq!(idx, params.len());
-}
-
-// Adam, CurriculumSchedule, clip_grad_norm moved to train.rs
-// Checkpoint save/load moved to wave_checkpoint.rs
+// Adam, CurriculumSchedule, clip_grad_norm → train.rs
+// Checkpoint save/load → wave_checkpoint.rs
 
 // ─── Main ───────────────────────────────────────────────────────
 

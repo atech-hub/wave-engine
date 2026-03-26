@@ -13,3 +13,4 @@ pub mod fft_ode;
 pub mod wave_analysis;
 pub mod help;
 pub mod agc;
+pub mod wave_model;
