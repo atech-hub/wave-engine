@@ -29,6 +29,14 @@ pub fn print_help() {
     println!("      768-dim:   --n-bands 384  --n-head 12  (default)");
     println!("      4096-dim:  --n-bands 2048 --n-head 32  --out-proj-groups 32");
     println!();
+    println!("    ODE coupling (linked to AGC ceiling — stronger coupling = tighter ceiling):");
+    println!("    --alpha F         ODE self-phase coupling                [default: 0.1]");
+    println!("    --beta F          ODE cross-phase coupling               [default: same as alpha]");
+    println!("    --agc-ceiling F   AGC max threshold (auto-derived if omitted)");
+    println!("      α=0.1:  ceiling = 1.77 (strong coupling, tight AGC — char-level)");
+    println!("      α=0.05: ceiling = 2.51 (medium coupling — BPE)");
+    println!("      α=0.01: ceiling = 5.60 (weak coupling — large models)");
+    println!();
     println!("    Recommended BPE vocab per dimension:");
     println!("      168-dim:  512 vocab  (data/tokenizer_512.json)");
     println!("      384-dim:  2K-4K vocab");

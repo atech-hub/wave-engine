@@ -39,20 +39,31 @@ pub struct OdeAgc {
 }
 
 impl OdeAgc {
-    /// Create new AGC with defaults.
-    /// Initial threshold = 5.0 (matches the proven static value from Test C).
-    /// The AGC adapts from there based on observed magnitudes.
-    pub fn new() -> Self {
+    /// Create AGC with physics-derived ceiling from coupling constants.
+    /// ceiling = sqrt(pi/2 / (alpha + 4*beta)) — the ODE stability limit.
+    pub fn from_coupling(alpha: f32, beta: f32) -> Self {
+        let physics_ceiling = (std::f32::consts::FRAC_PI_2 / (alpha + 4.0 * beta)).sqrt();
+        Self::with_ceiling(physics_ceiling)
+    }
+
+    /// Create AGC with explicit ceiling (for --agc-ceiling override).
+    pub fn with_ceiling(ceiling: f32) -> Self {
+        let ceiling = ceiling.max(0.5); // absolute minimum
         Self {
-            ema_mean: 2.0,       // conservative initial estimate
-            ema_var: 1.0,        // initial variance
-            headroom: 3.0,       // three sigma — only outliers compressed
-            decay: 0.995,        // adapts over ~200 iterations
-            min_threshold: 2.0,  // never compress below this (collapse floor)
-            max_threshold: 6.0,  // never open above this (ODE physics ceiling)
-            threshold: 5.0,      // initial threshold before any data
+            ema_mean: 1.0,
+            ema_var: 0.5,
+            headroom: 3.0,
+            decay: 0.995,
+            min_threshold: (ceiling * 0.3).max(0.5), // floor scales with ceiling
+            max_threshold: ceiling,
+            threshold: (ceiling * 0.75).max(0.5),     // start at 75% of ceiling
             count: 0,
         }
+    }
+
+    /// Create with defaults (backward compat — uses α=0.1 coupling).
+    pub fn new() -> Self {
+        Self::from_coupling(0.1, 0.1)
     }
 
     /// Update AGC state with observed magnitudes.

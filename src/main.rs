@@ -140,7 +140,7 @@ fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, 
     (w, b)
 }
 
-fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: usize, d: Dims) -> WavePacketModel {
+fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: usize, d: Dims, alpha: f32, beta: f32) -> WavePacketModel {
     let mut rng = Rng::new(seed);
 
     let wte = build_harmonic_table(vocab_size, d.n_bands);
@@ -169,11 +169,8 @@ fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: us
         let kerr = KerrWeights {
             gamma_raw: vec![gamma_raw_val; d.n_bands],
             omega: (0..d.n_bands).map(|k| (k + 1) as f32 / d.n_bands as f32).collect(),
-            // ODE coupling: scales with band count. Proven values:
-            //   84 bands (168-dim): 0.01 (2K BPE)
-            //   384 bands (768-dim): 0.1 (50K BPE)
-            alpha: if d.n_bands <= 128 { 0.01 } else { 0.1 },
-            beta: if d.n_bands <= 128 { 0.01 } else { 0.1 },
+            alpha,
+            beta,
             rk4_n_steps: d.rk4_steps,
         };
         let (sq_w, sq_b) = init_linear(&mut rng, d.maestro_dim, d.n_embd);
@@ -1045,7 +1042,7 @@ fn main() {
         let n_bands_cli: usize = parse_flag("--n-bands", N_BANDS);
         let n_head_cli: usize = parse_flag("--n-head", N_HEAD);
         let dims = Dims::from_cli(n_bands_cli, n_head_cli, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS);
-        let mut model = init_model(effective_vocab, 42, n_layers, out_proj_groups, dims);
+        let mut model = init_model(effective_vocab, 42, n_layers, out_proj_groups, dims, 0.1, 0.1);
         unflatten_params(&mut model, &params);
         println!("  Loaded {} params from {}", params.len(), resume_path);
 
@@ -1145,6 +1142,10 @@ fn main() {
         checkpoint_name: parse_flag("--checkpoint-name", "checkpoint.bin".to_string()),
         n_bands: parse_flag("--n-bands", N_BANDS),
         n_head: parse_flag("--n-head", N_HEAD),
+        alpha: parse_flag("--alpha", 0.1),
+        beta: parse_flag("--beta", parse_flag("--alpha", 0.1)), // default beta = alpha
+        agc_ceiling: std::env::args().skip_while(|a| a != "--agc-ceiling").nth(1)
+            .and_then(|s| s.parse().ok()),
     });
 }
 

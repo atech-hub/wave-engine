@@ -151,6 +151,9 @@ pub struct TrainConfig {
     pub checkpoint_name: String,
     pub n_bands: usize,
     pub n_head: usize,
+    pub alpha: f32,
+    pub beta: f32,
+    pub agc_ceiling: Option<f32>, // None = auto-derive from alpha
 }
 
 pub fn run_training(config: TrainConfig) {
@@ -197,7 +200,7 @@ pub fn run_training(config: TrainConfig) {
         println!("Resuming from checkpoint: {ckpt}");
         let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v, _ck_groups) = wave_checkpoint::load_checkpoint(ckpt);
         assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
-        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS));
+        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS), config.alpha, config.beta);
         unflatten_params(&mut m, &params);
         model = m;
         start_iter = ck_iter;
@@ -206,7 +209,7 @@ pub fn run_training(config: TrainConfig) {
         println!("  Resuming from iter {start_iter}");
     } else {
         println!("Initializing model (seed=42)...");
-        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS));
+        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS), config.alpha, config.beta);
         start_iter = 0;
         let n_t = count_trainable(&model);
         optimizer = Adam::new(config.lr, n_t);
@@ -265,6 +268,16 @@ pub fn run_training(config: TrainConfig) {
         } else {
             println!("  [preflight] ODE stability: {:.0}° at M=2.0, alpha={:.4} beta={:.4} — OK", degrees, alpha, beta);
         }
+    }
+
+    // Initialize AGC with coupling-derived ceiling (or manual override)
+    if let Some(ceiling) = config.agc_ceiling {
+        crate::ffn_backend::init_agc_ceiling(ceiling);
+        println!("  [preflight] AGC ceiling: {:.2} (manual override)", ceiling);
+    } else {
+        crate::ffn_backend::init_agc(config.alpha, config.beta);
+        let derived = (std::f32::consts::FRAC_PI_2 / (config.alpha + 4.0 * config.beta)).sqrt();
+        println!("  [preflight] AGC ceiling: {:.2} (derived from α={:.2})", derived, config.alpha);
     }
 
     // GPU

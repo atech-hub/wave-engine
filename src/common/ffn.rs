@@ -11,13 +11,25 @@ use crate::wave_block::{KerrDualMaestroWeights, gelu};
 pub static ODE_CLAMP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static ODE_MAX_MAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Global AGC — shared across all FFN calls within an iteration.
-static AGC: std::sync::LazyLock<std::sync::Mutex<crate::common::agc::OdeAgc>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::common::agc::OdeAgc::new()));
+/// Global AGC — initialized at startup with coupling-derived ceiling.
+/// Call init_agc() before training. Falls back to α=0.1 defaults if not initialized.
+pub static AGC: std::sync::OnceLock<std::sync::Mutex<crate::common::agc::OdeAgc>> = std::sync::OnceLock::new();
+
+/// Initialize the global AGC with coupling constants.
+/// Must be called before training starts. Safe to call multiple times (only first wins).
+pub fn init_agc(alpha: f32, beta: f32) {
+    AGC.get_or_init(|| std::sync::Mutex::new(crate::common::agc::OdeAgc::from_coupling(alpha, beta)));
+}
+
+/// Initialize with explicit ceiling override.
+pub fn init_agc_ceiling(ceiling: f32) {
+    AGC.get_or_init(|| std::sync::Mutex::new(crate::common::agc::OdeAgc::with_ceiling(ceiling)));
+}
 
 /// Get current AGC stats for JSONL logging.
 pub fn agc_stats() -> crate::common::agc::AgcStats {
-    AGC.lock().unwrap().stats()
+    AGC.get_or_init(|| std::sync::Mutex::new(crate::common::agc::OdeAgc::new()))
+        .lock().unwrap().stats()
 }
 
 /// FFN forward through backend. Hybrid routing: big ops on `backend` (GPU when available),
@@ -53,7 +65,8 @@ pub fn ffn_forward_via_backend(
     // Threshold = EMA_mean + 3σ (adapts over ~200 iters).
     let n_bands = n_embd / 2;
     let (clamp_count, max_pre_clamp_mag) = {
-        let mut agc = AGC.lock().unwrap();
+        let mut agc = AGC.get_or_init(|| std::sync::Mutex::new(crate::common::agc::OdeAgc::new()))
+            .lock().unwrap();
         agc.process(&mut precond, n_bands)
     };
     ODE_CLAMP_COUNT.store(clamp_count, std::sync::atomic::Ordering::Relaxed);
@@ -80,6 +93,9 @@ pub fn ffn_forward_via_backend(
         (cpu.kerr_ode_batch(&weights.kerr, &precond), "CPU-seq")
     };
     let _ode_dur = _t_ode.elapsed();
+
+    // No energy conservation — AGC handles magnitude regulation.
+    // Coupling at α=0.1 with AGC ceiling=2.0 matches kerr-engine recipe.
 
     // 4. Maestro_out: CPU (same reason as maestro_in)
     let _t_mae_out = std::time::Instant::now();
