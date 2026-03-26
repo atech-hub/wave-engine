@@ -890,8 +890,10 @@ fn main() {
         let out_proj_groups: usize = pflag("--out-proj-groups", 6);
 
         let debug_nan = std::env::args().any(|a| a == "--debug-nan");
+        let alpha: f32 = pflag("--alpha", 0.1);
+        let beta: f32 = pflag("--beta", alpha);
         match candle_engine::engine::train_candle(
-            &data_path, n_iters, n_bands, n_head, n_layers, maestro_dim, rk4_steps, out_proj_groups, debug_nan,
+            &data_path, n_iters, n_bands, n_head, n_layers, maestro_dim, rk4_steps, out_proj_groups, debug_nan, alpha, beta,
         ) {
             Ok(()) => return,
             Err(e) => { eprintln!("Candle error: {e:?}"); std::process::exit(1); }
@@ -1042,7 +1044,9 @@ fn main() {
         let n_bands_cli: usize = parse_flag("--n-bands", N_BANDS);
         let n_head_cli: usize = parse_flag("--n-head", N_HEAD);
         let dims = Dims::from_cli(n_bands_cli, n_head_cli, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS);
-        let mut model = init_model(effective_vocab, 42, n_layers, out_proj_groups, dims, 0.1, 0.1);
+        let alpha_cli: f32 = parse_flag("--alpha", 0.1);
+        let beta_cli: f32 = parse_flag("--beta", alpha_cli);
+        let mut model = init_model(effective_vocab, 42, n_layers, out_proj_groups, dims, alpha_cli, beta_cli);
         unflatten_params(&mut model, &params);
         println!("  Loaded {} params from {}", params.len(), resume_path);
 

@@ -47,8 +47,8 @@ pub mod engine {
         let n_embd = n_bands * 2;
 
         // Per-band magnitude clamp — must match CPU tier (src/common/ffn.rs)
-        // Knee compressor at ODE stability ceiling — matches AGC ceiling from CPU tier
-        let threshold = 6.0f32;
+        // Knee compressor — derive ceiling from coupling (matches CPU tier AGC physics)
+        let threshold = (std::f32::consts::FRAC_PI_2 / (params.alpha + 4.0 * params.beta)).sqrt();
         let mut clamped = x.to_vec();
         for k in 0..n_bands {
             let r = clamped[k * 2];
@@ -398,9 +398,9 @@ pub mod engine {
                 let ode_params = OdeParams {
                     gamma_raw: vec![gamma_raw_val; n_bands],
                     omega: (0..n_bands).map(|k| (k + 1) as f32 / n_bands as f32).collect(),
-                    // Scale coupling with band count — must match CPU tier (main.rs)
-                    alpha: if n_bands <= 128 { 0.01 } else { 0.1 },
-                    beta: if n_bands <= 128 { 0.01 } else { 0.1 },
+                    // Coupling from CLI --alpha/--beta flags
+                    alpha,
+                    beta,
                     rk4_n_steps: rk4_steps,
                 };
                 let gpu_ode_params = crate::gpu_ode::gpu_ode::GpuOdeParams::new(
@@ -574,7 +574,7 @@ pub mod engine {
         data_path: &str, n_iters: usize,
         n_bands: usize, n_head: usize, n_layers: usize,
         maestro_dim: usize, _rk4_steps: usize, out_proj_groups: usize,
-        debug_nan: bool,
+        debug_nan: bool, alpha: f32, beta: f32,
     ) -> Result<()> {
         // Runtime config — lowercase variables used throughout
         let n_embd = n_bands * 2;
@@ -716,6 +716,11 @@ pub mod engine {
                 println!("  [preflight] ODE stability: {:.0}° at M=2.0, alpha={:.4} — OK", degrees, alpha);
             }
         }
+
+        // Initialize AGC with coupling-derived ceiling (matches CPU tier)
+        crate::ffn_backend::init_agc(alpha, beta);
+        let derived_ceiling = (std::f32::consts::FRAC_PI_2 / (alpha + 4.0 * beta)).sqrt();
+        println!("  [preflight] AGC ceiling: {:.2} (derived from α={:.2})", derived_ceiling, alpha);
 
         let total_iters = start_iter + n_iters;
         println!("\nTraining for {n_iters} iters (batch={batch_size}, seq={seq_len}, lr={lr})");
@@ -924,7 +929,7 @@ pub mod engine {
 // Stub when candle feature is not enabled
 #[cfg(not(feature = "candle-backend"))]
 pub mod engine {
-    pub fn train_candle(_data_path: &str, _n_iters: usize, _n_bands: usize, _n_head: usize, _n_layers: usize, _maestro_dim: usize, _rk4_steps: usize, _out_proj_groups: usize, _debug_nan: bool) -> std::result::Result<(), String> {
+    pub fn train_candle(_data_path: &str, _n_iters: usize, _n_bands: usize, _n_head: usize, _n_layers: usize, _maestro_dim: usize, _rk4_steps: usize, _out_proj_groups: usize, _debug_nan: bool, _alpha: f32, _beta: f32) -> std::result::Result<(), String> {
         Err("Candle backend not enabled. Build with: cargo run --release --features candle-backend".to_string())
     }
 }

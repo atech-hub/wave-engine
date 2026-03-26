@@ -523,22 +523,13 @@ impl ComputeBackend for GpuBackend {
             for i in 0..n_embd { p[i] = x[pos][i] + mae_in_out[pos][i]; }
             p
         }).collect();
-        // Soft clamp (tanh compression) — must match CPU tier (common/ffn.rs)
+        // AGC knee compression — uses the global AGC from CPU tier (same OnceLock)
         let n_bands = n_embd / 2;
-        let threshold = 5.0f32;
-        for pv in precond.iter_mut() {
-            for k in 0..n_bands {
-                let r = pv[k * 2];
-                let s = pv[k * 2 + 1];
-                let mag = (r * r + s * s).sqrt();
-                if mag > 0.001 {
-                    let compressed = threshold * (mag / threshold).tanh();
-                    let scale = compressed / mag;
-                    pv[k * 2] *= scale;
-                    pv[k * 2 + 1] *= scale;
-                }
-            }
-        }
+        let (_clamp_count, _max_mag) = {
+            let agc_lock = crate::ffn_backend::AGC
+                .get_or_init(|| std::sync::Mutex::new(crate::common::agc::OdeAgc::new()));
+            agc_lock.lock().unwrap().process(&mut precond, n_bands)
+        };
         let kerr_outs = self.kerr_ode_batch(&weights.kerr, &precond);
         if kerr_outs.iter().any(|h| h.iter().any(|v| v.is_nan())) {
             eprintln!("    [NaN source: dual-maestro Kerr-ODE output]");
