@@ -60,9 +60,12 @@ impl OdeAgc {
     pub fn observe(&mut self, magnitudes: &[f32]) {
         if magnitudes.is_empty() { return; }
 
-        // Guard against NaN — a single NaN poisons the EMA permanently.
-        // Filter to finite values only. If entire batch is NaN, skip the update.
-        let clean: Vec<f32> = magnitudes.iter().filter(|m| m.is_finite()).copied().collect();
+        // Guard against NaN and runaway values — either poisons the EMA permanently.
+        // Filter: must be finite AND below 2× physics ceiling (if mag > 12, model is broken).
+        let ceiling_2x = self.max_threshold * 2.0;
+        let clean: Vec<f32> = magnitudes.iter()
+            .filter(|m| m.is_finite() && **m < ceiling_2x)
+            .copied().collect();
         if clean.is_empty() { return; }
 
         let n = clean.len() as f32;
