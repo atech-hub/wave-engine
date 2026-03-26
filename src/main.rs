@@ -1046,6 +1046,18 @@ fn main() {
         unflatten_params(&mut model, &params);
         println!("  Loaded {} params from {}", params.len(), resume_path);
 
+        // Truncate to block_size if needed (char-level can exceed positional table)
+        let max_tokens = dims.block_size.min(token_ids.len());
+        let token_ids = token_ids[..max_tokens].to_vec();
+        let token_strings: Vec<String> = token_strings[..max_tokens].to_vec();
+        // Filter all pairs that reference positions beyond truncation
+        related_span_pairs.retain(|(a, b)| a.iter().all(|&i| i < max_tokens) && b.iter().all(|&i| i < max_tokens));
+        random_span_pairs.retain(|(a, b)| a.iter().all(|&i| i < max_tokens) && b.iter().all(|&i| i < max_tokens));
+        related_labels.truncate(related_span_pairs.len());
+        // Rebuild single-position pairs from filtered spans
+        related_pairs = related_span_pairs.iter().map(|(a, b)| (a[0], b[0])).collect();
+        random_pairs = random_span_pairs.iter().map(|(a, b)| (a[0], b[0])).collect();
+
         // Forward pass
         let stencil = fft_ode::StencilFft::new(dims.n_bands);
         let cache = forward_with_cache(&model, &token_ids, dims, None, None, None, Some(&stencil), None);
