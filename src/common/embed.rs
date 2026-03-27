@@ -36,9 +36,21 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
 /// Grid 2 (half bands): token_id mod m2 → phase on m2-circle
 /// where m1, m2 are coprime and m1 × m2 ≥ vocab_size.
 pub fn build_harmonic_table(vocab_size: usize, n_bands: usize) -> Vec<Vec<f32>> {
+    build_harmonic_table_with_moduli(vocab_size, n_bands, None, None)
+}
+
+pub fn build_harmonic_table_with_moduli(vocab_size: usize, n_bands: usize, m1_override: Option<usize>, m2_override: Option<usize>) -> Vec<Vec<f32>> {
     let n_embd = n_bands * 2;
     let half = n_bands / 2;
-    let (m1, m2) = find_coprime_moduli(vocab_size);
+    let (m1, m2) = match (m1_override, m2_override) {
+        (Some(a), Some(b)) => {
+            assert!(gcd(a, b) == 1, "m1={a} and m2={b} must be coprime (gcd=1)");
+            eprintln!("  [embed] Multi-grid (manual): m1={a}, m2={b}, lcm_coverage={}, vocab={vocab_size}", a * b);
+            (a, b)
+        }
+        (None, None) => find_coprime_moduli(vocab_size),
+        _ => panic!("--m1 and --m2 must both be provided or both omitted"),
+    };
 
     // Log the grid configuration
     eprintln!("  [embed] Multi-grid: m1={}, m2={}, lcm_coverage={}, vocab={}", m1, m2, m1 * m2, vocab_size);

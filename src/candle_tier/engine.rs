@@ -324,7 +324,7 @@ pub mod engine {
     impl CandleWaveModel {
         pub fn new(varmap: &VarMap, vocab_size: usize, device: &Device,
                    n_bands: usize, n_head: usize, n_layers: usize, maestro_dim: usize,
-                   rk4_steps: usize, out_proj_groups: usize) -> Result<Self> {
+                   rk4_steps: usize, out_proj_groups: usize, alpha: f32, beta: f32) -> Result<Self> {
             let n_embd = n_bands * 2;
             let block_size = 256; // positional table size
             // Save config for methods
@@ -510,7 +510,7 @@ pub mod engine {
                 let precond = {
                     let mut pv: Vec<Vec<f32>> = precond.to_vec2()?;
                     let nb = pv[0].len() / 2;
-                    let mut agc = crate::ffn_backend::AGC.lock().unwrap();
+                    let mut agc = crate::ffn_backend::AGC.get().unwrap().lock().unwrap();
                     agc.process(&mut pv, nb);
                     drop(agc);
                     candle_core::Tensor::new(pv, precond.device())?
@@ -592,7 +592,8 @@ pub mod engine {
         let tokenizer_path = std::env::args().skip_while(|a| a != "--tokenizer").nth(1)
             .unwrap_or("data/tokenizer.json".to_string());
 
-        let (tokens, vocab_size) = if let Some((cached_toks, cached_vs)) = crate::token_cache::load_cache(data_path, use_bpe) {
+        let tok_path_opt = if use_bpe { Some(tokenizer_path.as_str()) } else { None };
+        let (tokens, vocab_size) = if let Some((cached_toks, cached_vs)) = crate::token_cache::load_cache(data_path, use_bpe, tok_path_opt) {
             (cached_toks, cached_vs)
         } else {
             let raw = std::fs::read_to_string(data_path)
@@ -615,7 +616,7 @@ pub mod engine {
                 println!("  Char-level tokens: {}, vocab: {}", t.len(), v);
                 (t, v)
             };
-            crate::token_cache::save_cache(data_path, use_bpe, &toks, vs);
+            crate::token_cache::save_cache(data_path, use_bpe, tok_path_opt, &toks, vs);
             (toks, vs)
         };
         let split = (tokens.len() as f32 * 0.9) as usize;
@@ -625,7 +626,7 @@ pub mod engine {
         // Model
         let mut varmap = VarMap::new();
         let mut model = CandleWaveModel::new(&varmap, vocab_size, &device,
-            n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups)?;
+            n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups, alpha, beta)?;
         model.debug_nan = debug_nan;
         if debug_nan { println!("  [debug-nan] Per-layer NaN detection ENABLED (~6x slower)"); }
         let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();

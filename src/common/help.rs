@@ -23,6 +23,9 @@ pub fn print_help() {
     println!("    --maestro-dim N   Maestro bottleneck width                [default: 16]");
     println!("    --rk4-steps N     ODE integration steps (CPU/wgpu only)   [default: 16]");
     println!("    --out-proj-groups N  Block-diagonal groups (1=dense)      [default: 6]");
+    println!("    --m1 N              Multi-grid modulus 1 (must pair with --m2, coprime)");
+    println!("    --m2 N              Multi-grid modulus 2 (must pair with --m1, coprime)");
+    println!("    --tied-embeddings   Use harmonic wte as output decoder (zero lm_head params)");
     println!();
     println!("    Common presets:");
     println!("      168-dim:   --n-bands 84   --n-head 4   (fast diagnostic model)");
@@ -48,6 +51,7 @@ pub fn print_help() {
     println!("                      Candle:   .safetensors file (restores weights only)");
     println!("    --no-curriculum   Disable progressive band curriculum (all bands from start)");
     println!("    --checkpoint-name Save checkpoint to this filename          [default: checkpoint.bin]");
+    println!("    --log-name FILE   Custom training log filename (auto-derived from checkpoint name)");
     println!();
     println!("TOKENIZER:");
     println!("    --bpe             Use BPE tokenizer (GPT-2 style)");

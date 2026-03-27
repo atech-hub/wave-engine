@@ -10,3 +10,4 @@ pub mod resident;
 pub mod validate;
 pub mod ffn_gpu;
 pub mod ffn_full_gpu;
+pub mod diagnostics;

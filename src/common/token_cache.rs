@@ -6,12 +6,22 @@
 
 use std::io::{Read, Write};
 
-/// Cache file format: "WTOK" + vocab_size(u64) + n_tokens(u64) + token_ids([u32])
+/// Cache file format: "WTOK" + vocab_size(u64) + n_tokens(u64) + file_size(u64) + token_ids([u32])
 const MAGIC: &[u8; 4] = b"WTOK";
 
+/// FNV-1a 32-bit hash — zero dependencies
+fn fnv1a_hash(s: &str) -> u32 {
+    let mut h: u32 = 2166136261;
+    for b in s.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
 /// Try to load cached tokens. Returns None if cache doesn't exist or is stale.
-pub fn load_cache(data_path: &str, use_bpe: bool) -> Option<(Vec<usize>, usize)> {
-    let cache_path = cache_path_for(data_path, use_bpe);
+pub fn load_cache(data_path: &str, use_bpe: bool, tokenizer_path: Option<&str>) -> Option<(Vec<usize>, usize)> {
+    let cache_path = cache_path_for(data_path, use_bpe, tokenizer_path);
     let mut f = std::fs::File::open(&cache_path).ok()?;
 
     let mut magic = [0u8; 4];
@@ -43,8 +53,8 @@ pub fn load_cache(data_path: &str, use_bpe: bool) -> Option<(Vec<usize>, usize)>
 }
 
 /// Save tokens to cache file.
-pub fn save_cache(data_path: &str, use_bpe: bool, tokens: &[usize], vocab_size: usize) {
-    let cache_path = cache_path_for(data_path, use_bpe);
+pub fn save_cache(data_path: &str, use_bpe: bool, tokenizer_path: Option<&str>, tokens: &[usize], vocab_size: usize) {
+    let cache_path = cache_path_for(data_path, use_bpe, tokenizer_path);
     let file_size = std::fs::metadata(data_path).map(|m| m.len()).unwrap_or(0);
 
     let mut f = match std::fs::File::create(&cache_path) {
@@ -65,8 +75,14 @@ pub fn save_cache(data_path: &str, use_bpe: bool, tokens: &[usize], vocab_size: 
     println!("  Token cache saved: {:.1}MB → {}", mb, cache_path);
 }
 
-/// Generate cache file path: data_path + ".bpe.tokens" or ".char.tokens"
-fn cache_path_for(data_path: &str, use_bpe: bool) -> String {
-    let suffix = if use_bpe { ".bpe.tokens" } else { ".char.tokens" };
-    format!("{}{}", data_path, suffix)
+/// Generate cache file path. BPE caches include a hash of the tokenizer path
+/// so switching tokenizers auto-invalidates.
+fn cache_path_for(data_path: &str, use_bpe: bool, tokenizer_path: Option<&str>) -> String {
+    if use_bpe {
+        let tok_path = tokenizer_path.unwrap_or("default");
+        let hash = fnv1a_hash(tok_path);
+        format!("{}.bpe.{:08x}.tokens", data_path, hash)
+    } else {
+        format!("{}.char.tokens", data_path)
+    }
 }

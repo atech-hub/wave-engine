@@ -4,6 +4,7 @@
 //! accumulation, optimizer step, and checkpoint saving.
 
 use crate::*;
+use crate::cpu::model_backward::backward;
 use crate::wave_checkpoint;
 use crate::rng::Rng;
 
@@ -154,6 +155,10 @@ pub struct TrainConfig {
     pub alpha: f32,
     pub beta: f32,
     pub agc_ceiling: Option<f32>, // None = auto-derive from alpha
+    pub log_name: Option<String>, // Custom log filename (default: training_log_{tier}.jsonl)
+    pub m1: Option<usize>,
+    pub m2: Option<usize>,
+    pub tied: bool,
 }
 
 pub fn run_training(config: TrainConfig) {
@@ -166,7 +171,8 @@ pub fn run_training(config: TrainConfig) {
     // Load data (with token cache — encode once, load instantly on repeat runs)
     println!("Loading dataset from {}...", config.data_path);
 
-    let (tokens, vocab_size) = if let Some((cached_toks, cached_vs)) = token_cache::load_cache(&config.data_path, config.use_bpe) {
+    let tok_path = if config.use_bpe { Some(config.tokenizer_path.as_str()) } else { None };
+    let (tokens, vocab_size) = if let Some((cached_toks, cached_vs)) = token_cache::load_cache(&config.data_path, config.use_bpe, tok_path) {
         (cached_toks, cached_vs)
     } else {
         let raw = std::fs::read_to_string(&config.data_path).expect("Failed to read data file");
@@ -187,7 +193,7 @@ pub fn run_training(config: TrainConfig) {
             println!("  Char-level tokens: {}, vocab: {}", t.len(), v);
             (t, v)
         };
-        token_cache::save_cache(&config.data_path, config.use_bpe, &toks, vs);
+        token_cache::save_cache(&config.data_path, config.use_bpe, tok_path, &toks, vs);
         (toks, vs)
     };
     let split = (tokens.len() as f32 * 0.9) as usize;
@@ -200,28 +206,35 @@ pub fn run_training(config: TrainConfig) {
         println!("Resuming from checkpoint: {ckpt}");
         let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v, _ck_groups) = wave_checkpoint::load_checkpoint(ckpt);
         assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
-        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS), config.alpha, config.beta);
+        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied), config.alpha, config.beta);
         unflatten_params(&mut m, &params);
         model = m;
         start_iter = ck_iter;
         optimizer = Adam::from_checkpoint(config.lr, adam_t, adam_m, adam_v);
         rng = Rng::from_state(ck_rng);
         println!("  Resuming from iter {start_iter}");
+        if config.m1.is_some() || config.m2.is_some() {
+            eprintln!("  WARNING: Custom moduli with --resume will change embeddings but not trained weights");
+        }
     } else {
         println!("Initializing model (seed=42)...");
-        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS), config.alpha, config.beta);
+        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied), config.alpha, config.beta);
         start_iter = 0;
-        let n_t = count_trainable(&model);
+        let n_t = count_trainable_ex(&model, config.tied);
         optimizer = Adam::new(config.lr, n_t);
         rng = Rng::new(1337);
     }
 
-    let n_trainable = count_trainable(&model);
-    println!("  Trainable parameters: {n_trainable} (attention frozen, FFN+LN+lm_head trainable)");
+    let n_trainable = count_trainable_ex(&model, config.tied);
+    if config.tied {
+        println!("  Trainable parameters: {n_trainable} (TIED — lm_head=wte, all gradient to ODE)");
+    } else {
+        println!("  Trainable parameters: {n_trainable} (attention frozen, FFN+LN+lm_head trainable)");
+    }
     println!("  Architecture: {} parallel blocks, {} harmonic heads, {} bands ({}-dim)", config.n_layers, config.n_head, config.n_bands, config.n_bands * 2);
 
     // Runtime dimensions (needed by pre-flight, forward, backward)
-    let dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS);
+    let dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied);
 
     // ─── Pre-flight diagnostics ──────────────────────────────────────
     {
@@ -310,13 +323,28 @@ pub fn run_training(config: TrainConfig) {
     let seq_len = config.seq_len;
     let lr = config.lr;
 
-    // JSONL telemetry — tier-specific filenames to prevent overwrites
-    let log_name = if config.use_gpu { "training_log_wgpu.jsonl" } else { "training_log_cpu.jsonl" };
-    let log_file = std::fs::File::create(log_name)
+    // JSONL telemetry — derive from checkpoint name or use explicit --log-name
+    let log_name = config.log_name.clone().unwrap_or_else(|| {
+        let tier = if config.use_gpu { "wgpu" } else { "cpu" };
+        // If checkpoint has a custom name, derive log name from it
+        let base = &config.checkpoint_name;
+        if base != "checkpoint.bin" {
+            let stem = base.strip_suffix(".bin").unwrap_or(base);
+            format!("training_log_{}.jsonl", stem)
+        } else {
+            format!("training_log_{}.jsonl", tier)
+        }
+    });
+    let log_file = std::fs::File::create(&log_name)
         .expect(&format!("Failed to create {log_name}"));
     println!("  Telemetry: {log_name}");
     let mut log_writer = std::io::BufWriter::new(log_file);
     let mut nan_skip_count = 0usize;
+
+    // Training summary tracking (#48)
+    let mut best_loss = f32::MAX;
+    let mut best_iter = 0usize;
+    let mut loss_history: Vec<f32> = Vec::new();
 
     println!("\nTraining for {} iterations (batch={batch_size}, seq={seq_len}, lr={lr})", config.n_iters);
     if config.resume_path.is_some() { println!("  Resuming from iter {start_iter}, target iter {total_iters}"); }
@@ -363,7 +391,7 @@ pub fn run_training(config: TrainConfig) {
                 s.spawn(move || {
                     let cache = forward_with_cache(model_ref, input, dims, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref);
                     let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref);
-                    (loss, flatten_grads(&grads))
+                    (loss, flatten_grads_ex(&grads, dims.tied))
                 })
             }).collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -396,11 +424,18 @@ pub fn run_training(config: TrainConfig) {
             continue;
         }
 
+        // Track for summary (#48)
+        loss_history.push(total_loss);
+        if total_loss < best_loss {
+            best_loss = total_loss;
+            best_iter = iter;
+        }
+
         let t_optim = monitor.start();
         clip_grad_norm(&mut total_grads, 1.0);
-        let mut params = flatten_params(&model);
+        let mut params = flatten_params_ex(&model, config.tied);
         optimizer.step(&mut params, &total_grads);
-        unflatten_params(&mut model, &params);
+        unflatten_params_ex(&mut model, &params, config.tied);
         monitor.record("optimizer", t_optim);
 
         let grad_norm: f32 = total_grads.iter().map(|g| g * g).sum::<f32>().sqrt();
@@ -466,21 +501,80 @@ pub fn run_training(config: TrainConfig) {
             }
         }
 
-        // Periodic checkpoint: save every 500 iters (all tiers)
+        // Periodic checkpoint: save every 500 iters (all tiers, always untied format)
         if (iter + 1) % 500 == 0 {
-            let params = flatten_params(&model);
+            let save_p = flatten_params(&model);
             let path = format!("checkpoint_iter{}.bin", iter + 1);
             let groups = model.blocks[0].ffn.out_proj.n_groups();
-            wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), groups, iter + 1, lr, &optimizer, rng.state(), &path, dims);
+            if config.tied {
+                let dummy_opt = Adam::new(config.lr, save_p.len());
+                wave_checkpoint::save_checkpoint(&save_p, vocab_size, model.blocks.len(), groups, iter + 1, lr, &dummy_opt, rng.state(), &path, dims);
+            } else {
+                wave_checkpoint::save_checkpoint(&save_p, vocab_size, model.blocks.len(), groups, iter + 1, lr, &optimizer, rng.state(), &path, dims);
+            }
             println!("  Checkpoint: {path}");
         }
     }
 
     println!("\nTraining complete. Total time: {:.1?}", train_start.elapsed());
 
-    // Final checkpoint
-    let params = flatten_params(&model);
+    // Training summary (#48)
+    {
+        let total_time = train_start.elapsed();
+        let ms_per_iter = if config.n_iters > 0 { total_time.as_millis() as f64 / config.n_iters as f64 } else { 0.0 };
+        let final_avg = if loss_history.len() >= 100 {
+            loss_history[loss_history.len()-100..].iter().sum::<f32>() / 100.0
+        } else if !loss_history.is_empty() {
+            loss_history.iter().sum::<f32>() / loss_history.len() as f32
+        } else { 0.0 };
+
+        println!("\n=== Training Summary ===");
+        println!("  Iters: {} → {} ({} steps)", start_iter, total_iters, config.n_iters);
+        println!("  Best loss: {:.4} @ iter {}", best_loss, best_iter);
+        println!("  Final loss (last 100 avg): {:.4}", final_avg);
+        println!("  NaN skips: {}", nan_skip_count);
+        println!("  Time: {:.1?}", total_time);
+        println!("  Speed: {:.0}ms/iter", ms_per_iter);
+
+        // Rolling averages (2000-iter windows)
+        if loss_history.len() > 2000 {
+            println!("\n  Rolling averages (2000-iter windows):");
+            let mut start_i = 0;
+            while start_i < loss_history.len() {
+                let end_i = (start_i + 2000).min(loss_history.len());
+                let avg: f32 = loss_history[start_i..end_i].iter().sum::<f32>() / (end_i - start_i) as f32;
+                println!("    {}-{}: avg {:.3}", start_iter + start_i, start_iter + end_i - 1, avg);
+                start_i = end_i;
+            }
+        }
+
+        let ceiling_str = match config.agc_ceiling {
+            Some(c) => format!("{:.2}", c),
+            None => format!("auto"),
+        };
+        println!("\n  Config: {}L, {}b, {}v, α={}, ceiling={}",
+            config.n_layers, config.n_bands, vocab_size, config.alpha, ceiling_str);
+        println!("  Checkpoint: {}", config.checkpoint_name);
+
+        // Summary line to JSONL
+        let summary = format!(
+            r#"{{"type":"summary","best_loss":{:.4},"best_iter":{},"final_avg":{:.4},"nan_skips":{},"total_iters":{},"time_secs":{},"ms_per_iter":{:.0}}}"#,
+            best_loss, best_iter, final_avg, nan_skip_count, config.n_iters, total_time.as_secs(), ms_per_iter
+        );
+        use std::io::Write;
+        writeln!(log_writer, "{}", summary).ok();
+        log_writer.flush().ok();
+    }
+
+    // Final checkpoint (always saves full untied params for compatibility)
+    let save_params = flatten_params(&model); // untied — includes lm_head
     let groups = model.blocks[0].ffn.out_proj.n_groups();
-    wave_checkpoint::save_checkpoint(&params, vocab_size, model.blocks.len(), groups, total_iters, lr, &optimizer, rng.state(), &config.checkpoint_name, dims);
+    if config.tied {
+        // Optimizer is tied-size; checkpoint needs untied-size. Save dummy optimizer.
+        let dummy_opt = Adam::new(config.lr, save_params.len());
+        wave_checkpoint::save_checkpoint(&save_params, vocab_size, model.blocks.len(), groups, total_iters, lr, &dummy_opt, rng.state(), &config.checkpoint_name, dims);
+    } else {
+        wave_checkpoint::save_checkpoint(&save_params, vocab_size, model.blocks.len(), groups, total_iters, lr, &optimizer, rng.state(), &config.checkpoint_name, dims);
+    }
     println!("Checkpoint saved to {}", config.checkpoint_name);
 }

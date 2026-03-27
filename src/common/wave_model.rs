@@ -4,7 +4,7 @@
 use crate::model::*;
 use crate::wave_attn::{WaveAttnWeights, WaveAttnHeadWeights};
 use crate::wave_block::WaveBlockWeights;
-use crate::wave_embed::{build_harmonic_table, build_positional_table};
+use crate::wave_embed::{build_harmonic_table_with_moduli, build_positional_table};
 use crate::common::rng::Rng;
 use crate::Dims;
 
@@ -15,6 +15,7 @@ pub struct WavePacketModel {
     pub ln_f: LayerNormWeights,
     pub lm_head: Vec<Vec<f32>>,
     pub vocab_size: usize,
+    pub tied_temperature: f32, // learned scale for tied embeddings (0.1 init)
 }
 
 pub fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
@@ -29,7 +30,7 @@ pub fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32
 pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: usize, d: Dims, alpha: f32, beta: f32) -> WavePacketModel {
     let mut rng = Rng::new(seed);
 
-    let wte = build_harmonic_table(vocab_size, d.n_bands);
+    let wte = build_harmonic_table_with_moduli(vocab_size, d.n_bands, d.m1, d.m2);
     let wpe = build_positional_table(d.block_size, d.n_bands);
 
     let mut blocks = Vec::new();
@@ -91,15 +92,23 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
     }
 
     let ln_f = LayerNormWeights { weight: vec![1.0f32; d.n_embd], bias: vec![0.0f32; d.n_embd] };
-    let limit = 1.0 / (d.n_embd as f32).sqrt();
-    let lm_head: Vec<Vec<f32>> = (0..vocab_size)
-        .map(|_| (0..d.n_embd).map(|_| rng.uniform(limit)).collect())
-        .collect();
+    let lm_head: Vec<Vec<f32>> = if d.tied {
+        wte.clone() // tied: lm_head IS wte (stored for checkpoint compat)
+    } else {
+        let limit = 1.0 / (d.n_embd as f32).sqrt();
+        (0..vocab_size)
+            .map(|_| (0..d.n_embd).map(|_| rng.uniform(limit)).collect())
+            .collect()
+    };
 
-    WavePacketModel { wte, wpe, blocks, ln_f, lm_head, vocab_size }
+    WavePacketModel { wte, wpe, blocks, ln_f, lm_head, vocab_size, tied_temperature: 1.0 }
 }
 
 pub fn count_trainable(model: &WavePacketModel) -> usize {
+    count_trainable_ex(model, false)
+}
+
+pub fn count_trainable_ex(model: &WavePacketModel, tied: bool) -> usize {
     let n_embd = model.ln_f.weight.len();
     let maestro_dim = model.blocks[0].ffn.maestro_in.squeeze.w.len();
     let mut n = 0;
@@ -113,11 +122,19 @@ pub fn count_trainable(model: &WavePacketModel) -> usize {
         n += block.ffn.out_proj.param_count();
     }
     n += n_embd * 2;
-    n += model.vocab_size * n_embd;
+    if !tied {
+        n += model.vocab_size * n_embd;
+    } else {
+        n += 1; // tied_temperature
+    }
     n
 }
 
 pub fn flatten_params(model: &WavePacketModel) -> Vec<f32> {
+    flatten_params_ex(model, false)
+}
+
+pub fn flatten_params_ex(model: &WavePacketModel, tied: bool) -> Vec<f32> {
     let mut p = Vec::new();
     for block in &model.blocks {
         p.extend_from_slice(&block.ln.weight);
@@ -136,11 +153,19 @@ pub fn flatten_params(model: &WavePacketModel) -> Vec<f32> {
     }
     p.extend_from_slice(&model.ln_f.weight);
     p.extend_from_slice(&model.ln_f.bias);
-    for row in &model.lm_head { p.extend_from_slice(row); }
+    if !tied {
+        for row in &model.lm_head { p.extend_from_slice(row); }
+    } else {
+        p.push(model.tied_temperature);
+    }
     p
 }
 
 pub fn unflatten_params(model: &mut WavePacketModel, params: &[f32]) {
+    unflatten_params_ex(model, params, false);
+}
+
+pub fn unflatten_params_ex(model: &mut WavePacketModel, params: &[f32], tied: bool) {
     let n_embd = model.ln_f.weight.len();
     let maestro_dim = model.blocks[0].ffn.maestro_in.squeeze.w.len();
     let mut idx = 0;
@@ -161,6 +186,11 @@ pub fn unflatten_params(model: &mut WavePacketModel, params: &[f32]) {
     }
     model.ln_f.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
     model.ln_f.bias.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-    for row in &mut model.lm_head { row.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd; }
+    if !tied {
+        for row in &mut model.lm_head { row.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd; }
+    } else {
+        model.tied_temperature = params[idx]; idx += 1;
+        // lm_head stays as wte clone — not loaded from params
+    }
     assert_eq!(idx, params.len());
 }

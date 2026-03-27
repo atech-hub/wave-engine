@@ -14,3 +14,7 @@ pub mod wave_analysis;
 pub mod help;
 pub mod agc;
 pub mod wave_model;
+pub mod dims;
+pub mod analyze;
+pub mod scale;
+pub mod sub_harmonic;

@@ -1,0 +1,33 @@
+{
+  "band_census": {
+    "bimodal": false,
+    "mean_cv": 0.44044893980026245,
+    "universal": 42,
+    "word_specific": 42
+  },
+  "checkpoint": "checkpoint_iter27500.bin",
+  "depth_curve": [
+    1.010656476020813,
+    0.9747441411018372,
+    1.0075420141220093,
+    1.011664867401123,
+    1.0139796733856201
+  ],
+  "n_bands": 84,
+  "n_layers": 4,
+  "n_tokens": 136,
+  "phase_clustering": 0.5595510601997375,
+  "related_pairs": [
+    "cat/dog",
+    "sat/kicked",
+    "boy/ball",
+    "noun/verb",
+    "love/war",
+    "mat/rug"
+  ],
+  "semantic_discrimination": {
+    "random_mean": 0.7352488040924072,
+    "ratio": 1.017106533050537,
+    "related_mean": 0.7478263974189758
+  }
+}
