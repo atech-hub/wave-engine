@@ -35,18 +35,99 @@ Proven configurations for each dimension tier, with recommended settings, traini
 
 | Tier | Dimension | Params | Speed | Best For | Details |
 |------|-----------|--------|-------|----------|--------|
-| **Research / Specialist** | 168-dim | 186K | 57-80ms | Small-vocab structured tasks — music, code, chemistry, DNA, arithmetic. Trains in minutes on any CPU. 0.988 phase clustering, bimodal band census confirmed. | [168-dim config](configs/168-dim/CONFIG.md) |
+| **Research / Specialist** | 168-dim | 186K–340K | 57-80ms | Small-vocab structured tasks — music, code, chemistry, DNA, arithmetic. Trains in minutes on any CPU. | [168-dim config](configs/168-dim/CONFIG.md) |
 | **Mid-Range** | 256-dim | 258-579K | 140-210ms | Domain-specific text, structured English, code generation. Bridge between research and production. | [256-dim config](configs/256-dim/CONFIG.md) |
 | **Power User** | 384-dim | ~500K | ~200ms | Coherent English with word-level BPE. Enough capacity for sentence-level generation. | [384-dim config](configs/384-dim/CONFIG.md) |
 | **Production** | 768-dim | ~4M | 1.2s CPU / 4.3s GPU | Full English, 50K BPE vocabulary. 24-layer models trained on Candle/CUDA. | [768-dim config](configs/768-dim/CONFIG.md) |
 
-Key scaling rules discovered through systematic testing:
-- **Gradient balance:** Model params need ≥44% of total for effective learning. Below this, the lm_head starves the ODE/maestro.
-- **Vocab matching:** Larger vocabularies need larger dimensions — 512 BPE for 168-dim, up to 50K BPE for 768-dim.
-- **Multi-grid embeddings:** Required for BPE below 768-dim. Coprime dual-circle mapping gives 101x-11,800x token separation improvement.
-- **Per-band ODE clamp:** Max magnitude 2.5 before ODE — prevents phase wrapping at all dimensions.
-
 See [configs/README.md](configs/README.md) for the complete guide.
+
+## Usage
+
+```
+wave-engine <data> [options]
+
+ARGUMENTS:
+    DATA              Path to training data file (e.g. data/input.txt)
+
+TRAINING:
+    --iters N         Training iterations                    [default: 500]
+    --batch N         Batch size                             [default: 4]
+    --seq N           Sequence length (context window)       [default: 256]
+    --lr F            Learning rate                          [default: 1e-4]
+    --layers N        Number of transformer blocks           [default: 24]
+
+ARCHITECTURE (all tiers — CPU, wgpu, Candle):
+    --n-bands N       Harmonic frequency bands (n_embd = N×2) [default: 384]
+    --n-head N        Number of attention heads               [default: 12]
+    --maestro-dim N   Maestro bottleneck width                [default: 16]
+    --rk4-steps N     ODE integration steps (CPU/wgpu only)   [default: 16]
+    --out-proj-groups N  Block-diagonal groups (1=dense)      [default: 6]
+    --m1 N              Multi-grid modulus 1 (must pair with --m2, coprime)
+    --m2 N              Multi-grid modulus 2 (must pair with --m1, coprime)
+    --tied-embeddings   Use harmonic wte as output decoder (experimental)
+
+    Common presets:
+      168-dim:   --n-bands 84   --n-head 4   (fast diagnostic model)
+      768-dim:   --n-bands 384  --n-head 12  (default)
+      4096-dim:  --n-bands 2048 --n-head 32  --out-proj-groups 32
+
+ODE COUPLING (linked to AGC ceiling — stronger coupling = tighter ceiling):
+    --alpha F         ODE self-phase coupling                [default: 0.1]
+    --beta F          ODE cross-phase coupling               [default: same as alpha]
+    --agc-ceiling F   AGC max threshold (auto-derived if omitted)
+
+    α and β control the Kerr nonlinearity. β independently controls the
+    cross-band coupling ratio — this is a key design parameter:
+
+      α=0.1, β=0.1: cross/self = 3.94x  (one encoding strategy at a time)
+      α=0.1, β=0.2: cross/self = 7.82x  (dual encoding, 2x discrimination)
+      α=0.1, β=0.3: cross/self = 11.79x (over-coupled, both channels fail)
+
+    AGC ceiling auto-derives from coupling: ceiling = sqrt(π/2 / (α + 4β))
+      β=0.1: ceiling = 1.77
+      β=0.2: ceiling = 1.32 (use --agc-ceiling 1.0 for stability)
+      β=0.3: ceiling = 1.10 (use --agc-ceiling 0.85)
+
+RESUME:
+    --resume FILE     Resume training from checkpoint
+                      CPU/wgpu: WCHK .bin file (restores weights + Adam + RNG)
+                      Candle:   .safetensors file (restores weights only)
+    --no-curriculum   Disable progressive band curriculum (all bands from start)
+    --checkpoint-name Save checkpoint to this filename       [default: checkpoint.bin]
+    --log-name FILE   Custom training log filename (auto-derived from checkpoint name)
+
+TOKENIZER:
+    --bpe             Use BPE tokenizer (GPT-2 style)
+    --tokenizer FILE  Path to tokenizer.json                 [default: data/tokenizer.json]
+    (default)         Character-level tokenization
+
+ACCELERATION:
+    --gpu             Enable wgpu GPU (Vulkan/Metal/DX12)
+    --candle          Use Candle CUDA backend (requires --features candle-backend)
+
+PERFORMANCE:
+    --threads N       Rayon thread pool size (default: half available cores)
+
+MONITORS:
+    --monitor         Enable per-section pipeline timing (forward profiling)
+    --debug-nan       Enable per-layer NaN detection (Candle only, ~6x slower)
+
+ANALYSIS:
+    --analyze         Run wave structure diagnostics on a trained model (no training)
+                      Requires --resume <checkpoint>. Uses cos(n*dtheta) harmonic coherence.
+                      Reports: semantic discrimination, depth curve, band census,
+                      phase clustering, harmonic spectra.
+    --sub-harmonic    Add sub-harmonic diagnostics to --analyze:
+                      per-band/cross-band discrimination, coupling energy budget,
+                      inter-modulation spectrum, magnitude correlation.
+
+DIMENSION SCALING:
+    --scale FILE      Scale a trained checkpoint to larger dimensions
+    --target-bands N  Target number of bands for scaling      [default: 128]
+    --target-head N   Target number of attention heads        [default: 8]
+    --output FILE     Output path for scaled checkpoint       [default: scaled_checkpoint.bin]
+```
 
 ## Examples
 
@@ -60,101 +141,116 @@ Download any plain text file (Shakespeare, Wikipedia, a novel — anything works
 
 This trains a 4-layer model on CPU for 200 iterations. You'll see loss descending from ~4.5 to ~2.5. The model saves to `checkpoint.bin` when done.
 
-### Scale up with GPU
+### 168-dim diagnostic model with BPE
 
-If you have any GPU (NVIDIA, AMD, Intel, Apple Silicon):
+The fastest way to experiment with the wave architecture:
 
 ```bash
-./target/release/wave-engine data/input.txt --layers 4 --iters 200 --gpu
+# 512 BPE (good composition at 168-dim)
+./target/release/wave-engine data/input.txt --layers 4 --n-bands 84 --n-head 4 \
+    --out-proj-groups 1 --bpe --tokenizer data/tokenizer_512.json --iters 20000
+
+# 1K BPE (deeper vocabulary, longer training)
+./target/release/wave-engine data/input.txt --layers 4 --n-bands 84 --n-head 4 \
+    --out-proj-groups 1 --bpe --tokenizer data/tokenizer_1k_gs.json --iters 20000
 ```
 
-Same model, same results, GPU-accelerated. The `--gpu` flag works on any GPU vendor — no CUDA required.
+### Asymmetric coupling (β=0.2 — recommended)
 
-### NVIDIA CUDA (fastest)
-
-If you have an NVIDIA GPU and want maximum speed:
+β controls cross-band coupling strength independently of α. At β=0.2, the model sustains dual encoding (both per-band and cross-band semantic channels active) and learns 4x faster than α=β=0.1:
 
 ```bash
+# β=0.2 with 1K BPE — strongest discrimination measured (3.21x at C2)
+./target/release/wave-engine data/input.txt --layers 4 --n-bands 84 --n-head 4 \
+    --out-proj-groups 1 --alpha 0.1 --beta 0.2 --agc-ceiling 1.0 \
+    --bpe --tokenizer data/tokenizer_1k_gs.json --iters 10000 \
+    --checkpoint-name model_beta02.bin
+```
+
+### Resume with custom log name
+
+```bash
+# Resume training — log auto-derives from checkpoint name
+./target/release/wave-engine data/input.txt --resume model_beta02.bin --iters 10000
+
+# Or specify a custom log
+./target/release/wave-engine data/input.txt --resume model_beta02.bin --iters 10000 \
+    --log-name training_log_beta02_c2.jsonl
+```
+
+### Analyse a trained model
+
+```bash
+# Basic wave structure analysis
+./target/release/wave-engine --analyze --resume checkpoint.bin \
+    --layers 4 --n-bands 84 --n-head 4 --out-proj-groups 1
+
+# With sub-harmonic diagnostics (cross-band coupling, encoding strategies)
+./target/release/wave-engine --analyze --sub-harmonic --resume model_beta02.bin \
+    --layers 4 --n-bands 84 --n-head 4 --out-proj-groups 1 \
+    --alpha 0.1 --beta 0.2 --agc-ceiling 1.0 \
+    --bpe --tokenizer data/tokenizer_1k_gs.json
+```
+
+Sub-harmonic diagnostics report: per-band (θ) and cross-band (Δθ) discrimination, coupling energy budget, inter-modulation spectrum, and magnitude correlation. These reveal the two encoding strategies the model uses and how they interact.
+
+### Scale a checkpoint to larger dimensions
+
+```bash
+# Scale 168-dim (84 bands) checkpoint to 256-dim (128 bands)
+./target/release/wave-engine --scale model_beta02.bin \
+    --target-bands 128 --target-head 8 --out-proj-groups 1 \
+    --output model_256_from_168.bin
+
+# Train the scaled model at 256-dim
+./target/release/wave-engine data/input.txt --resume model_256_from_168.bin \
+    --layers 4 --n-bands 128 --n-head 8 --out-proj-groups 1 \
+    --alpha 0.1 --beta 0.2 --agc-ceiling 1.0 \
+    --bpe --tokenizer data/tokenizer_1k_gs.json --iters 20000
+```
+
+Scaling preserves the learned weights for existing bands (1–84) and initialises new bands (85–128) with fresh weights. The model inherits the semantic structure from the smaller checkpoint.
+
+### Custom multi-grid moduli
+
+The embedding system uses two coprime moduli for token separation. Normally auto-detected, but can be overridden:
+
+```bash
+./target/release/wave-engine data/input.txt --layers 4 --n-bands 84 --n-head 4 \
+    --m1 33 --m2 35 --bpe --tokenizer data/tokenizer_1k_gs.json --iters 10000
+```
+
+Both `--m1` and `--m2` must be provided together and must be coprime (GCD=1).
+
+### Scale up with GPU
+
+```bash
+# wgpu — any GPU (NVIDIA, AMD, Intel, Apple Silicon)
+./target/release/wave-engine data/input.txt --layers 4 --iters 200 --gpu
+
+# Candle CUDA — NVIDIA only (fastest)
 cargo build --release --features candle-backend
 ./target/release/wave-engine data/input.txt --candle --layers 4 --iters 200
 ```
 
-This uses the Candle/CUDA backend with perturbative ODE and block-diagonal output projection. 2.4x faster than CPU.
-
-### Train with BPE tokenizer (recommended for real training)
-
-Character-level tokenization is fine for experiments, but BPE produces better models:
-
-```bash
-# Download a GPT-2 tokenizer (or any HuggingFace tokenizer.json)
-./target/release/wave-engine data/input.txt --iters 1000 --bpe --tokenizer data/tokenizer.json
-```
-
 ### Production training (24 layers, diverse corpus)
 
-For a real model that generates English:
-
 ```bash
-# Combine your training data (grammar, literature, etc.)
 cat grammar.txt literature.txt > data/training.txt
-
-# Train 24 layers with BPE on CUDA (fastest)
 ./target/release/wave-engine data/training.txt --candle \
     --layers 24 --iters 5000 --seq 256 --batch 4 --lr 1e-4 \
     --bpe --tokenizer data/tokenizer.json
 ```
 
-### Resume training from a checkpoint
-
-```bash
-./target/release/wave-engine data/input.txt --iters 5000 --resume checkpoint.bin
-```
-
-### Custom architecture dimensions
-
-All tiers (CPU, wgpu, Candle) support runtime-configurable dimensions:
-
-```bash
-# 168-dim diagnostic model (fast, 57ms/iter CPU, use 512 BPE)
-./target/release/wave-engine data/input.txt --n-bands 84 --n-head 4 --layers 4 \
-    --bpe --tokenizer data/tokenizer_512.json
-
-# 384-dim (coherent English, use 2K-4K BPE)
-./target/release/wave-engine data/input.txt --n-bands 192 --n-head 8 --layers 8
-
-# 768-dim default (production, 50K BPE)
-./target/release/wave-engine data/input.txt --bpe --tokenizer data/tokenizer.json
-```
-
-Recommended BPE vocab per dimension (harmonic embedding minimum):
-- 168-dim (84 bands): 512 vocab
-- 384-dim (192 bands): 2K-4K vocab
-- 768-dim (384 bands): 50K vocab
-
-### Analyse your trained model
-
-After training, inspect what the model learned using harmonic coherence diagnostics — the same `cos(n × Δθ)` math from the research framework:
-
-```bash
-# Wave structure report: semantic discrimination, depth curve, band census, phase clustering
-./target/release/wave-engine --analyze --resume checkpoint.bin --layers 4
-
-# With BPE tokenizer (for proper word-level semantic pairs)
-./target/release/wave-engine --analyze --resume checkpoint.bin --layers 24 --out-proj-groups 6 \
-    --bpe --tokenizer data/tokenizer.json
-```
-
-This runs a forward pass on curated test sentences, extracts phase angles at every layer, and sweeps harmonic coherence between known semantic pairs (cat/dog, noun/verb, etc.). Reports to console and `analysis/wave_report.json`.
-
 ### Serve your trained model
 
-After training, serve it with [wave-server](https://github.com/atech-hub/wave-server):
+After training, serve with [wave-server](https://github.com/atech-hub/wave-server):
 
 ```bash
-# In the wave-server repo:
-./target/release/wave-server ../wave-engine/checkpoint.bin --bpe ../wave-engine/data/tokenizer.json --port 8080
+./target/release/wave-server ../wave-engine/checkpoint.bin \
+    --bpe ../wave-engine/data/tokenizer.json --port 8080
 
-# Then connect any OpenAI-compatible chat UI to http://localhost:8080/v1
+# Connect any OpenAI-compatible chat UI to http://localhost:8080/v1
 ```
 
 ## Training Tiers
@@ -169,81 +265,56 @@ The engine provides three tiers to match your hardware. All tiers train the same
 
 *Measured March 22 2026: 4 layers, seq=64, batch=4, 200 iters, Shakespeare, no curriculum, RTX 4070 Ti.*
 
-**CPU** gives the best training quality on any hardware — a Raspberry Pi, a cloud VM, a 10-year-old laptop. **wgpu** runs on any GPU without CUDA, producing identical results to CPU (same loss at every iteration). **Candle CUDA** is 2.4x faster with block-diagonal output projection (6 groups of 128) and perturbative ODE — fewer parameters, faster convergence, slightly higher loss from cosine LR warmup.
+**CPU** gives the best training quality on any hardware — a Raspberry Pi, a cloud VM, a 10-year-old laptop. **wgpu** runs on any GPU without CUDA, producing identical results to CPU. **Candle CUDA** is 2.4x faster with block-diagonal output projection and perturbative ODE.
 
-**Realistic training times:** The engine runs on any hardware from a Raspberry Pi to an RTX 4090. A 4-layer experiment takes ~2 minutes on any machine. Training time scales with your hardware — the architecture is the same everywhere, only the speed differs.
+## Built-In Monitors
 
-## Usage
-
-```
-wave-engine <data> [options]
-
-Arguments:
-  <data>              Path to training data file (text)
-
-Training:
-  --iters N           Number of training iterations (default: 500)
-  --batch N           Batch size (default: 4)
-  --seq N             Sequence length (default: 256)
-  --layers N          Number of parallel blocks (default: 24)
-  --lr RATE           Learning rate (default: 1e-4 for 384+ bands, 3e-4 otherwise)
-
-Tokenizer:
-  --bpe               Use BPE tokenizer (default: character-level)
-  --tokenizer FILE    Path to HuggingFace tokenizer.json (default: data/tokenizer.json)
-
-Architecture (runtime configurable):
-  --n-bands N         Harmonic frequency bands (default: 384, embedding dim = N×2)
-  --n-head N          Attention heads (default: 12)
-  --maestro-dim N     Maestro bottleneck width (default: 16)
-  --rk4-steps N       ODE integration steps, 1=perturbative (default: 16)
-  --out-proj-groups N Block-diagonal groups, 1=dense (default: 6)
-
-GPU:
-  --gpu               Enable wgpu GPU acceleration (any GPU)
-  --candle            Use Candle/CUDA backend (NVIDIA only, requires candle-backend feature)
-
-Monitoring:
-  --monitor           Enable always-on pipeline timing (per-section FFN breakdown)
-
-Resume:
-  --resume FILE       Resume training from WCHK checkpoint
-  --no-curriculum     Disable progressive band curriculum
-```
-
-### Always-On Monitors
-
-These run automatically during training — no flags needed:
+### Always-on (no flags needed)
 
 | Monitor | Output | Description |
 |---------|--------|-------------|
 | Loss + time | Console | Per-iteration loss and wall-clock time |
 | Gradient norm | Console | `gnorm=` after each iteration |
+| Pre-flight checks | Console | Embedding separation, param balance, ODE stability at startup |
+| First-10 health | Console | Gradient norms, component balance (first 10 iters) |
 | NaN recovery | Console | Detects NaN loss, skips step, logs count, continues |
-| VRAM tracking | Console (Candle) | Real-time GPU memory via cudarc `mem_get_info` |
-| JSONL telemetry | `training_log.jsonl` | Per-iteration: loss, lr, time_ms, vram_mb, nan_skips |
+| VRAM tracking | Console (Candle) | Real-time GPU memory via cudarc |
+| JSONL telemetry | `training_log_*.jsonl` | Per-iteration: loss, lr, time_ms, vram_mb, ODE/AGC stats |
 | Checkpoint guard | — | Refuses to save when loss is NaN/Inf/zero |
-| Loss in filename | Checkpoint | `checkpoint_iter500_loss2.48.bin` for quick comparison |
+| Auto training summary | End of run | Best loss, rolling averages, speed, config summary + JSONL line |
 
-The `--monitor` flag adds per-section FFN timing on top of these.
+### Optional
+
+| Flag | What it does |
+|------|-------------|
+| `--monitor` | Per-section FFN timing: mae_in, ODE, mae_out, out_proj breakdown per block |
+| `--debug-nan` | Per-layer NaN detection in Candle tier (~6x slower) |
+
+### Training logs
+
+Log filenames auto-derive from checkpoint name to prevent overwrites:
+- `checkpoint.bin` → `training_log.jsonl`
+- `model_beta02.bin` → `training_log_beta02.jsonl`
+- Or override with `--log-name custom_log.jsonl`
 
 ## Features
 
 | Feature | Status | Description |
 |---------|--------|-------------|
 | Three training tiers | ✓ | CPU, wgpu (any GPU), Candle/CUDA (NVIDIA) |
-| BPE tokenizer | ✓ | HuggingFace tokenizer.json format, tested with 50K vocab |
-| Token cache | ✓ | BPE encoding cached to disk — 6 min encode → 13 sec reload |
+| BPE tokenizer | ✓ | HuggingFace tokenizer.json format |
+| Token cache | ✓ | BPE encoding cached to disk — instant reload |
 | Checkpoint save/load | ✓ | WCHK format with optimizer state, iteration count, resume support |
-| Text generation | ✓ | Temperature, top-k, top-p, repetition penalty sampling |
+| Asymmetric coupling | ✓ | Independent `--alpha` and `--beta` for cross/self coupling control |
+| Sub-harmonic diagnostics | ✓ | Per-band (θ) and cross-band (Δθ) discrimination, coupling budget |
+| Progressive dim scaling | ✓ | Scale trained checkpoints to larger dimensions (`--scale`) |
+| Configurable multi-grid | ✓ | Custom coprime moduli (`--m1`, `--m2`) for embedding separation |
+| Custom log names | ✓ | Auto-derived or manual (`--log-name`) — no more overwrites |
 | Curriculum training | ✓ | Soft-mask band unlocking (+1.46pp validated), LN-safe at 24 layers |
 | GPU fused ODE | ✓ | One submit, 192 dispatches, zero CPU readbacks between RK4 steps |
-| Candle ODE | ✓ | CustomOp1 with identity backward, matching GELU and init |
 | FFT ODE | ✓ | OFDM-inspired stencil convolution, validated at 1.19e-7 precision |
-| GPU FFT shader | ✓ | 512-point radix-2 Cooley-Tukey in WGSL, compiled and validated |
 | Ping-pong buffers | ✓ | Forward/backward read same GPU bits, eliminates precision mismatch |
-| Pipeline monitor | ✓ | Per-section FFN timing (mae_in, ODE, mae_out, out_proj) |
-| 256-thread Kahan shaders | ✓ | Compensated tree reduction, 0.19 gap (f32 non-associativity floor) |
+| Pipeline monitor | ✓ | Per-section FFN timing (`--monitor`) |
 
 ## Architecture
 
@@ -254,18 +325,22 @@ Wave-engine implements a novel neural architecture where standard MLP feed-forwa
 x = x + attention(LN(x)) + FFN(LN(x))
 ```
 
-Attention and FFN receive the same normalized input and run in parallel. This is different from the sequential GPT-2 formulation and was chosen to enable within-block overlap between attention scoring and ODE integration.
-
 **FFN: Dual-Maestro Kerr-ODE**
 ```
 input → maestro_in (768→16→768) → ODE (RK4, 16 steps) → maestro_out (768→16→768) → out_proj (768→768)
 ```
 
-The maestro layers are learned bottleneck coordinators (dim=16, a universal constant validated across 128-dim to 1536-dim). The ODE evolves 384 coupled oscillator bands through nonlinear Kerr dynamics — self-phase modulation, cross-phase modulation, and nearest-neighbour coupling.
+The maestro layers are learned bottleneck coordinators (dim=16, a universal constant validated across 128-dim to 1536-dim). The ODE evolves coupled oscillator bands through nonlinear Kerr dynamics — self-phase modulation (α), cross-phase modulation (β), and nearest-neighbour coupling.
+
+**ODE coupling: α and β**
+
+The `--alpha` and `--beta` flags control the Kerr nonlinearity independently. α governs self-phase modulation (each band's own amplitude affects its phase). β governs cross-phase modulation (neighbouring bands' amplitudes affect phase). The cross/self coupling ratio is determined by the architecture and α/β values, not learned during training.
+
+At α=0.1, β=0.2, the cross-modulation is ~7.82x stronger than self-modulation. This enables the model to use two simultaneous encoding strategies (per-band phase and cross-band phase differences) where α=β only allows one at a time. See the [research repo](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive) for the full investigation.
 
 **Attention: Frozen Harmonic Coherence**
 
-Standard Q/K dot-product attention is replaced with phase-based scoring: `cos(n × Δφ)` where `n` is a learned harmonic number and `Δφ` is the phase difference between positions. Attention weights are frozen during training — only the FFN and layer norms learn. This reduces trainable parameters significantly and is validated to produce equivalent quality on the datasets tested.
+Standard Q/K dot-product attention is replaced with phase-based scoring: `cos(n × Δφ)` where `n` is a learned harmonic number and `Δφ` is the phase difference between positions. Attention weights are frozen during training — only the FFN and layer norms learn.
 
 **Default configuration:**
 | Parameter | Value |
@@ -277,9 +352,7 @@ Standard Q/K dot-product attention is replaced with phase-based scoring: `cos(n 
 | RK4 steps | 16 |
 | Block size | 256 |
 
-**Trainable parameters at 24 layers:** ~15.5M (attention frozen)
-
-**Parameter efficiency:** The Kerr-ODE FFN uses 640K parameters per block vs 4.72M for a standard 4x-expansion MLP — 7.4x fewer parameters. A 24-layer wave-engine at 768-dim has 15.5M trainable parameters doing the computation that a standard transformer needs ~115M for. The ODE itself is only 770 parameters per block (384 γ + 384 ω + α + β), replacing a dense 768×3072×768 matrix path with coupled oscillator dynamics that require ~100x fewer FLOPs.
+**Parameter efficiency:** The Kerr-ODE FFN uses 640K parameters per block vs 4.72M for a standard 4x-expansion MLP — 7.4x fewer parameters.
 
 ## GPU Acceleration
 
@@ -287,116 +360,68 @@ Standard Q/K dot-product attention is replaced with phase-based scoring: `cos(n 
 
 The `--gpu` flag enables GPU acceleration via wgpu, which works on any GPU supporting Vulkan, Metal, or DX12 — NVIDIA, AMD, Intel, Apple Silicon.
 
-What runs on GPU:
-- Frozen attention output projection (zero quality cost)
-- Trained FFN output projection via ping-pong buffers (0.19 quality trade for 2.8x speedup)
-- Fused ODE integration (one submit, 192 dispatches, all buffers VRAM-resident)
-
-What stays on CPU:
-- Maestro layers (dim=16, too small for GPU dispatch overhead)
-- Attention scoring (phase-based, frozen)
-- Layer normalization
-
-The engine includes 32+ WGSL compute shaders covering matvec, outer product, attention backward, layer norm, FFT convolution, ODE integration, and RK4 stepping. An always-on pipeline monitor (`--monitor`) shows per-section timing so you can see exactly where every millisecond goes.
+What runs on GPU: frozen attention output projection, trained FFN output projection via ping-pong buffers, fused ODE integration. What stays on CPU: maestro layers (dim=16, too small for GPU dispatch), attention scoring (frozen), layer normalization.
 
 ### Candle/CUDA (NVIDIA)
 
 ```bash
-./target/release/wave-engine data/input.txt --iters 200 --candle
+cargo build --release --features candle-backend
+./target/release/wave-engine data/input.txt --candle --layers 4 --iters 200
 ```
 
-The Candle backend uses cuBLAS for all matrix operations with automatic forward/backward consistency via autograd. The Kerr-ODE runs as a `CustomOp1` with identity backward (ODE parameters frozen, gradient passthrough). Requires NVIDIA GPU with CUDA support.
+Uses cuBLAS for all matrix operations with autograd. The Kerr-ODE runs as a `CustomOp1` with identity backward.
 
 ### A note on GPU utilisation
 
-If you open Task Manager or `nvidia-smi` during training, you'll see GPU utilisation oscillating between 20-63% instead of the 100% you might expect from PyTorch. **This is normal and by design — it means the architecture is working efficiently.**
-
-A standard transformer keeps the GPU at 100% because every operation is a large dense matrix multiply that runs on GPU. The wave-engine replaces those dense MLP layers (4.72M parameters, 589K multiply-adds per block) with a Kerr-ODE (770 parameters, ~6K operations per block). The GPU simply has less work to do.
-
-The oscillation pattern during Candle CUDA training:
-
-| Phase | GPU% | What's happening |
-|-------|------|-----------------|
-| Forward/backward matmuls | 50-63% | cuBLAS computing projections across 24 layers |
-| ODE integration | 20-30% | CPU running RK4 for 24 blocks (CustomOp1) |
-| Optimizer step | ~20% | Parameter updates |
-
-The GPU bursts during matrix operations, dips while the CPU runs the ODE, then bursts again. This is a 15.5M parameter model doing the work of a 115M parameter model — the GPU has less to compute because the architecture is more efficient, not because something is wrong.
-
-**Healthy training indicators:** GPU 40-63% with regular oscillation, temperature under 60°C, VRAM stable (5-6GB at 24 layers), CPU under 15%. If you see GPU at 0% (crashed), 100% sustained (hung), or VRAM climbing continuously (memory leak), something is wrong.
-
-## Pipeline Monitor
-
-The `--monitor` flag enables per-section timing for every component:
-
-```
-[FFN fwd] mae_in: 0.5ms  ODE(FFT): 5.5ms  mae_out: 0.5ms  out_proj(GPU): 2.0ms  (64 elem)
-[profile fwd] LN: 0.3ms  Attn: 17ms  FFN: 35ms  Total: 53ms
-```
-
-The monitor identified that `out_proj` (768×768 matmul) is 66% of FFN time — not the ODE (28%). This finding redirected GPU optimization from the ODE to `out_proj`, resulting in a 2.3x FFN speedup.
+GPU utilisation oscillates between 20-63% instead of 100%. **This is normal** — the wave-engine replaces dense MLP layers (4.72M params, 589K multiply-adds per block) with a Kerr-ODE (770 parameters, ~6K operations per block). The GPU has less work to do because the architecture is more efficient.
 
 ## Key Findings
 
 These are validated through testing and documented honestly:
 
-- **Maestro dim=16 is a universal constant.** Tested at dim 16/96/128/160 on 768-dim — all within 0.028 loss. The coordination task is fundamentally low-dimensional.
-- **ODE is 28% of FFN time, not 80%.** The output projection (768×768 matmul) dominates at 66%. Per-section monitors revealed this.
-- **GPU fast mode reaches CPU quality in the same wall-clock time.** CPU hits loss 2.50 at 36 seconds. GPU hits 2.54 at 36 seconds. Then GPU keeps going — more iterations in the same time.
-- **The 0.19 GPU quality gap is f32 non-associativity.** Different addition order on GPU vs CPU gives a different but equally valid result. Proven by identical error at 64 and 256 GPU threads.
-- **FFT-based ODE derivative matches sequential at 384 bands on CPU.** OFDM-inspired stencil convolution validated at 1.19e-7 precision. GPU FFT shader written and validated.
+- **β is an independent design parameter.** β=0.2 with α=0.1 produces 1.9x stronger semantic discrimination in 1/5 of the training time compared to α=β=0.1. The coupling ratio (3.94x→7.82x) enables dual encoding where both per-band and cross-band channels carry semantics simultaneously.
+- **Maestro dim=16 is a universal constant.** Tested at dim 16/96/128/160 on 768-dim — all within 0.028 loss.
+- **ODE is 28% of FFN time, not 80%.** The output projection (768×768 matmul) dominates at 66%.
 - **Frozen attention loses nothing on tested datasets.** Harmonic coherence scoring produces equivalent quality without training attention weights.
-- **7.4x parameter efficiency holds across scale.** 640K FFN params per block vs 4.72M standard MLP. Ratio measured at both 128-dim and 768-dim.
-
-## OFDM-Inspired ODE Acceleration
-
-The Kerr-ODE's nearest-neighbour coupling is structurally identical to OFDM subcarrier interference in MIMO wireless systems. The stencil sum `ns[k] = mag²[k-2] + mag²[k-1] + mag²[k+1] + mag²[k+2]` is a convolution with kernel [1,1,0,1,1], which maps to FFT → multiply → IFFT in the frequency domain.
-
-This connection is implemented in `fft_ode.rs` using rustfft, with a GPU FFT shader (`shaders/fft_512.wgsl`) compiled and validated at 1.67e-6 precision vs CPU. At 384 bands, CPU FFT matches sequential speed. The GPU fused ODE path chains all RK4 dispatches in a single command encoder submit with zero CPU readbacks between steps.
+- **7.4x parameter efficiency holds across scale.** 640K FFN params per block vs 4.72M standard MLP.
 
 ## Project Structure
 
 ```
 src/
-├── main.rs                  Training loop, CLI, model init, re-export shims
+├── main.rs                  CLI dispatch, mode routing
 ├── common/                  Shared modules (all tiers)
-│   ├── model.rs             Weight structs, OutProjWeights enum, layer_norm, gelu, linear
+│   ├── model.rs             Weight structs, layer_norm, gelu, linear
 │   ├── attn.rs              Harmonic coherence attention (frozen)
 │   ├── block.rs             Parallel block (GPT-J formulation)
 │   ├── ffn.rs               FFN routing via ComputeBackend
 │   ├── embed.rs             Frozen harmonic + positional embeddings
-│   ├── checkpoint.rs        WCHK v2 checkpoint save/load with resume
+│   ├── wave_model.rs        Model init, flatten/unflatten params
+│   ├── dims.rs              Dimension constants + Dims struct
+│   ├── analyze.rs           --analyze mode (wave structure diagnostics)
+│   ├── sub_harmonic.rs      Sub-harmonic diagnostics (θ/Δθ encoding strategies)
+│   ├── scale.rs             Progressive dimension scaling (--scale)
+│   ├── checkpoint.rs        WCHK v2 checkpoint save/load
 │   ├── fft_ode.rs           OFDM-inspired FFT ODE derivative
-│   └── optim.rs             Adam optimizer
+│   ├── help.rs              CLI help text
+│   └── ...                  bpe, token_cache, data, rng, monitor
 ├── cpu/
+│   ├── forward.rs           Forward pass with cache
+│   ├── model_backward.rs    Backward pass, gradient computation
+│   ├── backward.rs          Loss backward
 │   └── train.rs             CPU/wgpu training loop
-├── wgpu_tier/               Cross-platform GPU backend
-│   ├── pipelines.rs         Pipeline + shader compilation (35 shaders)
+├── wgpu_tier/               Cross-platform GPU backend (35 WGSL shaders)
+│   ├── pipelines.rs         Pipeline + shader compilation
 │   ├── dispatch.rs          ComputeBackend trait implementation
-│   ├── ops_forward.rs       Forward ops (fused RK4, perturbative, block-diagonal)
+│   ├── ops_forward.rs       Forward ops (fused RK4, perturbative)
 │   ├── ops_backward.rs      Backward ops (analytical gradients)
-│   ├── resident.rs          Pre-uploaded weight buffers (zero per-iter allocation)
-│   ├── buffers.rs           Buffer pool with cache-by-pointer
-│   └── ffn_gpu.rs           Ping-pong buffer management
+│   ├── diagnostics.rs       GPU diagnostic functions
+│   └── ...                  buffers, resident, ffn_gpu, ffn_full_gpu
 ├── candle_tier/             NVIDIA CUDA backend
 │   ├── engine.rs            Candle training loop with autograd
 │   ├── ode.rs               GPU-native perturbative ODE
 │   └── block_diag.rs        Block-diagonal linear via Candle
-├── backend.rs               ComputeBackend trait (CPU/GPU abstraction)
-├── bpe.rs                   BPE tokenizer (HuggingFace format)
-├── monitor.rs               Always-on pipeline timing
-└── rng.rs                   Deterministic PRNG
-
-shaders/                     35 WGSL compute shaders
-├── kerr_perturbative_batch.wgsl         Single-dispatch perturbative ODE (14x speedup)
-├── matvec_block_diagonal_batch.wgsl     Block-diagonal batched matvec
-├── matvec_batch_tiled_kahan.wgsl        Forward matmul (256-thread, Kahan compensated)
-├── matvec_backward_batch_tiled_kahan.wgsl  Backward d_x
-├── outer_product.wgsl                   Backward d_W (Kahan compensated)
-├── fft_512.wgsl                         512-point radix-2 FFT
-├── kerr_step_batch.wgsl                 Fused ODE forward (RK4)
-├── kerr_backward_batch.wgsl             Analytical ODE backward
-└── ...                                  Layer norm, GELU, attention, RK4, etc.
+└── shaders/                 35 WGSL compute shaders
 ```
 
 ## Requirements
@@ -405,7 +430,7 @@ shaders/                     35 WGSL compute shaders
 - **Any GPU** for `--gpu` mode (Vulkan, Metal, or DX12 support)
 - **NVIDIA GPU + CUDA** for `--candle` mode (optional feature)
 
-No Python, no pip, no CUDA toolkit for the default build. The Candle backend requires `CUDA_COMPUTE_CAP=89` (or your GPU's compute capability) set as an environment variable.
+No Python, no pip, no CUDA toolkit for the default build.
 
 ```bash
 # Default build (CPU + wgpu)
@@ -419,19 +444,14 @@ cargo build --release --features candle-backend
 
 The maintainer ([Marco Da Cunha](https://github.com/atech-hub)) is an IT systems administrator, not a software engineer. This engine was built through collaboration with AI — Claude Desktop for architecture and analysis, Claude Code for implementation and testing. This is stated openly and honestly.
 
-What this means for contributions:
-
-- **Main branch is protected.** All changes go through pull requests.
-- **Fork and branch.** Want to improve shaders, add new backends, optimize training? Fork the repo, create a branch, do your work, submit a PR.
-- **The validation gate is test results.** Every PR must show that training still converges to baseline quality on at least one tier.
-- **The maintainer merges based on testing and description, not code review.** Be clear about what you changed and why.
+**Main branch is protected.** Fork, branch, submit a PR with test results showing training still converges.
 
 **Known targets for contributors:**
 
 | Target | Impact | Difficulty |
 |--------|--------|------------|
 | Wikitext-103 training pipeline | Validate architecture on real English | Medium |
-| Tied embeddings / vocab adapter | Solve 50K vocab lm_head explosion (38.6M → 590K params) | Medium |
+| Low-rank lm_head | Reduce output projection cost at small dims | Medium |
 | Stochastic resonance integration | Validated -8.8% perplexity improvement (α=0.05) | Small |
 | Batched inference dispatch | Use engine's existing batch patterns in wave-server | Medium |
 | fp16 for linear ops | Halve memory and PCIe transfer size | Medium |
@@ -439,27 +459,24 @@ What this means for contributions:
 
 ## Important: Model Compatibility
 
-Models trained by wave-engine use a novel architecture (Kerr-ODE, harmonic coherence attention, block-diagonal projections) that is **not compatible** with standard inference tools. Trained checkpoints will **only** work with [wave-server](https://github.com/atech-hub/wave-server). They cannot be loaded by LM Studio, Ollama, llama.cpp, vLLM, or Hugging Face Transformers — these tools have no code path for ODE integration or harmonic attention.
+Models trained by wave-engine use a novel architecture (Kerr-ODE, harmonic coherence attention, block-diagonal projections) that is **not compatible** with standard inference tools. Trained checkpoints will **only** work with [wave-server](https://github.com/atech-hub/wave-server). They cannot be loaded by LM Studio, Ollama, llama.cpp, vLLM, or Hugging Face Transformers.
 
 Train with wave-engine → serve with wave-server → connect any OpenAI-compatible chat UI.
 
 ## Related
 
-- [Wave Coherence as a Computational Primitive](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive) — The parent research project (public, MIT, 1000+ cloners)
-- [wave-server](https://github.com/atech-hub/wave-server) — OpenAI-compatible inference server with KV-cache and wave memory (public, Apache 2.0)
-- [kerr-memory](https://github.com/atech-hub/kerr-memory) — Persistent wave memory state (public, Apache 2.0)
-- [kerr-engine](https://github.com/atech-hub/kerr-engine) — First implementation, historical reference (public, Apache 2.0)
+- [Wave Coherence as a Computational Primitive](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive) — The parent research project
+- [wave-server](https://github.com/atech-hub/wave-server) — OpenAI-compatible inference server with KV-cache and wave memory
+- [kerr-memory](https://github.com/atech-hub/kerr-memory) — Persistent wave memory state
+- [kerr-engine](https://github.com/atech-hub/kerr-engine) — First implementation, historical reference
 
 ## References and Acknowledgments
 
-The perturbative ODE and GPU architecture draw on published work from multiple fields:
-
-- **Secondini et al. (2015)** — "[Fiber Nonlinearity Mitigation in WDM Systems: Enhanced Split-Step Fourier Method](https://arxiv.org/abs/1507.00921)." The ESSFM single-step approach inspired the perturbative Kerr-ODE: replace iterative numerical integration with a single analytical pass.
-- **Lin et al. (2022)** — "[Perturbation-Aided Sample-Based Learned Digital Back-Propagation](https://arxiv.org/abs/2110.05563)." Informed the α/β phase correction structure — self-phase modulation + cross-phase modulation as learnable perturbation terms.
-- **Pal et al. (2024)** — "[Coupled Lugiato-Lefèvre Equation for Nonlinear Frequency Comb Generation](https://arxiv.org/abs/2404.05646v2)." The physical basis for Kerr coupling terms between oscillator bands.
-- **Ng (2026)** — "[RYS-XLarge: Repeated Blocks for Parameter Efficiency](https://huggingface.co/blog/rys-xlarge)." Inspiration for the repeated-blocks experiment (serve model through blocks twice for quality improvement).
-- **Listopad (2025)** — "[ResonanceDB: Phase-Aware Vector Database](https://arxiv.org/abs/2509.09691)." Independent validation of the phase-aware approach to vector similarity, confirming that per-harmonic coherence captures structure invisible to cosine similarity.
-- **Ping-pong buffer pattern** — Standard GPU compute technique for maintaining numerical consistency between forward and backward passes. Our implementation was informed by studying a wgpu Game of Life tutorial demonstrating double-buffered compute dispatch.
+- **Secondini et al. (2015)** — "[Fiber Nonlinearity Mitigation in WDM Systems: Enhanced Split-Step Fourier Method](https://arxiv.org/abs/1507.00921)." The ESSFM single-step approach inspired the perturbative Kerr-ODE.
+- **Lin et al. (2022)** — "[Perturbation-Aided Sample-Based Learned Digital Back-Propagation](https://arxiv.org/abs/2110.05563)." Informed the α/β phase correction structure.
+- **Pal et al. (2024)** — "[Coupled Lugiato-Lefèvre Equation for Nonlinear Frequency Comb Generation](https://arxiv.org/abs/2404.05646v2)." Physical basis for Kerr coupling terms.
+- **Ng (2026)** — "[RYS-XLarge: Repeated Blocks for Parameter Efficiency](https://huggingface.co/blog/rys-xlarge)." Inspiration for repeated-blocks experiment.
+- **Listopad (2025)** — "[ResonanceDB: Phase-Aware Vector Database](https://arxiv.org/abs/2509.09691)." Independent validation of phase-aware vector similarity.
 
 ## License
 
