@@ -76,3 +76,4 @@ data/grammar/
 
 # Lab experiments (internal benchmarks)
 /lab/
+specs/
