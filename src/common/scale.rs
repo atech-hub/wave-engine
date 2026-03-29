@@ -6,11 +6,12 @@
 
 use crate::common::rng::Rng;
 
-/// Configuration for dimension scaling.
+/// Configuration for dimension and/or layer scaling.
 pub struct ScaleConfig {
     pub source_path: String,
     pub target_bands: usize,
     pub target_head: usize,
+    pub target_layers: Option<usize>, // None = keep source layers
     pub output_path: String,
     pub target_groups: usize,
     pub seed: u64,
@@ -144,8 +145,15 @@ pub fn scale_checkpoint(config: &ScaleConfig) -> Result<(), String> {
 
     let src = read_source(&config.source_path)?;
 
-    if config.target_bands <= src.n_bands {
-        return Err(format!("Target bands ({}) must be greater than source ({})", config.target_bands, src.n_bands));
+    let tgt_layers = config.target_layers.unwrap_or(src.n_layers);
+    let band_scaling = config.target_bands > src.n_bands;
+    let layer_scaling = tgt_layers > src.n_layers;
+
+    if !band_scaling && !layer_scaling {
+        return Err("Nothing to scale — target bands and layers are same as source".into());
+    }
+    if config.target_bands < src.n_bands {
+        return Err(format!("Target bands ({}) must be >= source ({})", config.target_bands, src.n_bands));
     }
     let tgt_embd = config.target_bands * 2;
     if tgt_embd % config.target_head != 0 {
@@ -158,7 +166,7 @@ pub fn scale_checkpoint(config: &ScaleConfig) -> Result<(), String> {
     println!("  Source: {} bands ({}-dim), {} layers, {} groups, {} vocab",
         src.n_bands, src_embd, src.n_layers, src.out_proj_groups, src.vocab_size);
     println!("  Target: {} bands ({}-dim), {} layers, {} groups, {} vocab",
-        config.target_bands, tgt_embd, src.n_layers, config.target_groups, src.vocab_size);
+        config.target_bands, tgt_embd, tgt_layers, config.target_groups, src.vocab_size);
 
     let mut rng = Rng::new(config.seed);
     let small_limit = 1.0 / (tgt_embd as f32).sqrt();
@@ -314,6 +322,52 @@ pub fn scale_checkpoint(config: &ScaleConfig) -> Result<(), String> {
         }
     }
 
+    // Layer scaling: append fresh blocks after existing ones
+    if layer_scaling {
+        let new_layers = tgt_layers - src.n_layers;
+        let mae_limit = 1.0 / (tgt_embd as f32).sqrt();
+        let op_limit = 1.0 / (tgt_embd as f32).sqrt();
+        println!("\n  Adding {} fresh layers ({} → {}):", new_layers, src.n_layers, tgt_layers);
+
+        for _layer in 0..new_layers {
+            // LN: weight=1.0, bias=0.0 (identity)
+            for _ in 0..tgt_embd { scaled_params.push(1.0); }
+            for _ in 0..tgt_embd { scaled_params.push(0.0); }
+            // LN FFN: same
+            for _ in 0..tgt_embd { scaled_params.push(1.0); }
+            for _ in 0..tgt_embd { scaled_params.push(0.0); }
+            // Maestro in: squeeze [md × n_embd] Xavier, bias zeros
+            for _ in 0..md { for _ in 0..tgt_embd { scaled_params.push(rng.uniform(mae_limit)); } }
+            for _ in 0..md { scaled_params.push(0.0); }
+            // Maestro in: process [n_embd × md] Xavier, bias zeros
+            for _ in 0..tgt_embd { for _ in 0..md { scaled_params.push(rng.uniform(mae_limit)); } }
+            for _ in 0..tgt_embd { scaled_params.push(0.0); }
+            // Maestro out: squeeze
+            for _ in 0..md { for _ in 0..tgt_embd { scaled_params.push(rng.uniform(mae_limit)); } }
+            for _ in 0..md { scaled_params.push(0.0); }
+            // Maestro out: process
+            for _ in 0..tgt_embd { for _ in 0..md { scaled_params.push(rng.uniform(mae_limit)); } }
+            for _ in 0..tgt_embd { scaled_params.push(0.0); }
+            // Out_proj: ZERO init (not Xavier) — residual passes through unchanged
+            // Fresh layers start as identity: output = input + 0. The lm_head sees
+            // the same signal it was trained on. Layers learn to contribute gradually.
+            if config.target_groups == 1 {
+                for _ in 0..tgt_embd { for _ in 0..tgt_embd { scaled_params.push(0.0); } }
+                for _ in 0..tgt_embd { scaled_params.push(0.0); }
+            } else {
+                let gs = tgt_embd / config.target_groups;
+                for _ in 0..config.target_groups {
+                    for _ in 0..gs { for _ in 0..gs { scaled_params.push(0.0); } }
+                    for _ in 0..gs { scaled_params.push(0.0); }
+                }
+            }
+        }
+        println!("    {} fresh blocks initialised ({} params each)", new_layers,
+            (tgt_embd * 4 + md * tgt_embd + md + tgt_embd * md + tgt_embd) * 2
+            + if config.target_groups == 1 { tgt_embd * tgt_embd + tgt_embd }
+              else { config.target_groups * (tgt_embd / config.target_groups).pow(2) + tgt_embd });
+    }
+
     // 14. ln_f.weight [n_embd] → pad with 1.0
     let ln_f_w = read_1d(&src.params, &mut offset, src_embd);
     scaled_params.extend_from_slice(&pad_1d(&ln_f_w, tgt_embd, 1.0));
@@ -349,7 +403,7 @@ pub fn scale_checkpoint(config: &ScaleConfig) -> Result<(), String> {
     let n_trainable = tgt_count;
     let optimizer = crate::cpu::train::Adam::new(1e-4, n_trainable);
     crate::wave_checkpoint::save_checkpoint(
-        &scaled_params, src.vocab_size, src.n_layers, config.target_groups,
+        &scaled_params, src.vocab_size, tgt_layers, config.target_groups,
         0, 1e-4, &optimizer, 42, &config.output_path, dims,
     );
     println!("\n  Saved: {} (WCHK v2, iter=0, fresh optimizer)", config.output_path);

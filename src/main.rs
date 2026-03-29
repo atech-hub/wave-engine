@@ -120,6 +120,8 @@ fn main() {
             .expect("--scale requires a checkpoint path");
         let target_bands: usize = pflag("--target-bands", 128);
         let target_head: usize = pflag("--target-head", 8);
+        let target_layers: Option<usize> = std::env::args().skip_while(|a| a != "--target-layers").nth(1)
+            .and_then(|s| s.parse().ok());
         let output: String = pflag("--output", "scaled_checkpoint.bin".to_string());
         let groups: usize = pflag("--out-proj-groups", 1);
 
@@ -127,6 +129,7 @@ fn main() {
             source_path: source,
             target_bands,
             target_head,
+            target_layers,
             output_path: output,
             target_groups: groups,
             seed: 42,
@@ -212,5 +215,9 @@ fn main() {
         m1: std::env::args().skip_while(|a| a != "--m1").nth(1).and_then(|s| s.parse().ok()),
         m2: std::env::args().skip_while(|a| a != "--m2").nth(1).and_then(|s| s.parse().ok()),
         tied: std::env::args().any(|a| a == "--tied-embeddings"),
+        lm_rank: parse_flag("--lm-rank", 0),
+        wave_decode: std::env::args().any(|a| a == "--wave-decode"),
+        unfreeze_phases: std::env::args().any(|a| a == "--unfreeze-phases"),
+        health_interval: parse_flag("--health-interval", 0),
     });
 }

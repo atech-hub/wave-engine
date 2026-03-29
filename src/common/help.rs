@@ -26,6 +26,10 @@ pub fn print_help() {
     println!("    --m1 N              Multi-grid modulus 1 (must pair with --m2, coprime)");
     println!("    --m2 N              Multi-grid modulus 2 (must pair with --m1, coprime)");
     println!("    --tied-embeddings   Use harmonic wte as output decoder (zero lm_head params)");
+    println!("    --lm-rank N         Low-rank lm_head factoring (0=full rank)  [default: 0]");
+    println!("                        Rank 32 at 168-dim: 172K→38K params (78% saving)");
+    println!("    --wave-decode       Phase coherence output decoder (85 params vs 172K)");
+    println!("    --unfreeze-phases   Learn reference phases (86K params, use with --wave-decode)");
     println!();
     println!("    Common presets:");
     println!("      168-dim:   --n-bands 84   --n-head 4   (fast diagnostic model)");
@@ -69,6 +73,8 @@ pub fn print_help() {
     println!("MONITORS:");
     println!("    --monitor         Enable per-section pipeline timing (forward profiling)");
     println!("    --debug-nan       Enable per-layer NaN detection (Candle only, ~6x slower)");
+    println!("    --health-interval N  Encoding health sample every N iters (0=off)  [default: 0]");
+    println!("                        Logs θ/Δθ balance, entropy, coupling to JSONL");
     println!();
     println!("    Always-on telemetry (no flag needed):");
     println!("      training_log_cpu.jsonl    CPU tier telemetry (per-iteration)");

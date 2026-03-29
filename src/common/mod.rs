@@ -18,3 +18,5 @@ pub mod dims;
 pub mod analyze;
 pub mod scale;
 pub mod sub_harmonic;
+pub mod wave_decode;
+pub mod encoding_health;
