@@ -35,8 +35,8 @@ Proven configurations for each dimension tier, with recommended settings, traini
 
 | Tier | Dimension | Params | Speed | Best For | Details |
 |------|-----------|--------|-------|----------|--------|
-| **Research / Specialist** | 168-dim | 186K–340K | 57-80ms | Small-vocab structured tasks — music, code, chemistry, DNA, arithmetic. Trains in minutes on any CPU. | [168-dim config](configs/168-dim/CONFIG.md) |
-| **Mid-Range** | 256-dim | 258-579K | 140-210ms | Domain-specific text, structured English, code generation. Bridge between research and production. | [256-dim config](configs/256-dim/CONFIG.md) |
+| **Research Platform** | 168-dim | 186K–340K | 57-80ms | Full research platform — β discovery, rotational learning, 3.38x discrimination, 12 investigations. Trains in minutes on any CPU. | [168-dim config](configs/168-dim/CONFIG.md) |
+| **Scaling Tier (active)** | 256-dim | 597K | 110-140ms | Transplanted from 168-dim. Loss 3.78 (all-time record), dual encoding, near-phrases emerging. Active investigation. | [256-dim config](configs/256-dim/CONFIG.md) |
 | **Power User** | 384-dim | ~500K | ~200ms | Coherent English with word-level BPE. Enough capacity for sentence-level generation. | [384-dim config](configs/384-dim/CONFIG.md) |
 | **Production** | 768-dim | ~4M | 1.2s CPU / 4.3s GPU | Full English, 50K BPE vocabulary. 24-layer models trained on Candle/CUDA. | [768-dim config](configs/768-dim/CONFIG.md) |
 
@@ -65,7 +65,11 @@ ARCHITECTURE (all tiers — CPU, wgpu, Candle):
     --out-proj-groups N  Block-diagonal groups (1=dense)      [default: 6]
     --m1 N              Multi-grid modulus 1 (must pair with --m2, coprime)
     --m2 N              Multi-grid modulus 2 (must pair with --m1, coprime)
-    --tied-embeddings   Use harmonic wte as output decoder (experimental)
+    --tied-embeddings   Use harmonic wte as output decoder (experimental, null at 168-dim)
+    --wave-decode       Phase coherence output decoder (85 params, validated 5.84)
+    --unfreeze-phases   Learn reference phases (use with --wave-decode, 86K params)
+    --lm-rank N         Low-rank lm_head factoring (0=full rank)  [default: 0]
+                        Rank 32 at 168-dim: 172K→38K params (78% saving)
 
     Common presets:
       168-dim:   --n-bands 84   --n-head 4   (fast diagnostic model)
@@ -379,9 +383,11 @@ GPU utilisation oscillates between 20-63% instead of 100%. **This is normal** �
 
 These are validated through testing and documented honestly:
 
-- **β is an independent design parameter.** β=0.2 with α=0.1 produces 1.9x stronger semantic discrimination in 1/5 of the training time compared to α=β=0.1. The coupling ratio (3.94x→7.82x) enables dual encoding where both per-band and cross-band channels carry semantics simultaneously.
+- **β is an independent design parameter.** β=0.2 with α=0.1 produces 2x stronger semantic discrimination and prevents crystallisation. The coupling ratio (3.94x→7.82x) enables dual encoding where both per-band and cross-band channels carry semantics simultaneously.
+- **Progressive dimension scaling works.** 168-dim checkpoint transplanted to 256-dim — loss 4.09 in one cycle (took 168-dim four cycles). Band-preserving scaling transfers learned structure across dimensions.
+- **256-dim at loss 3.78.** New all-time record at 50K iters, with "sentence", "phrase", "verb forms", "preposition" emerging. Near-phrases appearing at 80K iters. Investigation active.
+- **Phase-native decoding validated.** Wave transduction (85 params) beats tied embeddings (5.84 vs 6.23). The conservation argument holds — phase coherence preserves what dot products destroy. Low-rank 32 (38K params, loss 4.62) is the best efficiency for learned decoders.
 - **Maestro dim=16 is a universal constant.** Tested at dim 16/96/128/160 on 768-dim — all within 0.028 loss.
-- **ODE is 28% of FFN time, not 80%.** The output projection (768×768 matmul) dominates at 66%.
 - **Frozen attention loses nothing on tested datasets.** Harmonic coherence scoring produces equivalent quality without training attention weights.
 - **7.4x parameter efficiency holds across scale.** 640K FFN params per block vs 4.72M standard MLP.
 
@@ -450,12 +456,13 @@ The maintainer ([Marco Da Cunha](https://github.com/atech-hub)) is an IT systems
 
 | Target | Impact | Difficulty |
 |--------|--------|------------|
+| 256-dim scaling investigation | Active — loss 3.78, near-phrases emerging | Active |
+| wgpu tier validation at 256-dim | Verify all enhancements work on GPU tier | Medium |
+| Low-rank lm_head at 256-dim | 262K→41K params, gradient balance 90/10 | Medium |
+| Longer sequence length (128/256) | May improve composition at 256-dim | Medium |
+| 168-dim 2K BPE harmonic test | Does more vocabulary force more harmonics? | Small |
 | Wikitext-103 training pipeline | Validate architecture on real English | Medium |
-| Low-rank lm_head | Reduce output projection cost at small dims | Medium |
-| Stochastic resonance integration | Validated -8.8% perplexity improvement (α=0.05) | Small |
-| Batched inference dispatch | Use engine's existing batch patterns in wave-server | Medium |
 | fp16 for linear ops | Halve memory and PCIe transfer size | Medium |
-| Speculative decoding | Lower per-token latency for serving | Large |
 
 ## Important: Model Compatibility
 
