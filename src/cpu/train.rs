@@ -557,9 +557,12 @@ pub fn run_training(config: TrainConfig) {
                 if h.entropy > 0.60 && (h.theta_disc > 2.0 * h.delta_theta_disc || h.delta_theta_disc > 2.0 * h.theta_disc) {
                     eprintln!("  [enc-health {}] WARNING: entropy={:.3} θ={:.2}x Δθ={:.2}x — encoding drift",
                         iter, h.entropy, h.theta_disc, h.delta_theta_disc);
-                } else if iter % (config.health_interval * 5) == 0 {
-                    eprintln!("  [enc-health {}] θ={:.2}x Δθ={:.2}x entropy={:.3} top=band{} ({:.1}x)",
-                        iter, h.theta_disc, h.delta_theta_disc, h.entropy, h.top_band, h.concentration);
+                } else if iters_into_run % (config.health_interval * 5) == 0 {
+                    let thd_str = if let Some(ref d) = h.distortion {
+                        format!(" THD={:.3} gain={:.2}", d.thd_total, d.gain_max)
+                    } else { String::new() };
+                    eprintln!("  [enc-health {}] θ={:.2}x Δθ={:.2}x entropy={:.3} top=band{} ({:.1}x){}",
+                        iter, h.theta_disc, h.delta_theta_disc, h.entropy, h.top_band, h.concentration, thd_str);
                 }
             }
         }

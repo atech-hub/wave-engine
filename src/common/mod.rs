@@ -20,3 +20,4 @@ pub mod scale;
 pub mod sub_harmonic;
 pub mod wave_decode;
 pub mod encoding_health;
+pub mod ode_distortion;

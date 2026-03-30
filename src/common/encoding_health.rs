@@ -18,6 +18,8 @@ pub struct HealthSample {
     pub top_band: usize,
     pub concentration: f32,
     pub bimodal_score: f32,
+    // ODE distortion (averaged across layers)
+    pub distortion: Option<crate::common::ode_distortion::OdeDistortion>,
 }
 
 /// Fixed reference tokens — hard-coded for determinism.
@@ -94,6 +96,17 @@ pub fn sample(
     // 4. Bimodal score (CV of circular variances)
     let bimodal = compute_bimodal_score(hidden, n_bands);
 
+    // 5. ODE distortion — measure from the last layer's cached precond/kerr_out
+    let distortion = if let Some(ref fc) = cache.block_caches.last().and_then(|bc| bc.ffn_backend_cache.as_ref()) {
+        if !fc.precond.is_empty() && !fc.kerr_out.is_empty() {
+            // Use first position as representative
+            let omega: Vec<f32> = (0..n_bands).map(|k| (k + 1) as f32 / n_bands as f32).collect();
+            Some(crate::common::ode_distortion::measure_distortion(
+                &fc.precond[0], &fc.kerr_out[0], &omega, n_bands, 16,
+            ))
+        } else { None }
+    } else { None };
+
     Some(HealthSample {
         theta_disc: cbd.per_band_ratio,
         delta_theta_disc: cbd.diff_phase_ratio,
@@ -101,6 +114,7 @@ pub fn sample(
         top_band: cb.most_coupled_band.0,
         concentration: cb.most_coupled_band.1,
         bimodal_score: bimodal,
+        distortion,
     })
 }
 
@@ -121,8 +135,14 @@ fn compute_bimodal_score(hidden: &[Vec<f32>], n_bands: usize) -> f32 {
 
 /// Format health sample as JSON fragment for JSONL embedding.
 pub fn to_json(h: &HealthSample) -> String {
+    let dist_str = if let Some(ref d) = h.distortion {
+        format!(",{}", crate::common::ode_distortion::to_json(d))
+    } else {
+        String::new()
+    };
     format!(
-        r#""enc_health":{{"θ_disc":{:.2},"Δθ_disc":{:.2},"entropy":{:.3},"top_band":{},"concentration":{:.1},"bimodal":{:.2}}}"#,
-        h.theta_disc, h.delta_theta_disc, h.entropy, h.top_band, h.concentration, h.bimodal_score
-    )
+        r#""enc_health":{{"θ_disc":{:.2},"Δθ_disc":{:.2},"entropy":{:.3},"top_band":{},"concentration":{:.1},"bimodal":{:.2}}}{}
+"#,
+        h.theta_disc, h.delta_theta_disc, h.entropy, h.top_band, h.concentration, h.bimodal_score, dist_str
+    ).trim().to_string()
 }
