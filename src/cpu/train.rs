@@ -484,11 +484,29 @@ pub fn run_training(config: TrainConfig) {
             let clamp_count = crate::ffn_backend::ODE_CLAMP_COUNT.load(std::sync::atomic::Ordering::Relaxed);
             let max_mag = f32::from_bits(crate::ffn_backend::ODE_MAX_MAG.load(std::sync::atomic::Ordering::Relaxed));
             let agc = crate::ffn_backend::agc_stats();
+            // ODE param values and gradient norms (when learnable)
+            let ode_str = if !config.freeze_ode {
+                let mut parts = Vec::new();
+                for (l, block) in model.blocks.iter().enumerate() {
+                    let a = block.ffn.kerr.alpha;
+                    let b = block.ffn.kerr.beta;
+                    let g_mean: f32 = block.ffn.kerr.gamma_raw.iter().map(|&g| {
+                        if g > 20.0 { g } else { (1.0 + g.exp()).ln() } // softplus
+                    }).sum::<f32>() / block.ffn.kerr.gamma_raw.len() as f32;
+                    // Gradient norms for ODE params
+                    let a_gn = total_grads.get(l * per_layer + per_layer - 2).copied().unwrap_or(0.0).abs();
+                    let b_gn = total_grads.get(l * per_layer + per_layer - 1).copied().unwrap_or(0.0).abs();
+                    parts.push(format!(r#"{{"a":{:.4},"b":{:.4},"g":{:.4}}}"#, a, b, g_mean));
+                }
+                format!(r#","ode_params":[{}]"#, parts.join(","))
+            } else {
+                String::new()
+            };
             writeln!(log_writer,
-                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}}}"#,
+                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}{}}}"#,
                 iter, total_loss, current_lr, iter_start.elapsed().as_millis(), nan_skip_count,
                 model_gn, head_gn, head_pct, layer_str, clamp_count, max_mag,
-                agc.threshold, agc.ema_mean, agc.ema_std
+                agc.threshold, agc.ema_mean, agc.ema_std, ode_str
             ).ok();
         } else {
             writeln!(log_writer,
