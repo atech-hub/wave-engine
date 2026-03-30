@@ -442,8 +442,9 @@ pub fn run_training(config: TrainConfig) {
 
         // Head LR floor: boost head gradients when effective LR drops too low.
         // The lm_head gradient starves during sustained training (71% → 9%).
-        // This ensures the output layer can track the evolving representation.
-        if config.head_lr_floor > 0.0 && current_lr < config.head_lr_floor {
+        // Only activate after warmup — cosine peaks within first 500 iters.
+        let iters_into_run = iter - start_iter;
+        if config.head_lr_floor > 0.0 && iters_into_run > 500 && current_lr < config.head_lr_floor {
             let boost = config.head_lr_floor / current_lr.max(1e-8);
             let lm_start = n_trainable.saturating_sub(
                 if model.learnable_ode { 0 } else { 0 } + // ODE params are before lm_head
