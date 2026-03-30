@@ -43,6 +43,7 @@ pub fn ffn_forward_via_backend(
     stencil: Option<&crate::fft_ode::StencilFft>,
     ping_pong: Option<(&crate::ffn_gpu::FfnGpuBuffers, &crate::gpu_pipelines::GpuBackend)>,
     gpu_kernel: Option<(&crate::fft_ode::GpuKernelFft, &crate::gpu_pipelines::GpuBackend)>,
+    freeze_ode: bool,
 ) -> (Vec<Vec<f32>>, FfnCache) {
     let t = x.len();
     let n_embd = x[0].len();
@@ -72,25 +73,36 @@ pub fn ffn_forward_via_backend(
     ODE_CLAMP_COUNT.store(clamp_count, std::sync::atomic::Ordering::Relaxed);
     ODE_MAX_MAG.store(max_pre_clamp_mag.to_bits(), std::sync::atomic::Ordering::Relaxed);
 
-    // 3. ODE: GPU fused when available (one submit, zero readbacks between steps),
-    //    CPU FFT fallback, sequential last resort
+    // 3. ODE: when !freeze_ode, use caching forward for backward pass.
+    //    When freeze_ode, use the fast path (GPU/FFT/sequential, no cache).
     let _t_ode = std::time::Instant::now();
-    let (kerr_out, ode_device): (Vec<Vec<f32>>, &str) = if let Some((_bufs, gpu_be)) = ping_pong {
+    let (kerr_out, ode_caches, ode_device): (Vec<Vec<f32>>, Option<Vec<crate::cpu::ode_backward::OdeForwardCache>>, &str) =
+    if !freeze_ode {
+        // Caching forward — stores intermediates for backward
+        let mut outs = Vec::with_capacity(t);
+        let mut caches = Vec::with_capacity(t);
+        for p in &precond {
+            let (out, cache) = crate::cpu::ode_backward::ode_forward_with_cache(p, &weights.kerr);
+            outs.push(out);
+            caches.push(cache);
+        }
+        (outs, Some(caches), "CPU-cached")
+    } else if let Some((_bufs, gpu_be)) = ping_pong {
         // GPU: perturbative (single dispatch) or fused RK4 based on rk4_n_steps
         let out = if weights.kerr.rk4_n_steps <= 1 {
             gpu_be.gpu_kerr_ode_perturbative_batch(&weights.kerr, &precond)
         } else {
             gpu_be.gpu_kerr_ode_batch_fused(&weights.kerr, &precond)
         };
-        (out, if weights.kerr.rk4_n_steps <= 1 { "GPU-perturbative" } else { "GPU-fused" })
+        (out, None, if weights.kerr.rk4_n_steps <= 1 { "GPU-perturbative" } else { "GPU-fused" })
     } else if let Some(st) = stencil {
         let out = precond.iter().map(|p| {
             crate::fft_ode::kerr_ode_fft(p, &weights.kerr.gamma_raw, &weights.kerr.omega,
                 weights.kerr.alpha, weights.kerr.beta, weights.kerr.rk4_n_steps, st)
         }).collect();
-        (out, "CPU-FFT")
+        (out, None, "CPU-FFT")
     } else {
-        (cpu.kerr_ode_batch(&weights.kerr, &precond), "CPU-seq")
+        (cpu.kerr_ode_batch(&weights.kerr, &precond), None, "CPU-seq")
     };
     let _ode_dur = _t_ode.elapsed();
 
@@ -123,6 +135,7 @@ pub fn ffn_forward_via_backend(
         mae_in_sq, mae_in_act, precond,
         kerr_out, mae_out_sq, mae_out_act,
         regulated,
+        ode_caches,
     };
 
     (output, cache)
@@ -166,8 +179,22 @@ pub fn ffn_backward_via_backend(
     // ─── d_kerr_out = d_regulated (residual) + d_from_mae_out_squeeze ───
     let d_kerr_out = cpu.vec_add_batch(&d_regulated, &d_kerr_from_mae);
 
-    // ─── ODE backward: identity (frozen) ───
-    let d_precond = d_kerr_out;
+    // ─── ODE backward ───
+    let (d_precond, ode_param_grads): (Vec<Vec<f32>>, Option<Vec<crate::cpu::ode_backward::OdeParamGrads>>) =
+    if let Some(ref ode_caches) = cache.ode_caches {
+        // Full backward through RK4
+        let mut d_preconds = Vec::with_capacity(t);
+        let mut param_grads = Vec::with_capacity(t);
+        for (pos, d_ko) in d_kerr_out.iter().enumerate() {
+            let (d_p, pg) = crate::cpu::ode_backward::ode_backward(d_ko, &ode_caches[pos], &weights.kerr);
+            d_preconds.push(d_p);
+            param_grads.push(pg);
+        }
+        (d_preconds, Some(param_grads))
+    } else {
+        // Identity (frozen ODE — legacy behaviour)
+        (d_kerr_out, None)
+    };
 
     // ─── Maestro_in: CPU (dim=16) ───
     let d_mae_in_act = cpu.linear_backward_dx_batch(&d_precond, &weights.maestro_in.process_1.w);
@@ -179,12 +206,29 @@ pub fn ffn_backward_via_backend(
     // ─── d_input = d_precond (residual) + d_from_mae_in_squeeze ───
     let d_input = cpu.vec_add_batch(&d_precond, &d_input_from_mae);
 
+    // Accumulate ODE param gradients across positions
+    let (d_kerr_gamma_raw, d_kerr_alpha, d_kerr_beta) = if let Some(ref pg_vec) = ode_param_grads {
+        let nb = pg_vec[0].d_gamma_raw.len();
+        let mut d_gr = vec![0.0f32; nb];
+        let mut d_a = 0.0f32;
+        let mut d_b = 0.0f32;
+        for pg in pg_vec {
+            for k in 0..nb { d_gr[k] += pg.d_gamma_raw[k]; }
+            d_a += pg.d_alpha;
+            d_b += pg.d_beta;
+        }
+        (Some(d_gr), Some(d_a), Some(d_b))
+    } else {
+        (None, None, None)
+    };
+
     let grads = FfnGrads {
         d_out_proj_w, d_out_proj_b,
         d_mae_out_pr_w, d_mae_out_pr_b,
         d_mae_out_sq_w, d_mae_out_sq_b,
         d_mae_in_pr_w, d_mae_in_pr_b,
         d_mae_in_sq_w, d_mae_in_sq_b,
+        d_kerr_gamma_raw, d_kerr_alpha, d_kerr_beta,
     };
 
     (d_input, grads)
@@ -200,6 +244,8 @@ pub struct FfnCache {
     pub mae_out_sq: Vec<Vec<f32>>,
     pub mae_out_act: Vec<Vec<f32>>,
     pub regulated: Vec<Vec<f32>>,
+    /// ODE forward caches for backward pass — None when --freeze-ode is active
+    pub ode_caches: Option<Vec<crate::cpu::ode_backward::OdeForwardCache>>,
 }
 
 /// FFN weight gradients.
@@ -214,4 +260,8 @@ pub struct FfnGrads {
     pub d_mae_in_pr_b: Vec<f32>,
     pub d_mae_in_sq_w: Vec<Vec<f32>>,
     pub d_mae_in_sq_b: Vec<f32>,
+    // ODE parameter gradients (None when --freeze-ode)
+    pub d_kerr_gamma_raw: Option<Vec<f32>>,  // [n_bands]
+    pub d_kerr_alpha: Option<f32>,
+    pub d_kerr_beta: Option<f32>,
 }

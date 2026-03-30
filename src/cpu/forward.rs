@@ -80,7 +80,8 @@ pub fn forward_with_cache(
 
         // FFN forward via backend (kerr-engine pattern: all ops through same device)
         let _tf = std::time::Instant::now();
-        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel);
+        let freeze_ode = !d.learnable_ode;
+        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, freeze_ode);
         let ffn_dur = _tf.elapsed();
 
         // Attention (CPU — frozen, harmonic coherence scoring)
@@ -117,17 +118,39 @@ pub fn forward_with_cache(
         .map(|h| layer_norm(h, &model.ln_f.weight, &model.ln_f.bias))
         .collect();
 
-    let decode_table = if d.tied { &model.wte } else { &model.lm_head };
-    let tied_temp = if d.tied { model.tied_temperature } else { 1.0 };
-    let logits: Vec<Vec<f32>> = post_ln_f.par_iter().map(|normed| {
-        let mut l = vec![0.0f32; model.vocab_size];
-        for v in 0..model.vocab_size {
-            let mut sum = 0.0f32;
-            for j in 0..d.n_embd { sum += decode_table[v][j] * normed[j]; }
-            l[v] = sum * tied_temp;
-        }
-        l
-    }).collect();
+    let logits: Vec<Vec<f32>> = if let Some(ref wds) = model.wd_state {
+        crate::common::wave_decode::forward(&post_ln_f, wds)
+    } else if model.lm_rank > 0 {
+        // Low-rank: hidden → lm_down → lm_up → logits
+        let rank = model.lm_rank;
+        post_ln_f.par_iter().map(|normed| {
+            let mut bottleneck = vec![0.0f32; rank];
+            for r in 0..rank {
+                let mut sum = 0.0f32;
+                for j in 0..d.n_embd { sum += model.lm_down[r][j] * normed[j]; }
+                bottleneck[r] = sum;
+            }
+            let mut l = vec![0.0f32; model.vocab_size];
+            for v in 0..model.vocab_size {
+                let mut sum = 0.0f32;
+                for r in 0..rank { sum += model.lm_up[v][r] * bottleneck[r]; }
+                l[v] = sum;
+            }
+            l
+        }).collect()
+    } else {
+        let decode_table = if d.tied { &model.wte } else { &model.lm_head };
+        let tied_temp = if d.tied { model.tied_temperature } else { 1.0 };
+        post_ln_f.par_iter().map(|normed| {
+            let mut l = vec![0.0f32; model.vocab_size];
+            for v in 0..model.vocab_size {
+                let mut sum = 0.0f32;
+                for j in 0..d.n_embd { sum += decode_table[v][j] * normed[j]; }
+                l[v] = sum * tied_temp;
+            }
+            l
+        }).collect()
+    };
 
     if profile {
         let total = _t0.elapsed();

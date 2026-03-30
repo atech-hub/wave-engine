@@ -49,7 +49,11 @@ pub struct Gradients {
     pub ln_f_w: Vec<f32>,
     pub ln_f_b: Vec<f32>,
     pub lm_head: Vec<Vec<f32>>,
-    pub tied_temperature: f32, // gradient for tied temperature (0.0 when untied)
+    pub lm_down: Vec<Vec<f32>>,
+    pub lm_up: Vec<Vec<f32>>,
+    pub tied_temperature: f32,
+    // Wave transduction gradients (self-contained)
+    pub wd_grads: Option<crate::common::wave_decode::WaveDecodeGrads>,
 }
 
 pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], d: Dims, gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>, ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>, full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>) -> (f32, Gradients) {
@@ -79,8 +83,11 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         block_ffn_out_proj_b: vec![vec![0.0; d.n_embd]; n_blocks],
         ln_f_w: vec![0.0; d.n_embd],
         ln_f_b: vec![0.0; d.n_embd],
-        lm_head: if d.tied { vec![] } else { vec![vec![0.0; d.n_embd]; vocab_size] },
+        lm_head: if d.wave_decode || d.lm_rank > 0 || d.tied { vec![] } else { vec![vec![0.0; d.n_embd]; vocab_size] },
+        lm_down: if d.lm_rank > 0 { vec![vec![0.0; d.n_embd]; d.lm_rank] } else { vec![] },
+        lm_up: if d.lm_rank > 0 { vec![vec![0.0; d.lm_rank]; vocab_size] } else { vec![] },
         tied_temperature: 0.0,
+        wd_grads: None, // populated by wave_decode::backward when active
     };
 
     // Loss + d_logits
@@ -97,31 +104,74 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
     }
     total_loss /= t as f32;
 
-    // Backward through LM head (no bias)
-    // d_hidden: parallelised over positions (each independent, ~768 floats output)
-    let n_embd = d.n_embd; // local alias for closures
-    let decode_table = if d.tied { &model.wte } else { &model.lm_head };
-    let mut d_hidden: Vec<Vec<f32>> = (0..t).into_par_iter().map(|pos| {
-        let mut d_h = vec![0.0f32; n_embd];
-        for j in 0..n_embd {
+    // Backward through output decoder
+    let n_embd = d.n_embd;
+    let mut d_hidden: Vec<Vec<f32>> = vec![vec![0.0f32; n_embd]; t];
+
+    if let Some(ref wds) = model.wd_state {
+        let (dh, wg) = crate::common::wave_decode::backward(&d_logits, &cache.post_ln_f, wds);
+        d_hidden = dh;
+        grads.wd_grads = Some(wg);
+    } else if d.lm_rank > 0 {
+        // Low-rank backward: logits = lm_up @ (lm_down @ hidden)
+        let rank = d.lm_rank;
+        for pos in 0..t {
+            let normed = &cache.post_ln_f[pos];
+            // Recompute bottleneck
+            let mut bottleneck = vec![0.0f32; rank];
+            for r in 0..rank {
+                let mut sum = 0.0f32;
+                for j in 0..n_embd { sum += model.lm_down[r][j] * normed[j]; }
+                bottleneck[r] = sum;
+            }
+            // d_bottleneck from d_logits through lm_up
+            let mut d_bottleneck = vec![0.0f32; rank];
+            for r in 0..rank {
+                for v in 0..vocab_size {
+                    d_bottleneck[r] += model.lm_up[v][r] * d_logits[pos][v];
+                }
+            }
+            // d_hidden from d_bottleneck through lm_down
+            for j in 0..n_embd {
+                for r in 0..rank {
+                    d_hidden[pos][j] += model.lm_down[r][j] * d_bottleneck[r];
+                }
+            }
+            // Accumulate lm_up gradients
             for v in 0..vocab_size {
-                d_h[j] += decode_table[v][j] * d_logits[pos][v];
+                for r in 0..rank {
+                    grads.lm_up[v][r] += d_logits[pos][v] * bottleneck[r];
+                }
+            }
+            // Accumulate lm_down gradients
+            for r in 0..rank {
+                for j in 0..n_embd {
+                    grads.lm_down[r][j] += d_bottleneck[r] * normed[j];
+                }
             }
         }
-        d_h
-    }).collect();
-    if !d.tied {
-        // lm_head weight gradients — sequential (shared accumulator, no temp allocation)
-        for pos in 0..t {
-            for v in 0..vocab_size {
-                for j in 0..d.n_embd {
-                    grads.lm_head[v][j] += d_logits[pos][v] * cache.post_ln_f[pos][j];
+    } else {
+        // Full-rank backward (existing)
+        let decode_table = if d.tied { &model.wte } else { &model.lm_head };
+        d_hidden = (0..t).into_par_iter().map(|pos| {
+            let mut d_h = vec![0.0f32; n_embd];
+            for j in 0..n_embd {
+                for v in 0..vocab_size {
+                    d_h[j] += decode_table[v][j] * d_logits[pos][v];
+                }
+            }
+            d_h
+        }).collect();
+        if !d.tied {
+            for pos in 0..t {
+                for v in 0..vocab_size {
+                    for j in 0..d.n_embd {
+                        grads.lm_head[v][j] += d_logits[pos][v] * cache.post_ln_f[pos][j];
+                    }
                 }
             }
         }
     }
-    // tied_temperature gradient: d_temp = sum over all logits of (raw_logit * d_logit)
-    // But for simplicity, we let the optimizer handle it through flatten_grads
 
     // Backward through final LN
     let mut d_pre_ln_f: Vec<Vec<f32>> = Vec::with_capacity(t);
@@ -164,6 +214,12 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
             for i in 0..fg.d_mae_in_pr_b.len() { grads.block_ffn_mae_in_pr_b[block_idx][i] += fg.d_mae_in_pr_b[i]; }
             for i in 0..fg.d_mae_in_sq_w.len() { for j in 0..fg.d_mae_in_sq_w[i].len() { grads.block_ffn_mae_in_sq_w[block_idx][i][j] += fg.d_mae_in_sq_w[i][j]; } }
             for i in 0..fg.d_mae_in_sq_b.len() { grads.block_ffn_mae_in_sq_b[block_idx][i] += fg.d_mae_in_sq_b[i]; }
+            // ODE param gradients
+            if let Some(ref d_gr) = fg.d_kerr_gamma_raw {
+                for k in 0..d_gr.len() { grads.block_ffn_kerr_gamma_raw[block_idx][k] += d_gr[k]; }
+            }
+            if let Some(d_a) = fg.d_kerr_alpha { grads.block_ffn_kerr_alpha[block_idx] += d_a; }
+            if let Some(d_b) = fg.d_kerr_beta { grads.block_ffn_kerr_beta[block_idx] += d_b; }
             d_input
         } else {
             ffn_backward(&block.ffn, &bc.normed, &d_ffn_out, &mut grads, block_idx, bc, d, gpu, ping_pong)
@@ -431,7 +487,13 @@ pub fn flatten_grads_ex(grads: &Gradients, tied: bool) -> Vec<f32> {
     }
     g.extend_from_slice(&grads.ln_f_w);
     g.extend_from_slice(&grads.ln_f_b);
-    if !tied {
+    if let Some(ref wg) = grads.wd_grads {
+        g.extend_from_slice(&crate::common::wave_decode::flatten_grads(wg));
+    } else if !grads.lm_down.is_empty() {
+        // Low-rank
+        for row in &grads.lm_down { g.extend_from_slice(row); }
+        for row in &grads.lm_up { g.extend_from_slice(row); }
+    } else if !tied {
         for row in &grads.lm_head { g.extend_from_slice(row); }
     } else {
         g.push(grads.tied_temperature);
