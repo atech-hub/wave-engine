@@ -76,6 +76,7 @@ pub fn print_help() {
     println!("    --health-interval N  Encoding health sample every N iters (0=off)  [default: 0]");
     println!("                        Logs θ/Δθ balance, entropy, coupling to JSONL");
     println!("    --freeze-ode        Freeze ODE params (identity backward — legacy behaviour)");
+    println!("    --head-lr-floor F   Minimum effective LR for lm_head (prevents starvation)");
     println!();
     println!("    Always-on telemetry (no flag needed):");
     println!("      training_log_cpu.jsonl    CPU tier telemetry (per-iteration)");

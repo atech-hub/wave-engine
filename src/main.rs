@@ -220,5 +220,6 @@ fn main() {
         unfreeze_phases: std::env::args().any(|a| a == "--unfreeze-phases"),
         health_interval: parse_flag("--health-interval", 0),
         freeze_ode: std::env::args().any(|a| a == "--freeze-ode"),
+        head_lr_floor: parse_flag("--head-lr-floor", 0.0),
     });
 }

@@ -164,6 +164,7 @@ pub struct TrainConfig {
     pub unfreeze_phases: bool,
     pub health_interval: usize, // 0 = disabled
     pub freeze_ode: bool,
+    pub head_lr_floor: f32, // 0.0 = disabled, e.g. 0.00003 = 30% of 1e-4
 }
 
 pub fn run_training(config: TrainConfig) {
@@ -438,6 +439,23 @@ pub fn run_training(config: TrainConfig) {
 
         let t_optim = monitor.start();
         clip_grad_norm(&mut total_grads, 1.0);
+
+        // Head LR floor: boost head gradients when effective LR drops too low.
+        // The lm_head gradient starves during sustained training (71% → 9%).
+        // This ensures the output layer can track the evolving representation.
+        if config.head_lr_floor > 0.0 && current_lr < config.head_lr_floor {
+            let boost = config.head_lr_floor / current_lr.max(1e-8);
+            let lm_start = n_trainable.saturating_sub(
+                if model.learnable_ode { 0 } else { 0 } + // ODE params are before lm_head
+                if model.lm_rank > 0 { model.lm_rank * model.ln_f.weight.len() + model.vocab_size * model.lm_rank }
+                else if model.wd_state.is_some() { crate::common::wave_decode::param_count(model.wd_state.as_ref().unwrap()) }
+                else { model.vocab_size * model.ln_f.weight.len() }
+            );
+            for i in lm_start..total_grads.len() {
+                total_grads[i] *= boost;
+            }
+        }
+
         let mut params = flatten_params_ex(&model, config.tied);
         optimizer.step(&mut params, &total_grads);
         unflatten_params_ex(&mut model, &params, config.tied);
