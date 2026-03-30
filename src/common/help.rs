@@ -74,8 +74,9 @@ pub fn print_help() {
     println!("    --monitor         Enable per-section pipeline timing (forward profiling)");
     println!("    --debug-nan       Enable per-layer NaN detection (Candle only, ~6x slower)");
     println!("    --health-interval N  Encoding health sample every N iters (0=off)  [default: 0]");
-    println!("                        Logs θ/Δθ balance, entropy, coupling to JSONL");
+    println!("                        Logs θ/Δθ balance, entropy, coupling, THD to JSONL");
     println!("    --freeze-ode        Freeze ODE params (identity backward — legacy behaviour)");
+    println!("                        Default: ODE α/β/γ are learnable per layer");
     println!("    --head-lr-floor F   Minimum effective LR for lm_head (prevents starvation)");
     println!();
     println!("    Always-on telemetry (no flag needed):");
