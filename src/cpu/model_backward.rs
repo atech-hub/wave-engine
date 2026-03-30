@@ -67,7 +67,7 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         block_ln_b: vec![vec![0.0; d.n_embd]; n_blocks],
         block_ln_ffn_w: vec![vec![0.0; d.n_embd]; n_blocks],
         block_ln_ffn_b: vec![vec![0.0; d.n_embd]; n_blocks],
-        block_ffn_kerr_gamma_raw: vec![vec![0.0; d.n_bands]; n_blocks],
+        block_ffn_kerr_gamma_raw: if d.learnable_ode { vec![vec![0.0; d.n_bands]; n_blocks] } else { vec![vec![]; n_blocks] },
         block_ffn_kerr_omega: vec![vec![0.0; d.n_bands]; n_blocks],
         block_ffn_kerr_alpha: vec![0.0; n_blocks],
         block_ffn_kerr_beta: vec![0.0; n_blocks],
@@ -484,6 +484,12 @@ pub fn flatten_grads_ex(grads: &Gradients, tied: bool) -> Vec<f32> {
         g.extend_from_slice(&grads.block_ffn_mae_out_pr_b[b]);
         for row in &grads.block_ffn_out_proj_w[b] { g.extend_from_slice(row); }
         g.extend_from_slice(&grads.block_ffn_out_proj_b[b]);
+        // ODE param gradients (when learnable)
+        if !grads.block_ffn_kerr_gamma_raw[b].is_empty() {
+            g.extend_from_slice(&grads.block_ffn_kerr_gamma_raw[b]);
+            g.push(grads.block_ffn_kerr_alpha[b]);
+            g.push(grads.block_ffn_kerr_beta[b]);
+        }
     }
     g.extend_from_slice(&grads.ln_f_w);
     g.extend_from_slice(&grads.ln_f_b);

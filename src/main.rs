@@ -219,5 +219,6 @@ fn main() {
         wave_decode: std::env::args().any(|a| a == "--wave-decode"),
         unfreeze_phases: std::env::args().any(|a| a == "--unfreeze-phases"),
         health_interval: parse_flag("--health-interval", 0),
+        freeze_ode: std::env::args().any(|a| a == "--freeze-ode"),
     });
 }
