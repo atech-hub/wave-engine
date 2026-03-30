@@ -77,31 +77,36 @@ pub fn measure_distortion(
     let excess_phase_max = excess_shifts.iter().cloned().fold(0.0f32, f32::max);
     let n_phase_distorted = excess_shifts.iter().filter(|&&e| e > 0.3).count();
 
-    // 3. THD — harmonic energy detection
-    let median_mag_in = {
-        let mut sorted = mag_in.clone();
+    // 3. THD — harmonic energy redistribution (normalised by total energy)
+    // Damping reduces all bands uniformly, masking absolute energy changes.
+    // Measure energy SHARE changes — did harmonic positions get a larger share?
+    let total_in_energy: f32 = mag_in.iter().map(|m| m * m).sum::<f32>().max(1e-10);
+    let total_out_energy: f32 = mag_out.iter().map(|m| m * m).sum::<f32>().max(1e-10);
+    let share_in: Vec<f32> = mag_in.iter().map(|m| m * m / total_in_energy).collect();
+    let share_out: Vec<f32> = mag_out.iter().map(|m| m * m / total_out_energy).collect();
+
+    let median_share_in = {
+        let mut sorted = share_in.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         sorted[n_bands / 2]
     };
 
     let mut thd_per_band = vec![0.0f32; n_bands];
     for k in 0..n_bands {
-        if mag_in[k] < median_mag_in { continue; } // only measure driven bands
+        if share_in[k] < median_share_in { continue; } // only measure driven bands
 
-        let fund_energy = mag_out[k] * mag_out[k];
-        let mut harmonic_energy = 0.0f32;
+        let fund_share = share_out[k];
+        let mut harmonic_shift = 0.0f32;
 
         for &mult in &[3usize, 5, 7] {
-            let h = (mult * (k + 1)) % n_bands; // harmonic position
-            if h == k { continue; } // skip self
-            // Energy gain at harmonic position
-            let e_in = mag_in[h] * mag_in[h];
-            let e_out = mag_out[h] * mag_out[h];
-            let gained = (e_out - e_in).max(0.0);
-            harmonic_energy += gained;
+            let h = (mult * (k + 1)) % n_bands;
+            if h == k { continue; }
+            // Did energy share increase at harmonic position?
+            let shift = (share_out[h] - share_in[h]).max(0.0);
+            harmonic_shift += shift * shift;
         }
 
-        thd_per_band[k] = (harmonic_energy).sqrt() / fund_energy.sqrt().max(1e-8);
+        thd_per_band[k] = harmonic_shift.sqrt() / fund_share.max(1e-8);
     }
 
     let thd_total = {
@@ -113,17 +118,16 @@ pub fn measure_distortion(
         .map(|(i, &v)| (i, v)).unwrap_or((0, 0.0));
     let n_thd_over_10pct = thd_per_band.iter().filter(|&&t| t > 0.10).count();
 
-    // 4. Intermodulation — energy appearing at non-input frequencies
-    let total_out_energy: f32 = mag_out.iter().map(|m| m * m).sum();
+    // 4. Intermodulation — energy share increase at non-driven positions
     let mut intermod_energy = 0.0f32;
     for k in 0..n_bands {
-        if mag_in[k] < median_mag_in {
-            // Weakly-driven band — energy here is likely intermod
-            let gained = (mag_out[k] * mag_out[k] - mag_in[k] * mag_in[k]).max(0.0);
-            intermod_energy += gained;
+        if share_in[k] < median_share_in {
+            // Weakly-driven band — share increase here is likely intermod
+            let shift = (share_out[k] - share_in[k]).max(0.0);
+            intermod_energy += shift;
         }
     }
-    let intermod_ratio = intermod_energy / total_out_energy.max(1e-8);
+    let intermod_ratio = intermod_energy;
 
     OdeDistortion {
         gain_mean, gain_max, n_compressed,
