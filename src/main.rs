@@ -274,8 +274,10 @@ fn main() {
             vocab: std::sync::Arc::new(vocab),
             dims,
             stencil: std::sync::Arc::new(stencil),
-            model_name: "wave-engine".to_string(),
+            model_name: parse_flag("--model-name", "wave-engine".to_string()),
             api_key: std::env::args().skip_while(|a| a != "--api-key").nth(1),
+            host: parse_flag("--host", "127.0.0.1".to_string()),
+            port: parse_flag("--port", 8080),
         });
 
         serve_tier::server::run_server(state);

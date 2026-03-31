@@ -24,6 +24,8 @@ pub struct AppState {
     pub stencil: Arc<crate::fft_ode::StencilFft>,
     pub model_name: String,
     pub api_key: Option<String>,
+    pub host: String,
+    pub port: u16,
 }
 
 /// Bearer token auth middleware.
@@ -69,8 +71,8 @@ pub fn run_server(state: Arc<AppState>) {
 }
 
 async fn run(state: Arc<AppState>) {
-    let host = "127.0.0.1";
-    let port = 8080; // TODO: from config
+    let host = state.host.clone();
+    let port = state.port;
     let has_auth = state.api_key.is_some();
 
     let protected = Router::new()
