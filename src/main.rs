@@ -15,6 +15,8 @@ mod cpu;
 mod wgpu_tier;
 #[allow(dead_code)]
 mod candle_tier;
+#[cfg(feature = "serve")]
+mod serve_tier;
 
 // Re-export shim — existing code uses crate::model, crate::backend, etc.
 // These map to the new physical locations without changing any imports.
@@ -209,6 +211,74 @@ fn main() {
             beta: parse_flag("--beta", parse_flag("--alpha", 0.1)),
             temperature: parse_flag("--temperature", 0.0),
         });
+        return;
+    }
+
+    // ─── Serve mode (requires --features serve) ───
+    #[cfg(feature = "serve")]
+    if std::env::args().any(|a| a == "--serve") {
+        let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)
+            .expect("--serve requires --resume <checkpoint>");
+        let n_layers: usize = parse_flag("--layers", N_LAYERS);
+        let n_bands: usize = parse_flag("--n-bands", N_BANDS);
+        let n_head: usize = parse_flag("--n-head", N_HEAD);
+        let out_proj_groups: usize = parse_flag("--out-proj-groups", 6);
+        let alpha: f32 = parse_flag("--alpha", 0.1);
+        let beta: f32 = parse_flag("--beta", parse_flag("--alpha", 0.1));
+        let use_bpe = std::env::args().any(|a| a == "--bpe");
+        let tokenizer_path: String = parse_flag("--tokenizer", "data/tokenizer.json".to_string());
+
+        // Load checkpoint
+        println!("Loading checkpoint: {resume_path}");
+        let (params, ck_vocab, ck_iter, _lr, _rng, _at, _am, _av, _groups) =
+            wave_checkpoint::load_checkpoint(&resume_path);
+
+        // Build model
+        let dims = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_learnable_ode(false).with_corrector(true);
+        let dims_ext = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true);
+        let mut model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_ext, alpha, beta);
+        let ext_count = common::wave_model::count_trainable_ex(&model, false);
+        if params.len() == ext_count {
+            common::wave_model::unflatten_params_ex(&mut model, &params, false);
+            println!("  Loaded {} params (with ODE/corrector)", params.len());
+        } else {
+            let dims_base = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+                .with_learnable_ode(false).with_corrector(false);
+            model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_base, alpha, beta);
+            unflatten_params(&mut model, &params);
+            println!("  Loaded {} params (base)", params.len());
+        }
+        model.learnable_ode = false;
+        println!("  Model: {}L, {}bands, {}dim, {}vocab, iter {}",
+            n_layers, n_bands, n_bands * 2, ck_vocab, ck_iter);
+
+        // Init AGC from model coupling
+        crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+
+        // Build vocab
+        let vocab = if use_bpe {
+            let bpe = bpe::BpeTokenizer::from_file(&tokenizer_path);
+            println!("  BPE tokenizer: {} vocab", ck_vocab);
+            serve_tier::prompt::Vocab::from_bpe(bpe, ck_vocab)
+        } else {
+            println!("  Char-level: {} vocab", ck_vocab);
+            serve_tier::prompt::Vocab::from_chars(ck_vocab)
+        };
+
+        let stencil = fft_ode::StencilFft::new(n_bands);
+
+        let state = std::sync::Arc::new(serve_tier::server::AppState {
+            model: std::sync::Arc::new(model),
+            vocab: std::sync::Arc::new(vocab),
+            dims,
+            stencil: std::sync::Arc::new(stencil),
+            model_name: "wave-engine".to_string(),
+            api_key: std::env::args().skip_while(|a| a != "--api-key").nth(1),
+        });
+
+        serve_tier::server::run_server(state);
         return;
     }
 

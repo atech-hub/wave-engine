@@ -13,6 +13,7 @@ default-run = "wave-engine"
 [features]
 default = []
 candle-backend = ["dep:candle-core", "dep:candle-nn", "dep:candle-cuda-vmm"]
+serve = ["dep:axum", "dep:tokio", "dep:uuid", "dep:tokio-stream"]
 
 [dependencies]
 # Always available
@@ -28,6 +29,12 @@ rustfft = "6.2"
 
 # Parallel attention heads
 rayon = "1.10"
+
+# Serve tier (optional — HTTP API for inference)
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
 
 # Candle backend (optional, with CUDA support)
 candle-core = { version = "0.9", optional = true, features = ["cuda"] }
