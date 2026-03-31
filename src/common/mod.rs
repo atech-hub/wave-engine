@@ -22,3 +22,4 @@ pub mod wave_decode;
 pub mod encoding_health;
 pub mod ode_distortion;
 pub mod generate;
+pub mod kv_cache;

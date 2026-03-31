@@ -1,10 +1,10 @@
-//! Generation loop using the engine's training forward pass.
-//! NO reimplemented forward — calls forward_with_cache from cpu/forward.rs.
-//! This guarantees inference matches training: same ODE, corrector, AGC.
+//! Generation loop using KV-cache for fast autoregressive inference.
+//! Uses common/kv_cache.rs which calls the same FFN forward as training.
+//! Attention is computed incrementally — O(T) per new token, not O(T²).
 
 use crate::common::wave_model::WavePacketModel;
 use crate::common::dims::Dims;
-use crate::cpu::forward::forward_with_cache;
+use crate::common::kv_cache;
 use crate::common::rng::Rng;
 use super::prompt::Vocab;
 
@@ -26,7 +26,7 @@ pub struct TokenEvent {
     pub done: bool,
 }
 
-/// Generate all tokens (non-streaming) using engine's forward_with_cache.
+/// Generate all tokens (non-streaming) with KV-cache.
 pub fn generate(
     model: &WavePacketModel,
     prompt_tokens: &[usize],
@@ -36,19 +36,14 @@ pub fn generate(
     stencil: &crate::fft_ode::StencilFft,
 ) -> GenerationResult {
     let mut rng = make_rng();
-    let block_size = dims.block_size;
     let mut tokens = prompt_tokens.to_vec();
     let mut generated = Vec::new();
 
+    // Prefill: process entire prompt, populate cache
+    let mut cache = kv_cache::KvCache::new(model.blocks.len(), dims.n_head);
+    let mut logits = kv_cache::prefill(model, prompt_tokens, dims, &mut cache, stencil);
+
     for _ in 0..config.max_tokens {
-        let start = if tokens.len() > block_size { tokens.len() - block_size } else { 0 };
-        let input = &tokens[start..];
-
-        // SAME forward pass as training — zero reimplementation
-        let cache = forward_with_cache(model, input, dims, None, None, None, Some(stencil), None, None);
-        let logits = cache.logits.last().unwrap();
-
-        let mut logits = logits.clone();
         if let Some(penalty) = config.repetition_penalty {
             if penalty != 1.0 {
                 apply_repetition_penalty(&mut logits, &tokens, penalty);
@@ -58,13 +53,17 @@ pub fn generate(
         let token = sample_token(&logits, config, &mut rng);
         tokens.push(token);
         generated.push(token);
+
+        // Forward one: O(T) using cached attention state
+        let pos = tokens.len() - 1;
+        logits = kv_cache::forward_one(model, token, pos, dims, &mut cache, stencil);
     }
 
     let text = vocab.decode(&generated);
     GenerationResult { tokens: generated, text }
 }
 
-/// Generate tokens one at a time, calling on_token for each (streaming).
+/// Generate tokens one at a time with KV-cache, calling on_token for each (streaming).
 pub fn generate_streaming<F>(
     model: &WavePacketModel,
     prompt_tokens: &[usize],
@@ -77,16 +76,12 @@ pub fn generate_streaming<F>(
     F: FnMut(TokenEvent) -> bool,
 {
     let mut rng = make_rng();
-    let block_size = dims.block_size;
     let mut tokens = prompt_tokens.to_vec();
 
+    let mut cache = kv_cache::KvCache::new(model.blocks.len(), dims.n_head);
+    let mut logits = kv_cache::prefill(model, prompt_tokens, dims, &mut cache, stencil);
+
     for i in 0..config.max_tokens {
-        let start = if tokens.len() > block_size { tokens.len() - block_size } else { 0 };
-        let input = &tokens[start..];
-
-        let cache = forward_with_cache(model, input, dims, None, None, None, Some(stencil), None, None);
-        let mut logits = cache.logits.last().unwrap().clone();
-
         if let Some(penalty) = config.repetition_penalty {
             if penalty != 1.0 {
                 apply_repetition_penalty(&mut logits, &tokens, penalty);
@@ -102,6 +97,9 @@ pub fn generate_streaming<F>(
         if !on_token(TokenEvent { text, done }) {
             break;
         }
+
+        let pos = tokens.len() - 1;
+        logits = kv_cache::forward_one(model, token, pos, dims, &mut cache, stencil);
     }
 }
 
