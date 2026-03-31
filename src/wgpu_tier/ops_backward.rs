@@ -6,6 +6,8 @@
 
 use crate::gpu_pipelines::*;
 use crate::model::*;
+use wgpu::util::DeviceExt;
+
 impl GpuBackend {
     pub(crate) fn gpu_kerr_derivative_backward_batch(
         &self,
@@ -78,13 +80,13 @@ impl GpuBackend {
         (d_r, d_s, d_gamma, d_omega, d_alpha, d_beta)
     }
 
-    /// Batched Kerr-ODE backward: full RK4 backward for all positions simultaneously.
-    /// d_outputs is [n_pos][n_embd], inputs is [n_pos][n_embd].
+    /// Fused Kerr-ODE backward: full RK4 forward+backward in ONE command encoder.
+    /// Eliminates 128 GPU round-trips. All dispatches chained, one submit, one readback.
     /// Returns (d_inputs, d_gamma_raw, d_omega, d_alpha, d_beta).
     pub(crate) fn gpu_kerr_ode_backward_batch(
         &self,
-        d_outputs: &[Vec<f32>],  // [n_pos][n_embd]
-        inputs: &[Vec<f32>],      // [n_pos][n_embd]
+        d_outputs: &[Vec<f32>],
+        inputs: &[Vec<f32>],
         weights: &KerrWeights,
     ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32) {
         let n_pos = d_outputs.len();
@@ -93,191 +95,397 @@ impl GpuBackend {
         let n_steps = weights.rk4_n_steps;
         let dt = 1.0 / n_steps as f32;
         let total = n_pos * n_bands;
+        let buf_size = (total * 4) as u64;
 
-        fn softplus(x: f32) -> f32 {
-            if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
-        }
+        fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
         let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
 
-        // Unpack inputs: interleaved → separate r, s flat arrays
-        let mut r0 = vec![0.0f32; total];
-        let mut s0 = vec![0.0f32; total];
+        // Deinterleave inputs and d_outputs
+        let mut r_flat = vec![0.0f32; total];
+        let mut s_flat = vec![0.0f32; total];
+        let mut dr_flat = vec![0.0f32; total];
+        let mut ds_flat = vec![0.0f32; total];
         for pos in 0..n_pos {
             for k in 0..n_bands {
-                r0[pos * n_bands + k] = inputs[pos][k * 2];
-                s0[pos * n_bands + k] = inputs[pos][k * 2 + 1];
+                r_flat[pos * n_bands + k] = inputs[pos][k * 2];
+                s_flat[pos * n_bands + k] = inputs[pos][k * 2 + 1];
+                dr_flat[pos * n_bands + k] = d_outputs[pos][k * 2];
+                ds_flat[pos * n_bands + k] = d_outputs[pos][k * 2 + 1];
             }
         }
 
-        // Forward recompute: save all intermediate states
-        let mut states: Vec<(Vec<f32>, Vec<f32>)> = Vec::with_capacity(n_steps + 1);
-        let mut r = r0.clone();
-        let mut s = s0.clone();
-        states.push((r.clone(), s.clone()));
+        let ab = [weights.alpha, weights.beta];
+        let wg = (total as u32 + 63) / 64;
 
-        for _ in 0..n_steps {
-            let (k1r, k1s) = self.gpu_kerr_derivative_batch(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
-            let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
-            let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
-            let (k2r, k2s) = self.gpu_kerr_derivative_batch(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
-            let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
-            let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
-            let (k3r, k3s) = self.gpu_kerr_derivative_batch(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
-            let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&ri, &k)| ri + dt * k).collect();
-            let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&si, &k)| si + dt * k).collect();
-            let (k4r, k4s) = self.gpu_kerr_derivative_batch(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
-            for i in 0..total {
-                r[i] += dt / 6.0 * (k1r[i] + 2.0 * k2r[i] + 2.0 * k3r[i] + k4r[i]);
-                s[i] += dt / 6.0 * (k1s[i] + 2.0 * k2s[i] + 2.0 * k3s[i] + k4s[i]);
-            }
-            states.push((r.clone(), s.clone()));
+        // ─── Pre-allocate ALL buffers ───
+        let make_rw = |_label: &str| self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: buf_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let make_init = |_label: &str, data: &[f32]| self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Forward state + scratch
+        let r_buf = make_init("bwd_r", &r_flat);
+        let s_buf = make_init("bwd_s", &s_flat);
+        let k1r = make_rw("bk1r"); let k1s = make_rw("bk1s");
+        let k2r = make_rw("bk2r"); let k2s = make_rw("bk2s");
+        let k3r = make_rw("bk3r"); let k3s = make_rw("bk3s");
+        let k4r = make_rw("bk4r"); let k4s = make_rw("bk4s");
+        let r_mid = make_rw("br_mid"); let s_mid = make_rw("bs_mid");
+        let r_new = make_rw("br_new"); let s_new = make_rw("bs_new");
+
+        // Per-step state cache
+        let r_cache: Vec<wgpu::Buffer> = (0..n_steps).map(|i| {
+            let label = format!("rc{i}");
+            make_rw(&label)
+        }).collect();
+        let s_cache: Vec<wgpu::Buffer> = (0..n_steps).map(|i| {
+            let label = format!("sc{i}");
+            make_rw(&label)
+        }).collect();
+
+        // Backward gradient buffers
+        let d_r = make_init("d_r", &dr_flat);
+        let d_s = make_init("d_s", &ds_flat);
+        let d_r_step = make_rw("d_r_step"); let d_s_step = make_rw("d_s_step");
+        let d_k_r = make_rw("d_k_r"); let d_k_s = make_rw("d_k_s");
+        let d_eval_r = make_rw("d_eval_r"); let d_eval_s = make_rw("d_eval_s");
+        let d_extra_r = make_rw("d_extra_r"); let d_extra_s = make_rw("d_extra_s");
+
+        // Parameter gradient outputs (per dispatch) and accumulators
+        let dg_step = make_rw("dg_step"); let dom_step = make_rw("dom_step");
+        let da_step = make_rw("da_step"); let db_step = make_rw("db_step");
+        let dg_acc = make_init("dg_acc", &vec![0.0f32; total]);
+        let da_acc = make_init("da_acc", &vec![0.0f32; total]);
+        let db_acc = make_init("db_acc", &vec![0.0f32; total]);
+        let zero_buf = make_init("zero", &vec![0.0f32; total]);
+
+        // Shared weight buffers
+        let gamma_buf = self.storage_buf("bg", &gamma);
+        let omega_buf = self.storage_buf("bo", &weights.omega);
+        let ab_buf = self.storage_buf("bab", &ab);
+
+        // ─── Uniform buffers for various scale values ───
+        let deriv_params = KerrDerivBatchParams { n_bands: n_bands as u32, n_pos: n_pos as u32, _pad1: 0, _pad2: 0 };
+        let deriv_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bwd_deriv_u"), contents: bytemuck::bytes_of(&deriv_params), usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bwd_params = KerrBwdBatchParams { n_bands: n_bands as u32, n_pos: n_pos as u32, alpha: weights.alpha, beta: weights.beta };
+        let bwd_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bwd_bwd_u"), contents: bytemuck::bytes_of(&bwd_params), usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let acc_params = VecAccumulateParams { len: total as u32, _p1: 0, _p2: 0, _p3: 0 };
+        let acc_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bwd_acc_u"), contents: bytemuck::bytes_of(&acc_params), usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        // Scale uniforms: dt/6, dt/3, 0.5*dt, dt, 1.0
+        let make_vsa_u = |label, scale: f32| {
+            let p = VecScaleAddParams { len: total as u32, scale, _pad1: 0, _pad2: 0 };
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label), contents: bytemuck::bytes_of(&p), usage: wgpu::BufferUsages::UNIFORM,
+            })
+        };
+        let u_half_dt = make_vsa_u("u_hdt", 0.5 * dt);
+        let u_full_dt = make_vsa_u("u_fdt", dt);
+        let u_dt6 = make_vsa_u("u_dt6", dt / 6.0);
+        let u_dt3 = make_vsa_u("u_dt3", dt / 3.0);
+        let rc_params = Rk4CombineParams { len: total as u32, dt_over_6: dt / 6.0, _pad1: 0, _pad2: 0 };
+        let rc_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bwd_rc_u"), contents: bytemuck::bytes_of(&rc_params), usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        // ─── Bind group helpers ───
+        let deriv_bg = |r_in: &wgpu::Buffer, s_in: &wgpu::Buffer, dr: &wgpu::Buffer, ds: &wgpu::Buffer| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.kerr_deriv_batch_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: r_in.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: s_in.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: dr.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: ds.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: gamma_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: omega_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: deriv_u.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: ab_buf.as_entire_binding() },
+                ],
+            })
+        };
+        let vsa_bg = |a: &wgpu::Buffer, b: &wgpu::Buffer, y: &wgpu::Buffer, u: &wgpu::Buffer| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.vec_scale_add_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: b.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: u.as_entire_binding() },
+                ],
+            })
+        };
+        let acc_bg = |a: &wgpu::Buffer, b: &wgpu::Buffer| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.vec_accumulate_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: b.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: acc_u.as_entire_binding() },
+                ],
+            })
+        };
+        let bwd_bg = |r_in: &wgpu::Buffer, s_in: &wgpu::Buffer| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.kerr_bwd_batch_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: r_in.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: s_in.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: gamma_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: omega_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: d_k_r.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: d_k_s.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: d_eval_r.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: d_eval_s.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: dg_step.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: dom_step.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: da_step.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: db_step.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 12, resource: bwd_u.as_entire_binding() },
+                ],
+            })
+        };
+
+        // ─── Pre-create all bind groups ───
+        // Forward derivative bind groups (reused for cache + recompute)
+        let bg_fwd_k1 = deriv_bg(&r_buf, &s_buf, &k1r, &k1s);
+        let bg_fwd_k2 = deriv_bg(&r_mid, &s_mid, &k2r, &k2s);
+        let bg_fwd_k3 = deriv_bg(&r_mid, &s_mid, &k3r, &k3s);
+        let bg_fwd_k4 = deriv_bg(&r_mid, &s_mid, &k4r, &k4s);
+        let bg_mid_r2 = vsa_bg(&r_buf, &k1r, &r_mid, &u_half_dt);
+        let bg_mid_s2 = vsa_bg(&s_buf, &k1s, &s_mid, &u_half_dt);
+        let bg_mid_r3 = vsa_bg(&r_buf, &k2r, &r_mid, &u_half_dt);
+        let bg_mid_s3 = vsa_bg(&s_buf, &k2s, &s_mid, &u_half_dt);
+        let bg_mid_r4 = vsa_bg(&r_buf, &k3r, &r_mid, &u_full_dt);
+        let bg_mid_s4 = vsa_bg(&s_buf, &k3s, &s_mid, &u_full_dt);
+        let bg_combine_r = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.rk4_combine_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: r_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: k1r.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: k2r.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: k3r.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: k4r.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: r_new.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: rc_u.as_entire_binding() },
+            ],
+        });
+        let bg_combine_s = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.rk4_combine_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: s_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: k1s.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: k2s.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: k3s.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: k4s.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: s_new.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: rc_u.as_entire_binding() },
+            ],
+        });
+
+        // Backward-specific bind groups
+        let bg_bwd_k4 = bwd_bg(&r_mid, &s_mid);  // k4 eval point = r+dt*k3 (in r_mid after reconstruction)
+        let bg_bwd_k3 = bwd_bg(&r_mid, &s_mid);  // k3 eval point = r+0.5dt*k2 (same buffers, different data)
+        let bg_bwd_k2 = bwd_bg(&r_mid, &s_mid);  // k2 eval point = r+0.5dt*k1
+        let bg_bwd_k1 = bwd_bg(&r_buf, &s_buf);  // k1 eval point = cached r, s
+
+        // Scale bind groups: d_k = zero + scale * d_step
+        let bg_scale_dt6_r = vsa_bg(&zero_buf, &d_r_step, &d_k_r, &u_dt6);
+        let bg_scale_dt6_s = vsa_bg(&zero_buf, &d_s_step, &d_k_s, &u_dt6);
+        let bg_scale_dt3_r = vsa_bg(&d_extra_r, &d_r_step, &d_k_r, &u_dt3);
+        let bg_scale_dt3_s = vsa_bg(&d_extra_s, &d_s_step, &d_k_s, &u_dt3);
+        let bg_scale_k1_r = vsa_bg(&d_extra_r, &d_r_step, &d_k_r, &u_dt6);
+        let bg_scale_k1_s = vsa_bg(&d_extra_s, &d_s_step, &d_k_s, &u_dt6);
+
+        // Chain extra: d_extra = zero + scale * d_eval
+        let bg_extra_dt_r = vsa_bg(&zero_buf, &d_eval_r, &d_extra_r, &u_full_dt);
+        let bg_extra_dt_s = vsa_bg(&zero_buf, &d_eval_s, &d_extra_s, &u_full_dt);
+        let bg_extra_hdt_r = vsa_bg(&zero_buf, &d_eval_r, &d_extra_r, &u_half_dt);
+        let bg_extra_hdt_s = vsa_bg(&zero_buf, &d_eval_s, &d_extra_s, &u_half_dt);
+
+        // Accumulate bind groups
+        let bg_acc_dr = acc_bg(&d_r, &d_eval_r);
+        let bg_acc_ds = acc_bg(&d_s, &d_eval_s);
+        let bg_acc_dg = acc_bg(&dg_acc, &dg_step);
+        let bg_acc_da = acc_bg(&da_acc, &da_step);
+        let bg_acc_db = acc_bg(&db_acc, &db_step);
+
+        // Midpoint reconstruction for backward (reuses r_mid/s_mid)
+        let bg_bwd_mid_k3_r = vsa_bg(&r_buf, &k2r, &r_mid, &u_half_dt);
+        let bg_bwd_mid_k3_s = vsa_bg(&s_buf, &k2s, &s_mid, &u_half_dt);
+        let bg_bwd_mid_k2_r = vsa_bg(&r_buf, &k1r, &r_mid, &u_half_dt);
+        let bg_bwd_mid_k2_s = vsa_bg(&s_buf, &k1s, &s_mid, &u_half_dt);
+
+        // ─── Dispatch macros ───
+        macro_rules! dispatch {
+            ($enc:expr, $pipeline:expr, $bg:expr) => {{
+                let mut p = $enc.begin_compute_pass(&Default::default());
+                p.set_pipeline($pipeline);
+                p.set_bind_group(0, $bg, &[]);
+                p.dispatch_workgroups(wg, 1, 1);
+            }};
         }
 
-        // Unpack d_outputs into d_r, d_s
-        let mut d_r: Vec<f32> = vec![0.0f32; total];
-        let mut d_s: Vec<f32> = vec![0.0f32; total];
-        for pos in 0..n_pos {
-            for k in 0..n_bands {
-                d_r[pos * n_bands + k] = d_outputs[pos][k * 2];
-                d_s[pos * n_bands + k] = d_outputs[pos][k * 2 + 1];
-            }
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+
+        // ═══ PHASE 1: Forward with state caching ═══
+        for step in 0..n_steps {
+            // Save state before this step
+            encoder.copy_buffer_to_buffer(&r_buf, 0, &r_cache[step], 0, buf_size);
+            encoder.copy_buffer_to_buffer(&s_buf, 0, &s_cache[step], 0, buf_size);
+            // k1
+            dispatch!(encoder, &self.kerr_deriv_batch_pipeline, &bg_fwd_k1);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_r2);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_s2);
+            // k2
+            dispatch!(encoder, &self.kerr_deriv_batch_pipeline, &bg_fwd_k2);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_r3);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_s3);
+            // k3
+            dispatch!(encoder, &self.kerr_deriv_batch_pipeline, &bg_fwd_k3);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_r4);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_s4);
+            // k4
+            dispatch!(encoder, &self.kerr_deriv_batch_pipeline, &bg_fwd_k4);
+            // combine + copy
+            dispatch!(encoder, &self.rk4_combine_pipeline, &bg_combine_r);
+            dispatch!(encoder, &self.rk4_combine_pipeline, &bg_combine_s);
+            encoder.copy_buffer_to_buffer(&r_new, 0, &r_buf, 0, buf_size);
+            encoder.copy_buffer_to_buffer(&s_new, 0, &s_buf, 0, buf_size);
         }
 
-        let mut d_gamma_acc = vec![0.0f32; n_bands];
-        let mut d_omega_acc = vec![0.0f32; n_bands];
-        let mut d_alpha_acc = 0.0f32;
-        let mut d_beta_acc = 0.0f32;
-
-        // Backward through steps in reverse
+        // ═══ PHASE 2: Backward chain ═══
         for step in (0..n_steps).rev() {
-            let (ref r_step, ref s_step) = states[step];
+            // Load cached state for this step
+            encoder.copy_buffer_to_buffer(&r_cache[step], 0, &r_buf, 0, buf_size);
+            encoder.copy_buffer_to_buffer(&s_cache[step], 0, &s_buf, 0, buf_size);
+            // Save incoming gradient (Desktop's key insight)
+            encoder.copy_buffer_to_buffer(&d_r, 0, &d_r_step, 0, buf_size);
+            encoder.copy_buffer_to_buffer(&d_s, 0, &d_s_step, 0, buf_size);
 
-            // RK4 step backward: recompute forward within this step, then backward
-            let (d_r_new, d_s_new, dg, dom, da, db) = self.gpu_rk4_step_backward_batch(
-                &d_r, &d_s, r_step, s_step, dt,
-                &gamma, &weights.omega, weights.alpha, weights.beta,
-                n_bands, n_pos,
-            );
+            // Recompute k1-k4 from cached state
+            dispatch!(encoder, &self.kerr_deriv_batch_pipeline, &bg_fwd_k1);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_r2);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_s2);
+            dispatch!(encoder, &self.kerr_deriv_batch_pipeline, &bg_fwd_k2);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_r3);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_s3);
+            dispatch!(encoder, &self.kerr_deriv_batch_pipeline, &bg_fwd_k3);
+            // k4 eval point: r_mid = r + dt*k3
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_r4);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_mid_s4);
 
-            d_r = d_r_new;
-            d_s = d_s_new;
-            // Accumulate per-band parameter gradients (reduce across positions)
-            for pos in 0..n_pos {
-                for k in 0..n_bands {
-                    d_gamma_acc[k] += dg[pos * n_bands + k];
-                    d_omega_acc[k] += dom[pos * n_bands + k];
-                }
+            // ── k4 backward ──
+            // d_k = 0 + (dt/6)*d_step
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_scale_dt6_r);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_scale_dt6_s);
+            // kerr_bwd on k4 eval point (r_mid, s_mid)
+            dispatch!(encoder, &self.kerr_bwd_batch_pipeline, &bg_bwd_k4);
+            // accumulate d_r += d_eval, param grads
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dr);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_ds);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            // d_extra = 0 + dt * d_eval (chain: k4 depends on k3)
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_dt_r);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_dt_s);
+
+            // ── k3 backward ──
+            // d_k = d_extra + (dt/3)*d_step
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_scale_dt3_r);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_scale_dt3_s);
+            // Reconstruct k3 eval point: r_mid = r + 0.5*dt*k2
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_bwd_mid_k3_r);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_bwd_mid_k3_s);
+            dispatch!(encoder, &self.kerr_bwd_batch_pipeline, &bg_bwd_k3);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dr);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_ds);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            // d_extra = 0 + 0.5*dt * d_eval
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_hdt_r);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_hdt_s);
+
+            // ── k2 backward ──
+            // d_k = d_extra + (dt/3)*d_step
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_scale_dt3_r);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_scale_dt3_s);
+            // Reconstruct k2 eval point: r_mid = r + 0.5*dt*k1
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_bwd_mid_k2_r);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_bwd_mid_k2_s);
+            dispatch!(encoder, &self.kerr_bwd_batch_pipeline, &bg_bwd_k2);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dr);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_ds);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            // d_extra = 0 + 0.5*dt * d_eval
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_hdt_r);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_hdt_s);
+
+            // ── k1 backward ──
+            // d_k = d_extra + (dt/6)*d_step
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_scale_k1_r);
+            dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_scale_k1_s);
+            // k1 eval point is the cached state (r_buf, s_buf)
+            dispatch!(encoder, &self.kerr_bwd_batch_pipeline, &bg_bwd_k1);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dr);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_ds);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+        }
+
+        // ═══ ONE SUBMIT ═══
+        self.queue.submit(Some(encoder.finish()));
+
+        // ═══ ONE READBACK ═══
+        let d_r_out = self.readback(&d_r, total);
+        let d_s_out = self.readback(&d_s, total);
+        let dg_out = self.readback(&dg_acc, total);
+        let da_out = self.readback(&da_acc, total);
+        let db_out = self.readback(&db_acc, total);
+
+        // CPU reduction: sum across positions for d_gamma, d_alpha, d_beta
+        let mut d_gamma_acc = vec![0.0f32; n_bands];
+        for pos in 0..n_pos {
+            for k in 0..n_bands {
+                d_gamma_acc[k] += dg_out[pos * n_bands + k];
             }
-            d_alpha_acc += da;
-            d_beta_acc += db;
         }
+        let d_alpha: f32 = da_out.iter().sum();
+        let d_beta: f32 = db_out.iter().sum();
 
-        // Chain through softplus for gamma_raw
-        fn softplus_backward(d_y: f32, x: f32) -> f32 {
-            let s = 1.0 / (1.0 + (-x).exp()); // sigmoid(x)
-            d_y * s
-        }
+        // Softplus chain rule for gamma_raw
         let d_gamma_raw: Vec<f32> = (0..n_bands)
-            .map(|k| softplus_backward(d_gamma_acc[k], weights.gamma_raw[k]))
-            .collect();
+            .map(|k| {
+                let s = 1.0 / (1.0 + (-weights.gamma_raw[k]).exp());
+                d_gamma_acc[k] * s
+            }).collect();
 
-        // Re-interleave d_r, d_s → d_inputs
+        // Reinterleave d_r, d_s → d_inputs
         let d_inputs: Vec<Vec<f32>> = (0..n_pos).map(|pos| {
             let mut d_input = vec![0.0f32; n_embd];
             for k in 0..n_bands {
-                d_input[k * 2] = d_r[pos * n_bands + k];
-                d_input[k * 2 + 1] = d_s[pos * n_bands + k];
+                d_input[k * 2] = d_r_out[pos * n_bands + k];
+                d_input[k * 2 + 1] = d_s_out[pos * n_bands + k];
             }
             d_input
         }).collect();
 
-        (d_inputs, d_gamma_raw, d_omega_acc, d_alpha_acc, d_beta_acc)
-    }
-
-    /// Batched RK4 step backward for all positions.
-    /// Returns (d_r, d_s, d_gamma_flat, d_omega_flat, d_alpha, d_beta).
-    fn gpu_rk4_step_backward_batch(
-        &self,
-        d_r_new: &[f32], d_s_new: &[f32],  // [n_pos * n_bands]
-        r: &[f32], s: &[f32],               // [n_pos * n_bands] (state at start of step)
-        dt: f32,
-        gamma: &[f32], omega: &[f32],
-        alpha: f32, beta: f32,
-        n_bands: usize, n_pos: usize,
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, f32, f32) {
-        let total = n_pos * n_bands;
-        let dt6 = dt / 6.0;
-
-        // Forward recompute within this step to get intermediate states
-        let (k1r, k1s) = self.gpu_kerr_derivative_batch(r, s, gamma, omega, alpha, beta, n_bands, n_pos);
-
-        let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
-        let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
-        let (k2r, k2s) = self.gpu_kerr_derivative_batch(&r2, &s2, gamma, omega, alpha, beta, n_bands, n_pos);
-
-        let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
-        let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
-        let (k3r, k3s) = self.gpu_kerr_derivative_batch(&r3, &s3, gamma, omega, alpha, beta, n_bands, n_pos);
-
-        let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&ri, &k)| ri + dt * k).collect();
-        let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&si, &k)| si + dt * k).collect();
-
-        // Accumulate parameter gradients
-        let mut d_gamma_acc = vec![0.0f32; total];
-        let mut d_omega_acc = vec![0.0f32; total];
-        let mut d_alpha_acc = 0.0f32;
-        let mut d_beta_acc = 0.0f32;
-
-        // d_r_new -> d_r (direct path: r_new = r + ...)
-        let mut d_r = d_r_new.to_vec();
-        let mut d_s = d_s_new.to_vec();
-
-        // ── k4 backward ──
-        let d_dr4: Vec<f32> = d_r_new.iter().map(|&v| v * dt6).collect();
-        let d_ds4: Vec<f32> = d_s_new.iter().map(|&v| v * dt6).collect();
-
-        let (d_r4, d_s4, dg, dom, da, db) = self.gpu_kerr_derivative_backward_batch(
-            &d_dr4, &d_ds4, &r4, &s4, gamma, omega, alpha, beta, n_bands, n_pos,
-        );
-        for i in 0..total { d_gamma_acc[i] += dg[i]; d_omega_acc[i] += dom[i]; }
-        d_alpha_acc += da; d_beta_acc += db;
-
-        // r4 = r + dt*dr3, so d_r += d_r4, d_dr3 += d_r4*dt
-        for i in 0..total { d_r[i] += d_r4[i]; d_s[i] += d_s4[i]; }
-        let d_dr3: Vec<f32> = (0..total).map(|i| d_r4[i] * dt + d_r_new[i] * dt6 * 2.0).collect();
-        let d_ds3: Vec<f32> = (0..total).map(|i| d_s4[i] * dt + d_s_new[i] * dt6 * 2.0).collect();
-
-        // ── k3 backward ──
-        let (d_r3_in, d_s3_in, dg, dom, da, db) = self.gpu_kerr_derivative_backward_batch(
-            &d_dr3, &d_ds3, &r3, &s3, gamma, omega, alpha, beta, n_bands, n_pos,
-        );
-        for i in 0..total { d_gamma_acc[i] += dg[i]; d_omega_acc[i] += dom[i]; }
-        d_alpha_acc += da; d_beta_acc += db;
-
-        for i in 0..total { d_r[i] += d_r3_in[i]; d_s[i] += d_s3_in[i]; }
-        let d_dr2: Vec<f32> = (0..total).map(|i| d_r3_in[i] * 0.5 * dt + d_r_new[i] * dt6 * 2.0).collect();
-        let d_ds2: Vec<f32> = (0..total).map(|i| d_s3_in[i] * 0.5 * dt + d_s_new[i] * dt6 * 2.0).collect();
-
-        // ── k2 backward ──
-        let (d_r2_in, d_s2_in, dg, dom, da, db) = self.gpu_kerr_derivative_backward_batch(
-            &d_dr2, &d_ds2, &r2, &s2, gamma, omega, alpha, beta, n_bands, n_pos,
-        );
-        for i in 0..total { d_gamma_acc[i] += dg[i]; d_omega_acc[i] += dom[i]; }
-        d_alpha_acc += da; d_beta_acc += db;
-
-        for i in 0..total { d_r[i] += d_r2_in[i]; d_s[i] += d_s2_in[i]; }
-        let d_dr1: Vec<f32> = (0..total).map(|i| d_r2_in[i] * 0.5 * dt + d_r_new[i] * dt6).collect();
-        let d_ds1: Vec<f32> = (0..total).map(|i| d_s2_in[i] * 0.5 * dt + d_s_new[i] * dt6).collect();
-
-        // ── k1 backward ──
-        let (d_r1_in, d_s1_in, dg, dom, da, db) = self.gpu_kerr_derivative_backward_batch(
-            &d_dr1, &d_ds1, r, s, gamma, omega, alpha, beta, n_bands, n_pos,
-        );
-        for i in 0..total { d_gamma_acc[i] += dg[i]; d_omega_acc[i] += dom[i]; }
-        d_alpha_acc += da; d_beta_acc += db;
-
-        for i in 0..total { d_r[i] += d_r1_in[i]; d_s[i] += d_s1_in[i]; }
-
-        (d_r, d_s, d_gamma_acc, d_omega_acc, d_alpha_acc, d_beta_acc)
+        (d_inputs, d_gamma_raw, d_gamma_acc, d_alpha, d_beta)
     }
 }

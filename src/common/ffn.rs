@@ -76,10 +76,16 @@ pub fn ffn_forward_via_backend(
 
     // 3. ODE: when !freeze_ode, use caching forward for backward pass.
     //    When freeze_ode, use the fast path (GPU/FFT/sequential, no cache).
+    //    When !freeze_ode AND GPU available, use GPU forward (backward recomputes internally).
     let _t_ode = std::time::Instant::now();
     let (kerr_out, ode_caches, ode_device): (Vec<Vec<f32>>, Option<Vec<crate::cpu::ode_backward::OdeForwardCache>>, &str) =
-    if !freeze_ode {
-        // Caching forward — stores intermediates for backward
+    if !freeze_ode && ping_pong.is_some() {
+        // GPU forward for learnable ODE — backward will recompute via gpu_kerr_ode_backward_batch
+        let gpu_be = ping_pong.unwrap().1;
+        let out = gpu_be.gpu_kerr_ode_batch_fused(&weights.kerr, &precond);
+        (out, None, "GPU-learnable")
+    } else if !freeze_ode {
+        // CPU caching forward — stores intermediates for backward
         let mut outs = Vec::with_capacity(t);
         let mut caches = Vec::with_capacity(t);
         for p in &precond {
@@ -147,6 +153,7 @@ pub fn ffn_forward_via_backend(
             _mae_in_dur, ode_device, _ode_dur, _mae_out_dur, proj_device, _proj_dur, t);
     }
 
+    let gpu_ode = ode_device == "GPU-learnable";
     let cache = FfnCache {
         input: x.to_vec(),
         mae_in_sq, mae_in_act, precond,
@@ -154,6 +161,7 @@ pub fn ffn_forward_via_backend(
         regulated,
         ode_caches,
         corrector_active: use_corrector,
+        gpu_ode_backward: gpu_ode,
     };
 
     (output, cache)
@@ -233,9 +241,26 @@ pub fn ffn_backward_via_backend(
     };
 
     // ─── ODE backward ───
+    // Three paths: GPU (recomputes forward), CPU (uses cached intermediates), identity (frozen)
     let (d_precond, ode_param_grads): (Vec<Vec<f32>>, Option<Vec<crate::cpu::ode_backward::OdeParamGrads>>) =
-    if let Some(ref ode_caches) = cache.ode_caches {
-        // Full backward through RK4
+    if cache.gpu_ode_backward {
+        // GPU ODE backward — recomputes forward internally, returns reduced gradients
+        let gpu_be = ping_pong.unwrap().1;
+        let (d_inputs, d_gamma_raw, _d_omega, d_alpha, d_beta) =
+            gpu_be.gpu_kerr_ode_backward_batch(&d_kerr_out, &cache.precond, &weights.kerr);
+        // Convert to per-position OdeParamGrads format (already summed across positions by GPU)
+        // Create one synthetic OdeParamGrads with the full sum, rest zero
+        let mut param_grads = Vec::with_capacity(t);
+        for pos in 0..t {
+            param_grads.push(crate::cpu::ode_backward::OdeParamGrads {
+                d_gamma_raw: if pos == 0 { d_gamma_raw.clone() } else { vec![0.0; n_bands] },
+                d_alpha: if pos == 0 { d_alpha } else { 0.0 },
+                d_beta: if pos == 0 { d_beta } else { 0.0 },
+            });
+        }
+        (d_inputs, Some(param_grads))
+    } else if let Some(ref ode_caches) = cache.ode_caches {
+        // CPU ODE backward — full backward through cached RK4
         let mut d_preconds = Vec::with_capacity(t);
         let mut param_grads = Vec::with_capacity(t);
         for (pos, d_ko) in d_kerr_out.iter().enumerate() {
@@ -298,10 +323,12 @@ pub struct FfnCache {
     pub mae_out_sq: Vec<Vec<f32>>,
     pub mae_out_act: Vec<Vec<f32>>,
     pub regulated: Vec<Vec<f32>>,
-    /// ODE forward caches for backward pass — None when --freeze-ode is active
+    /// ODE forward caches for backward pass — None when GPU or --freeze-ode
     pub ode_caches: Option<Vec<crate::cpu::ode_backward::OdeForwardCache>>,
     /// Whether corrector plate was applied in forward (gates backward)
     pub corrector_active: bool,
+    /// GPU ODE backward path: precond stored, backward recomputes via GPU
+    pub gpu_ode_backward: bool,
 }
 
 /// FFN weight gradients.

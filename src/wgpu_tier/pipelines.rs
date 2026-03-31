@@ -76,6 +76,8 @@ pub struct GpuBackend {
     // Vec add (element-wise y = a + b, for fused chain)
     pub(crate) vec_add_pipeline: wgpu::ComputePipeline,
     pub(crate) vec_add_layout: wgpu::BindGroupLayout,
+    pub(crate) vec_accumulate_pipeline: wgpu::ComputePipeline,
+    pub(crate) vec_accumulate_layout: wgpu::BindGroupLayout,
     // FFT 512-point convolution (OFDM-inspired ODE acceleration)
     pub(crate) fft_convolve_pipeline: wgpu::ComputePipeline,
     pub(crate) fft_convolve_layout: wgpu::BindGroupLayout,
@@ -195,6 +197,15 @@ pub(crate) struct VecScaleAddParams {
     pub scale: f32,
     pub _pad1: u32,
     pub _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct VecAccumulateParams {
+    pub len: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+    pub _p3: u32,
 }
 
 #[repr(C)]
@@ -871,6 +882,22 @@ impl GpuBackend {
             entry_point: Some("vec_add"), compilation_options: Default::default(), cache: None,
         });
 
+        // ─── vec_accumulate: a[i] += b[i] in-place ──
+        let vacc_src = include_str!("../../shaders/vec_accumulate.wgsl");
+        let vacc_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("vec_accumulate"), source: wgpu::ShaderSource::Wgsl(vacc_src.into()),
+        });
+        let vec_accumulate_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vec_accumulate_layout"), entries: &[storage_rw(0), storage_ro(1), uniform_entry(2)],
+        });
+        let vacc_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&vec_accumulate_layout], push_constant_ranges: &[],
+        });
+        let vec_accumulate_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("vec_accumulate"), layout: Some(&vacc_pl), module: &vacc_module,
+            entry_point: Some("vec_accumulate"), compilation_options: Default::default(), cache: None,
+        });
+
         // ─── Compile FFT 512-point convolution shader (OFDM-inspired ODE) ──
         let fft_src = include_str!("../../shaders/fft_512.wgsl");
         let fft_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -989,6 +1016,8 @@ impl GpuBackend {
             gelu_layout,
             vec_add_pipeline,
             vec_add_layout,
+            vec_accumulate_pipeline,
+            vec_accumulate_layout,
             fft_convolve_pipeline,
             fft_convolve_layout,
             kerr_perturbative_pipeline,
