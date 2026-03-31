@@ -52,6 +52,7 @@ pub fn forward_with_cache(
     full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>,
     stencil: Option<&fft_ode::StencilFft>,
     gpu_kernel: Option<(&fft_ode::GpuKernelFft, &gpu_pipelines::GpuBackend)>,
+    layer_agcs: Option<&mut [crate::common::agc::OdeAgc]>,
 ) -> ForwardCache {
     let profile = PROFILE.load(std::sync::atomic::Ordering::Relaxed);
     let t = tokens.len();
@@ -62,7 +63,9 @@ pub fn forward_with_cache(
     let mut _ffn_total = std::time::Duration::ZERO;
     let mut _ln_total = std::time::Duration::ZERO;
 
-    for block in &model.blocks {
+    // Track layer index for per-layer AGC
+    let mut layer_agcs_ref = layer_agcs;
+    for (block_idx, block) in model.blocks.iter().enumerate() {
         let _tln = std::time::Instant::now();
         let normed: Vec<Vec<f32>> = hidden.iter()
             .map(|h| layer_norm(h, &block.ln.weight, &block.ln.bias))
@@ -78,11 +81,18 @@ pub fn forward_with_cache(
             None => &backend::CpuBackend,
         };
 
+        // Per-layer AGC: borrow one element from the mutable slice
+        let agc_for_layer = if let Some(ref mut agcs) = layer_agcs_ref {
+            Some(&mut agcs[block_idx])
+        } else {
+            None
+        };
+
         // FFN forward via backend (kerr-engine pattern: all ops through same device)
         let _tf = std::time::Instant::now();
         let freeze_ode = !d.learnable_ode;
         let use_corrector = d.use_corrector;
-        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, freeze_ode, use_corrector);
+        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, freeze_ode, use_corrector, agc_for_layer);
         let ffn_dur = _tf.elapsed();
 
         // Attention (CPU — frozen, harmonic coherence scoring)

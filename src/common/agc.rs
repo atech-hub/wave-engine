@@ -66,6 +66,32 @@ impl OdeAgc {
         Self::from_coupling(0.1, 0.1)
     }
 
+    /// Update ceiling from current coupling constants.
+    /// Called after each optimizer step when ODE params are learnable.
+    pub fn update_ceiling(&mut self, alpha: f32, beta: f32) {
+        let physics = (std::f32::consts::FRAC_PI_2 / (alpha + 4.0 * beta)).sqrt().max(0.5);
+        self.max_threshold = physics;
+        self.min_threshold = (physics * 0.3).max(0.5);
+        // Clamp current threshold to new ceiling if needed
+        if self.threshold > self.max_threshold {
+            self.threshold = self.max_threshold;
+        }
+    }
+
+    /// Update ceiling with explicit CLI maximum override.
+    pub fn update_ceiling_with_max(&mut self, alpha: f32, beta: f32, cli_max: Option<f32>) {
+        let physics = (std::f32::consts::FRAC_PI_2 / (alpha + 4.0 * beta)).sqrt().max(0.5);
+        let effective = match cli_max {
+            Some(c) => physics.min(c),
+            None => physics,
+        };
+        self.max_threshold = effective;
+        self.min_threshold = (effective * 0.3).max(0.5);
+        if self.threshold > self.max_threshold {
+            self.threshold = self.max_threshold;
+        }
+    }
+
     /// Update AGC state with observed magnitudes.
     /// Call BEFORE applying compression — measures the raw maestro output.
     pub fn observe(&mut self, magnitudes: &[f32]) {

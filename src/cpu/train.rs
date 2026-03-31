@@ -433,7 +433,7 @@ pub fn run_training(config: TrainConfig) {
                 let gk_ref: Option<(&fft_ode::GpuKernelFft, &gpu_pipelines::GpuBackend)> =
                     gpu_backend.as_ref().map(|be| (&gpu_kernel, be));
                 s.spawn(move || {
-                    let cache = forward_with_cache(model_ref, input, dims, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref);
+                    let cache = forward_with_cache(model_ref, input, dims, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref, None);
 
                     // Measure batch distortion on first batch element only (before backward consumes cache)
                     let distortion = if measure_batch_distortion && batch_idx == 0 {
@@ -520,6 +520,31 @@ pub fn run_training(config: TrainConfig) {
         let mut params = flatten_params_ex(&model, config.tied);
         optimizer.step(&mut params, &total_grads);
         unflatten_params_ex(&mut model, &params, config.tied);
+
+        // Dynamic AGC: update ceiling from learned coupling constants.
+        // Uses min ceiling across all layers (most conservative — prevents divergence).
+        if !config.freeze_ode {
+            let mut min_ceiling = f32::MAX;
+            for block in &model.blocks {
+                let a = block.ffn.kerr.alpha;
+                let b = block.ffn.kerr.beta;
+                let c = (std::f32::consts::FRAC_PI_2 / (a + 4.0 * b)).sqrt().max(0.5);
+                if c < min_ceiling { min_ceiling = c; }
+            }
+            // Apply CLI override as maximum
+            let effective = match config.agc_ceiling {
+                Some(cli) => min_ceiling.min(cli),
+                None => min_ceiling,
+            };
+            if let Some(agc_lock) = crate::ffn_backend::AGC.get() {
+                let mut agc = agc_lock.lock().unwrap();
+                agc.update_ceiling_with_max(
+                    model.blocks[0].ffn.kerr.alpha,
+                    model.blocks[0].ffn.kerr.beta,
+                    Some(effective),
+                );
+            }
+        }
         monitor.record("optimizer", t_optim);
 
         let grad_norm: f32 = total_grads.iter().map(|g| g * g).sum::<f32>().sqrt();

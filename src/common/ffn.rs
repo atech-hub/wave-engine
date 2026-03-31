@@ -45,6 +45,7 @@ pub fn ffn_forward_via_backend(
     gpu_kernel: Option<(&crate::fft_ode::GpuKernelFft, &crate::gpu_pipelines::GpuBackend)>,
     freeze_ode: bool,
     use_corrector: bool,
+    layer_agc: Option<&mut crate::common::agc::OdeAgc>,
 ) -> (Vec<Vec<f32>>, FfnCache) {
     let t = x.len();
     let n_embd = x[0].len();
@@ -62,11 +63,12 @@ pub fn ffn_forward_via_backend(
     let _mae_in_dur = _t_mae_in.elapsed();
 
     // AGC (Automatic Gain Control) — adaptive knee compression before ODE.
-    // The model finds its own operating range via EMA of observed magnitudes.
-    // Below threshold: signal passes UNCHANGED. Above: smooth compression on excess only.
-    // Threshold = EMA_mean + 3σ (adapts over ~200 iters).
+    // Per-layer AGC when provided (dynamic ceiling tracks learned α/β).
+    // Falls back to global static for inference/analyze paths.
     let n_bands = n_embd / 2;
-    let (clamp_count, max_pre_clamp_mag) = {
+    let (clamp_count, max_pre_clamp_mag) = if let Some(agc) = layer_agc {
+        agc.process(&mut precond, n_bands)
+    } else {
         let mut agc = AGC.get_or_init(|| std::sync::Mutex::new(crate::common::agc::OdeAgc::new()))
             .lock().unwrap();
         agc.process(&mut precond, n_bands)

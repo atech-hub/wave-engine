@@ -243,9 +243,9 @@ pub fn unflatten_params_ex(model: &mut WavePacketModel, params: &[f32], tied: bo
             block.ffn.kerr.gamma_raw.copy_from_slice(&params[idx..idx+nb]); idx += nb;
             block.ffn.kerr.alpha = params[idx]; idx += 1;
             block.ffn.kerr.beta = params[idx]; idx += 1;
-            // Clamp alpha/beta to safe range after optimizer step
+            // Clamp alpha/beta: α stays bounded, β wider now that dynamic AGC tracks safety
             block.ffn.kerr.alpha = block.ffn.kerr.alpha.clamp(0.01, 0.5);
-            block.ffn.kerr.beta = block.ffn.kerr.beta.clamp(0.01, 0.5);
+            block.ffn.kerr.beta = block.ffn.kerr.beta.clamp(0.01, 1.0);
             // Corrector plate phase corrections
             let nc = block.ffn.kerr.phase_correction.len();
             block.ffn.kerr.phase_correction.copy_from_slice(&params[idx..idx+nc]); idx += nc;
