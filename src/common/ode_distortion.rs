@@ -137,6 +137,90 @@ pub fn measure_distortion(
     }
 }
 
+/// Per-layer distortion summary aggregated across sampled positions.
+#[derive(Clone)]
+pub struct LayerDistortionSummary {
+    pub layer: usize,
+    pub thd_avg: f32,
+    pub thd_max: f32,
+    pub gain_mean: f32,
+    pub gain_max: f32,
+    pub n_compressed: usize,
+    pub excess_phase_avg: f32,
+    pub excess_phase_max: f32,
+    pub n_distorted: usize,
+    pub intermod_avg: f32,
+    pub positions_sampled: usize,
+}
+
+/// Measure distortion across sampled positions from one layer's FfnCache.
+/// Returns None if precond/kerr_out are empty.
+pub fn measure_layer(
+    precond: &[Vec<f32>],
+    kerr_out: &[Vec<f32>],
+    n_bands: usize,
+    layer_idx: usize,
+) -> Option<LayerDistortionSummary> {
+    if precond.is_empty() || kerr_out.is_empty() { return None; }
+
+    let omega: Vec<f32> = (0..n_bands).map(|k| (k + 1) as f32 / n_bands as f32).collect();
+    let n_positions = precond.len();
+    // Sample up to 16 evenly-spaced positions
+    let sample_size = 16.min(n_positions);
+    let step = if sample_size >= n_positions { 1 } else { n_positions / sample_size };
+    let positions: Vec<usize> = (0..n_positions).step_by(step).take(sample_size).collect();
+
+    let mut thd_sum = 0.0f32;
+    let mut thd_max = 0.0f32;
+    let mut gain_mean_sum = 0.0f32;
+    let mut gain_max = 0.0f32;
+    let mut n_compressed_total = 0usize;
+    let mut excess_phase_sum = 0.0f32;
+    let mut excess_phase_max = 0.0f32;
+    let mut n_distorted_total = 0usize;
+    let mut intermod_sum = 0.0f32;
+
+    for &pos in &positions {
+        let d = measure_distortion(&precond[pos], &kerr_out[pos], &omega, n_bands, 16);
+        thd_sum += d.thd_total;
+        if d.thd_total > thd_max { thd_max = d.thd_total; }
+        gain_mean_sum += d.gain_mean;
+        if d.gain_max > gain_max { gain_max = d.gain_max; }
+        n_compressed_total += d.n_compressed;
+        excess_phase_sum += d.excess_phase_mean;
+        if d.excess_phase_max > excess_phase_max { excess_phase_max = d.excess_phase_max; }
+        n_distorted_total += d.n_phase_distorted;
+        intermod_sum += d.intermod_ratio;
+    }
+
+    let n = positions.len() as f32;
+    Some(LayerDistortionSummary {
+        layer: layer_idx,
+        thd_avg: thd_sum / n,
+        thd_max,
+        gain_mean: gain_mean_sum / n,
+        gain_max,
+        n_compressed: n_compressed_total,
+        excess_phase_avg: excess_phase_sum / n,
+        excess_phase_max,
+        n_distorted: n_distorted_total,
+        intermod_avg: intermod_sum / n,
+        positions_sampled: positions.len(),
+    })
+}
+
+/// Format batch distortion as a complete JSONL line.
+pub fn batch_to_json(iter: usize, layers: &[LayerDistortionSummary]) -> String {
+    let layer_strs: Vec<String> = layers.iter().map(|l| {
+        format!(
+            r#"{{"layer":{},"thd_avg":{:.4},"thd_max":{:.4},"gain_mean":{:.3},"gain_max":{:.2},"n_compressed":{},"excess_phase_avg":{:.3},"excess_phase_max":{:.3},"n_distorted":{},"intermod":{:.4},"positions":{}}}"#,
+            l.layer, l.thd_avg, l.thd_max, l.gain_mean, l.gain_max, l.n_compressed,
+            l.excess_phase_avg, l.excess_phase_max, l.n_distorted, l.intermod_avg, l.positions_sampled
+        )
+    }).collect();
+    format!(r#"{{"iter":{},"type":"batch_distortion","layers":[{}]}}"#, iter, layer_strs.join(","))
+}
+
 /// Format as JSON fragment for JSONL.
 pub fn to_json(d: &OdeDistortion) -> String {
     format!(

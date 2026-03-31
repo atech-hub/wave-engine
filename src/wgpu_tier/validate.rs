@@ -92,6 +92,7 @@ pub fn validate_gpu_backend() {
             alpha: 0.1,
             beta: 0.1,
             rk4_n_steps: RK4_N_STEPS,
+            phase_correction: vec![0.0; N_BANDS],
         };
 
         let cpu_y = cpu.kerr_ode(&weights, &x);
@@ -120,6 +121,7 @@ pub fn validate_gpu_backend() {
             alpha: 0.1,
             beta: 0.1,
             rk4_n_steps: 16,
+            phase_correction: vec![0.0; n_bands],
         };
 
         // CPU reference: use model.rs kerr_ode_forward per position
@@ -172,6 +174,7 @@ pub fn validate_gpu_backend() {
             alpha: 0.1,
             beta: 0.1,
             rk4_n_steps: 8,
+            phase_correction: vec![0.0; n_bands],
         };
 
         let cpu_outs: Vec<Vec<f32>> = {
@@ -256,6 +259,7 @@ pub fn benchmark_gpu_vs_cpu() {
         alpha: 0.1,
         beta: 0.1,
         rk4_n_steps: RK4_N_STEPS,
+        phase_correction: vec![0.0; N_BANDS],
     };
 
     // Maestro

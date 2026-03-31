@@ -21,6 +21,7 @@ pub fn diagnose_ode_gpu_vs_cpu(gpu_be: &gpu_pipelines::GpuBackend) {
         gamma_raw: vec![gamma_raw_val; n_bands],
         omega: (0..n_bands).map(|k| (k + 1) as f32 / n_bands as f32).collect(),
         alpha: 0.1, beta: 0.1, rk4_n_steps: RK4_STEPS,
+        phase_correction: vec![0.0; n_bands],
     };
 
     // CPU ODE

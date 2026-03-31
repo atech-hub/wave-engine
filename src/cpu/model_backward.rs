@@ -35,6 +35,7 @@ pub struct Gradients {
     pub block_ffn_kerr_omega: Vec<Vec<f32>>,
     pub block_ffn_kerr_alpha: Vec<f32>,
     pub block_ffn_kerr_beta: Vec<f32>,
+    pub block_ffn_phase_correction: Vec<Vec<f32>>,
     pub block_ffn_mae_in_sq_w: Vec<Vec<Vec<f32>>>,
     pub block_ffn_mae_in_sq_b: Vec<Vec<f32>>,
     pub block_ffn_mae_in_pr_w: Vec<Vec<Vec<f32>>>,
@@ -71,6 +72,7 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         block_ffn_kerr_omega: vec![vec![0.0; d.n_bands]; n_blocks],
         block_ffn_kerr_alpha: vec![0.0; n_blocks],
         block_ffn_kerr_beta: vec![0.0; n_blocks],
+        block_ffn_phase_correction: if d.learnable_ode { vec![vec![0.0; d.n_bands]; n_blocks] } else { vec![vec![]; n_blocks] },
         block_ffn_mae_in_sq_w: vec![vec![vec![0.0; d.n_embd]; d.maestro_dim]; n_blocks],
         block_ffn_mae_in_sq_b: vec![vec![0.0; d.maestro_dim]; n_blocks],
         block_ffn_mae_in_pr_w: vec![vec![vec![0.0; d.maestro_dim]; d.n_embd]; n_blocks],
@@ -220,6 +222,9 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
             }
             if let Some(d_a) = fg.d_kerr_alpha { grads.block_ffn_kerr_alpha[block_idx] += d_a; }
             if let Some(d_b) = fg.d_kerr_beta { grads.block_ffn_kerr_beta[block_idx] += d_b; }
+            if let Some(ref d_pc) = fg.d_phase_correction {
+                for k in 0..d_pc.len() { grads.block_ffn_phase_correction[block_idx][k] += d_pc[k]; }
+            }
             d_input
         } else {
             ffn_backward(&block.ffn, &bc.normed, &d_ffn_out, &mut grads, block_idx, bc, d, gpu, ping_pong)
@@ -489,6 +494,7 @@ pub fn flatten_grads_ex(grads: &Gradients, tied: bool) -> Vec<f32> {
             g.extend_from_slice(&grads.block_ffn_kerr_gamma_raw[b]);
             g.push(grads.block_ffn_kerr_alpha[b]);
             g.push(grads.block_ffn_kerr_beta[b]);
+            g.extend_from_slice(&grads.block_ffn_phase_correction[b]);
         }
     }
     g.extend_from_slice(&grads.ln_f_w);

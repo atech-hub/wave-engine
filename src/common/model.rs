@@ -202,6 +202,7 @@ pub struct KerrWeights {
     pub alpha: f32,
     pub beta: f32,
     pub rk4_n_steps: usize,   // ODE integration steps (default 8)
+    pub phase_correction: Vec<f32>,  // [N_BANDS] corrector plate — per-band phase offset (init 0.0)
 }
 
 /// Weights for Maestro.

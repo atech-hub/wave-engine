@@ -66,6 +66,7 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
             alpha,
             beta,
             rk4_n_steps: d.rk4_steps,
+            phase_correction: vec![0.0; d.n_bands],
         };
         let (sq_w, sq_b) = init_linear(&mut rng, d.maestro_dim, d.n_embd);
         let (pr_w, pr_b) = init_linear(&mut rng, d.n_embd, d.maestro_dim);
@@ -156,6 +157,7 @@ pub fn count_trainable_ex(model: &WavePacketModel, tied: bool) -> usize {
             n += block.ffn.kerr.gamma_raw.len(); // gamma_raw per band
             n += 1; // alpha
             n += 1; // beta
+            n += block.ffn.kerr.phase_correction.len(); // corrector plate
         }
     }
     n += n_embd * 2;
@@ -196,6 +198,7 @@ pub fn flatten_params_ex(model: &WavePacketModel, tied: bool) -> Vec<f32> {
             p.extend_from_slice(&block.ffn.kerr.gamma_raw);
             p.push(block.ffn.kerr.alpha);
             p.push(block.ffn.kerr.beta);
+            p.extend_from_slice(&block.ffn.kerr.phase_correction);
         }
     }
     p.extend_from_slice(&model.ln_f.weight);
@@ -243,6 +246,9 @@ pub fn unflatten_params_ex(model: &mut WavePacketModel, params: &[f32], tied: bo
             // Clamp alpha/beta to safe range after optimizer step
             block.ffn.kerr.alpha = block.ffn.kerr.alpha.clamp(0.01, 0.5);
             block.ffn.kerr.beta = block.ffn.kerr.beta.clamp(0.01, 0.5);
+            // Corrector plate phase corrections
+            let nc = block.ffn.kerr.phase_correction.len();
+            block.ffn.kerr.phase_correction.copy_from_slice(&params[idx..idx+nc]); idx += nc;
         }
     }
     model.ln_f.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;

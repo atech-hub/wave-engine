@@ -165,6 +165,7 @@ pub struct TrainConfig {
     pub health_interval: usize, // 0 = disabled
     pub freeze_ode: bool,
     pub head_lr_floor: f32, // 0.0 = disabled, e.g. 0.00003 = 30% of 1e-4
+    pub no_corrector: bool, // --no-corrector: disable corrector plate (A/B testing)
 }
 
 pub fn run_training(config: TrainConfig) {
@@ -212,11 +213,30 @@ pub fn run_training(config: TrainConfig) {
         println!("Resuming from checkpoint: {ckpt}");
         let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v, _ck_groups) = wave_checkpoint::load_checkpoint(ckpt);
         assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
-        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode), config.alpha, config.beta);
-        unflatten_params(&mut m, &params);
+        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode), config.alpha, config.beta);
+        let ext_count = count_trainable_ex(&m, config.tied);
+        if params.len() == ext_count {
+            unflatten_params_ex(&mut m, &params, config.tied);
+            println!("  Loaded {} params (with ODE/corrector)", params.len());
+        } else {
+            // Old checkpoint without ODE/corrector — load base params, ODE starts fresh
+            let base_dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(false).with_corrector(false);
+            m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, base_dims, config.alpha, config.beta);
+            unflatten_params(&mut m, &params);
+            // Re-enable learnable ODE on the loaded model
+            m.learnable_ode = !config.freeze_ode;
+            println!("  Loaded {} params (base — ODE/corrector start fresh)", params.len());
+        }
         model = m;
         start_iter = ck_iter;
-        optimizer = Adam::from_checkpoint(config.lr, adam_t, adam_m, adam_v);
+        let n_ext = count_trainable_ex(&model, config.tied);
+        if adam_m.len() == n_ext {
+            optimizer = Adam::from_checkpoint(config.lr, adam_t, adam_m, adam_v);
+        } else {
+            // Old optimizer state doesn't match new param count — fresh optimizer
+            eprintln!("  Adam state size mismatch ({} vs {}), starting fresh optimizer", adam_m.len(), n_ext);
+            optimizer = Adam::new(config.lr, n_ext);
+        }
         rng = Rng::from_state(ck_rng);
         println!("  Resuming from iter {start_iter}");
         if config.m1.is_some() || config.m2.is_some() {
@@ -224,7 +244,7 @@ pub fn run_training(config: TrainConfig) {
         }
     } else {
         println!("Initializing model (seed=42)...");
-        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode), config.alpha, config.beta);
+        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode), config.alpha, config.beta);
         start_iter = 0;
         let n_t = count_trainable_ex(&model, config.tied);
         optimizer = Adam::new(config.lr, n_t);
@@ -240,7 +260,22 @@ pub fn run_training(config: TrainConfig) {
     println!("  Architecture: {} parallel blocks, {} harmonic heads, {} bands ({}-dim)", config.n_layers, config.n_head, config.n_bands, config.n_bands * 2);
 
     // Runtime dimensions (needed by pre-flight, forward, backward)
-    let dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode);
+    let dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode);
+
+    // ─── Pre-flight: out_proj_groups must divide n_embd ──────────────
+    if config.out_proj_groups > 1 && dims.n_embd % config.out_proj_groups != 0 {
+        let n_embd = dims.n_embd;
+        let groups = config.out_proj_groups;
+        let covered = (n_embd / groups) * groups;
+        eprintln!("  [preflight] FATAL: n_embd={} not divisible by out_proj_groups={}",
+            n_embd, groups);
+        eprintln!("              out_proj covers {}/{} dims — {} orphaned dims cause crash",
+            covered, n_embd, n_embd - covered);
+        // Suggest valid group sizes
+        let valid: Vec<usize> = (1..=n_embd).filter(|g| n_embd % g == 0 && *g <= 32).collect();
+        eprintln!("              Valid groups for {}-dim: {:?}", n_embd, valid);
+        std::process::exit(1);
+    }
 
     // ─── Pre-flight diagnostics ──────────────────────────────────────
     {
@@ -380,9 +415,12 @@ pub fn run_training(config: TrainConfig) {
             .map(|_| (rng.next_u64() as usize) % (train_data.len() - seq_len - 1))
             .collect();
 
+        // Should we measure batch distortion this iteration?
+        let measure_batch_distortion = config.health_interval > 0 && iter % config.health_interval == 0;
+
         let t_fwd = monitor.start();
-        let batch_results: Vec<(f32, Vec<f32>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = starts.iter().map(|&start| {
+        let batch_results: Vec<(f32, Vec<f32>, Option<Vec<crate::common::ode_distortion::LayerDistortionSummary>>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = starts.iter().enumerate().map(|(batch_idx, &start)| {
                 let model_ref = &model;
                 let gpu_ref: Option<&(dyn backend::ComputeBackend + Send + Sync)> = gpu_backend.as_ref().map(|be| be as &(dyn backend::ComputeBackend + Send + Sync));
                 let pp_ref: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)> =
@@ -396,8 +434,26 @@ pub fn run_training(config: TrainConfig) {
                     gpu_backend.as_ref().map(|be| (&gpu_kernel, be));
                 s.spawn(move || {
                     let cache = forward_with_cache(model_ref, input, dims, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref);
+
+                    // Measure batch distortion on first batch element only (before backward consumes cache)
+                    let distortion = if measure_batch_distortion && batch_idx == 0 {
+                        let mut layer_summaries = Vec::new();
+                        for (li, bc) in cache.block_caches.iter().enumerate() {
+                            if let Some(ref fc) = bc.ffn_backend_cache {
+                                if let Some(summary) = crate::common::ode_distortion::measure_layer(
+                                    &fc.precond, &fc.kerr_out, dims.n_bands, li,
+                                ) {
+                                    layer_summaries.push(summary);
+                                }
+                            }
+                        }
+                        if layer_summaries.is_empty() { None } else { Some(layer_summaries) }
+                    } else {
+                        None
+                    };
+
                     let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref);
-                    (loss, flatten_grads_ex(&grads, dims.tied))
+                    (loss, flatten_grads_ex(&grads, dims.tied), distortion)
                 })
             }).collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -407,9 +463,13 @@ pub fn run_training(config: TrainConfig) {
         let t_reduce = monitor.start();
         let mut total_loss = 0.0f32;
         let mut total_grads = vec![0.0f32; n_trainable];
-        for (loss, fg) in &batch_results {
+        let mut batch_distortion_data: Option<Vec<crate::common::ode_distortion::LayerDistortionSummary>> = None;
+        for (loss, fg, distortion) in &batch_results {
             total_loss += loss;
             for (a, g) in total_grads.iter_mut().zip(fg.iter()) { *a += g; }
+            if distortion.is_some() && batch_distortion_data.is_none() {
+                batch_distortion_data = distortion.clone();
+            }
         }
         total_loss /= batch_size as f32;
         for g in total_grads.iter_mut() { *g /= batch_size as f32; }
@@ -420,7 +480,7 @@ pub fn run_training(config: TrainConfig) {
             nan_skip_count += 1;
             // Post-mortem: which batch elements caused it?
             let nan_elements: Vec<usize> = batch_results.iter().enumerate()
-                .filter(|(_, (loss, _))| loss.is_nan() || loss.is_infinite())
+                .filter(|(_, (loss, _, _))| loss.is_nan() || loss.is_infinite())
                 .map(|(i, _)| i).collect();
             let has_nan_grad = total_grads.iter().any(|g| g.is_nan());
             if iter % 100 == 0 || iter < 10 {
@@ -565,11 +625,25 @@ pub fn run_training(config: TrainConfig) {
                         iter, h.theta_disc, h.delta_theta_disc, h.entropy, h.top_band, h.concentration, thd_str);
                 }
             }
+
+            // Batch distortion: measured on actual training data (not reference sentence)
+            if let Some(ref layers) = batch_distortion_data {
+                use std::io::Write;
+                let json = crate::common::ode_distortion::batch_to_json(iter, layers);
+                writeln!(log_writer, "{}", json).ok();
+                log_writer.flush().ok();
+                // Console summary: show per-layer THD and gain
+                let layer_strs: Vec<String> = layers.iter().map(|l| {
+                    format!("L{}:THD={:.3}/gain={:.2}/comp={}", l.layer, l.thd_avg, l.gain_max, l.n_compressed)
+                }).collect();
+                eprintln!("  [batch-distortion {}] {}", iter, layer_strs.join(" | "));
+            }
         }
 
         // Periodic checkpoint: save every 500 iters (all tiers, always untied format)
+        // Uses flatten_params_ex to include ODE params + corrector plate (matches optimizer state)
         if (iter + 1) % 500 == 0 {
-            let save_p = flatten_params(&model);
+            let save_p = flatten_params_ex(&model, false);
             let path = format!("checkpoint_iter{}.bin", iter + 1);
             let groups = model.blocks[0].ffn.out_proj.n_groups();
             if config.tied {
@@ -632,8 +706,8 @@ pub fn run_training(config: TrainConfig) {
         log_writer.flush().ok();
     }
 
-    // Final checkpoint (always saves full untied params for compatibility)
-    let save_params = flatten_params(&model); // untied — includes lm_head
+    // Final checkpoint (always saves full untied params + ODE/corrector for compatibility)
+    let save_params = flatten_params_ex(&model, false);
     let groups = model.blocks[0].ffn.out_proj.n_groups();
     if config.tied {
         // Optimizer is tied-size; checkpoint needs untied-size. Save dummy optimizer.

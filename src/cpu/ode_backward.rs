@@ -403,6 +403,7 @@ mod tests {
             alpha: 0.1,
             beta: 0.2,
             rk4_n_steps: 4, // fewer steps for faster test
+            phase_correction: vec![0.0; n_bands],
         }
     }
 

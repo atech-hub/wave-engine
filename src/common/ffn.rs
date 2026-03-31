@@ -44,6 +44,7 @@ pub fn ffn_forward_via_backend(
     ping_pong: Option<(&crate::ffn_gpu::FfnGpuBuffers, &crate::gpu_pipelines::GpuBackend)>,
     gpu_kernel: Option<(&crate::fft_ode::GpuKernelFft, &crate::gpu_pipelines::GpuBackend)>,
     freeze_ode: bool,
+    use_corrector: bool,
 ) -> (Vec<Vec<f32>>, FfnCache) {
     let t = x.len();
     let n_embd = x[0].len();
@@ -109,6 +110,22 @@ pub fn ffn_forward_via_backend(
     // No energy conservation — AGC handles magnitude regulation.
     // Coupling at α=0.1 with AGC ceiling=2.0 matches kerr-engine recipe.
 
+    // 3b. Corrector plate: per-band phase rotation after ODE (Schmidt corrector).
+    //     Magnitude preserved (rotation is orthogonal). Only phase changes.
+    //     Zero-init = identity rotation = no-op until the model learns corrections.
+    let mut kerr_out = kerr_out;
+    if use_corrector {
+        for pos in &mut kerr_out {
+            for k in 0..n_bands {
+                let (sin_c, cos_c) = weights.kerr.phase_correction[k].sin_cos();
+                let r = pos[2 * k];
+                let s = pos[2 * k + 1];
+                pos[2 * k]     = r * cos_c - s * sin_c;
+                pos[2 * k + 1] = r * sin_c + s * cos_c;
+            }
+        }
+    }
+
     // 4. Maestro_out: CPU (same reason as maestro_in)
     let _t_mae_out = std::time::Instant::now();
     let mae_out_sq = cpu.linear_batch(&weights.maestro_out.squeeze.w, &weights.maestro_out.squeeze.b, &kerr_out);
@@ -136,6 +153,7 @@ pub fn ffn_forward_via_backend(
         kerr_out, mae_out_sq, mae_out_act,
         regulated,
         ode_caches,
+        corrector_active: use_corrector,
     };
 
     (output, cache)
@@ -177,7 +195,42 @@ pub fn ffn_backward_via_backend(
     let (d_mae_out_sq_w, d_mae_out_sq_b) = cpu.outer_product_accum(&d_mae_out_sq, &cache.kerr_out, true);
 
     // ─── d_kerr_out = d_regulated (residual) + d_from_mae_out_squeeze ───
-    let d_kerr_out = cpu.vec_add_batch(&d_regulated, &d_kerr_from_mae);
+    //     This is the gradient w.r.t. the CORRECTED kerr_out (post-corrector).
+    let d_corrected = cpu.vec_add_batch(&d_regulated, &d_kerr_from_mae);
+
+    // ─── Corrector backward: inverse rotation + d_correction ───
+    let (d_kerr_out, d_phase_correction): (Vec<Vec<f32>>, Option<Vec<f32>>) =
+    if cache.corrector_active {
+        // Corrector is active — rotate gradients back and accumulate d_correction
+        let mut d_raw = Vec::with_capacity(t);
+        let mut d_corr = vec![0.0f32; n_bands];
+        for pos in 0..t {
+            let mut d_pos = vec![0.0f32; n_embd];
+            for k in 0..n_bands {
+                let (sin_c, cos_c) = weights.kerr.phase_correction[k].sin_cos();
+                let d_cr = d_corrected[pos][2 * k];
+                let d_cs = d_corrected[pos][2 * k + 1];
+
+                // Inverse rotation for input gradient
+                d_pos[2 * k]     =  cos_c * d_cr + sin_c * d_cs;
+                d_pos[2 * k + 1] = -sin_c * d_cr + cos_c * d_cs;
+
+                // Recover raw (pre-correction) r, s from corrected cache by inverse rotation
+                let cr = cache.kerr_out[pos][2 * k];
+                let cs = cache.kerr_out[pos][2 * k + 1];
+                let raw_r =  cos_c * cr + sin_c * cs;
+                let raw_s = -sin_c * cr + cos_c * cs;
+
+                // d_correction[k] accumulated across positions
+                d_corr[k] += d_cr * (-raw_r * sin_c - raw_s * cos_c)
+                           + d_cs * ( raw_r * cos_c - raw_s * sin_c);
+            }
+            d_raw.push(d_pos);
+        }
+        (d_raw, Some(d_corr))
+    } else {
+        (d_corrected, None)
+    };
 
     // ─── ODE backward ───
     let (d_precond, ode_param_grads): (Vec<Vec<f32>>, Option<Vec<crate::cpu::ode_backward::OdeParamGrads>>) =
@@ -229,6 +282,7 @@ pub fn ffn_backward_via_backend(
         d_mae_in_pr_w, d_mae_in_pr_b,
         d_mae_in_sq_w, d_mae_in_sq_b,
         d_kerr_gamma_raw, d_kerr_alpha, d_kerr_beta,
+        d_phase_correction,
     };
 
     (d_input, grads)
@@ -246,6 +300,8 @@ pub struct FfnCache {
     pub regulated: Vec<Vec<f32>>,
     /// ODE forward caches for backward pass — None when --freeze-ode is active
     pub ode_caches: Option<Vec<crate::cpu::ode_backward::OdeForwardCache>>,
+    /// Whether corrector plate was applied in forward (gates backward)
+    pub corrector_active: bool,
 }
 
 /// FFN weight gradients.
@@ -264,4 +320,5 @@ pub struct FfnGrads {
     pub d_kerr_gamma_raw: Option<Vec<f32>>,  // [n_bands]
     pub d_kerr_alpha: Option<f32>,
     pub d_kerr_beta: Option<f32>,
+    pub d_phase_correction: Option<Vec<f32>>,  // [n_bands] corrector plate gradient
 }

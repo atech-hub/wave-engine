@@ -5,6 +5,7 @@ use crate::common::wave_analysis as wa;
 use crate::common::dims::{N_BANDS, N_HEAD, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS};
 use crate::Dims;
 use crate::{init_model, unflatten_params};
+use crate::common::wave_model::{count_trainable_ex, unflatten_params_ex};
 use crate::wave_checkpoint;
 use crate::bpe;
 use crate::fft_ode;
@@ -146,9 +147,26 @@ pub fn run_analyze(
     let (params, ck_vocab, _ck_iter, _ck_lr, _ck_rng, _adam_t, _adam_m, _adam_v, _ck_groups) =
         wave_checkpoint::load_checkpoint(resume_path);
     let effective_vocab = vocab_size.max(ck_vocab);
-    let dims = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS);
-    let mut model = init_model(effective_vocab, 42, n_layers, out_proj_groups, dims, alpha, beta);
-    unflatten_params(&mut model, &params);
+    // Try extended params first (new checkpoints with ODE/corrector)
+    let dims_base = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_learnable_ode(false).with_corrector(false);
+    let dims_ext = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true);
+    let mut model = init_model(effective_vocab, 42, n_layers, out_proj_groups, dims_ext, alpha, beta);
+    let ext_count = count_trainable_ex(&model, false);
+    let dims;
+    if params.len() == ext_count {
+        // New checkpoint: load ODE+corrector params, run forward with corrector active
+        unflatten_params_ex(&mut model, &params, false);
+        // ODE backward not needed for analysis, but corrector forward must run
+        model.learnable_ode = false;
+        dims = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_learnable_ode(false).with_corrector(true);
+        println!("  Loaded {} params (with ODE/corrector) from {}", params.len(), resume_path);
+    } else {
+        // Old checkpoint without ODE/corrector params
+        model = init_model(effective_vocab, 42, n_layers, out_proj_groups, dims_base, alpha, beta);
+        unflatten_params(&mut model, &params);
+        dims = dims_base;
+        println!("  Loaded {} params (base) from {}", params.len(), resume_path);
+    }
     println!("  Loaded {} params from {}", params.len(), resume_path);
 
     // Truncate to block_size if needed (char-level can exceed positional table)

@@ -81,7 +81,8 @@ pub fn forward_with_cache(
         // FFN forward via backend (kerr-engine pattern: all ops through same device)
         let _tf = std::time::Instant::now();
         let freeze_ode = !d.learnable_ode;
-        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, freeze_ode);
+        let use_corrector = d.use_corrector;
+        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, freeze_ode, use_corrector);
         let ffn_dur = _tf.elapsed();
 
         // Attention (CPU — frozen, harmonic coherence scoring)

@@ -106,7 +106,16 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
         + ck_maestro*n_embd + ck_maestro + n_embd*ck_maestro + n_embd
         + ck_maestro*n_embd + ck_maestro + n_embd*ck_maestro + n_embd
         + out_proj_params;
-    let n_params = ck_layers * per_block + n_embd*2 + vocab_size*n_embd;
+    let n_base = ck_layers * per_block + n_embd*2 + vocab_size*n_embd;
+    // Extended: +gamma_raw(n_bands) + alpha(1) + beta(1) + phase_correction(n_bands) per layer
+    let n_ext = n_base + ck_layers * (ck_bands + 1 + 1 + ck_bands);
+
+    // Determine actual param count from file size
+    let file_len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+    let header_size = 4 + 4 + 7*4 + 8 + 8 + 4 + 8 + 8; // magic + version + config + metadata + adam_t
+    // file = header + adam_m(n*4) + adam_v(n*4) + params(n*4) = header + n*12
+    let data_bytes = file_len.saturating_sub(header_size);
+    let n_params = if data_bytes == n_ext * 12 { n_ext } else { n_base };
 
     let adam_t = read_u64(&mut f) as usize;
     let read_f32_vec = |f: &mut std::fs::File, n: usize| -> Vec<f32> {

@@ -74,9 +74,13 @@ pub fn print_help() {
     println!("    --monitor         Enable per-section pipeline timing (forward profiling)");
     println!("    --debug-nan       Enable per-layer NaN detection (Candle only, ~6x slower)");
     println!("    --health-interval N  Encoding health sample every N iters (0=off)  [default: 0]");
-    println!("                        Logs θ/Δθ balance, entropy, coupling, THD to JSONL");
+    println!("                        Logs θ/Δθ balance, entropy, coupling to JSONL");
+    println!("                        Also measures batch distortion (THD, gain, phase) per layer");
+    println!("                        on actual training data — not a reference sentence");
     println!("    --freeze-ode        Freeze ODE params (identity backward — legacy behaviour)");
     println!("                        Default: ODE α/β/γ are learnable per layer");
+    println!("    --no-corrector      Disable corrector plate (A/B testing)");
+    println!("                        Default: per-band phase correction after ODE (Schmidt corrector)");
     println!("    --head-lr-floor F   Minimum effective LR for lm_head (prevents starvation)");
     println!();
     println!("    Always-on telemetry (no flag needed):");
