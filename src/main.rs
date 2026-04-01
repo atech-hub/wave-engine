@@ -171,6 +171,19 @@ fn main() {
             .and_then(|s| s.parse().ok()).unwrap_or(default)
     }
 
+    // Parse dynamic parameter: --flag dyn | --flag 1.0,0.8,1.0 | absent
+    fn parse_dyn_param(name: &str) -> train::DynParam {
+        let val = std::env::args().skip_while(|a| a != name).nth(1);
+        match val {
+            None => train::DynParam::Off,
+            Some(s) if s == "dyn" || s == "dynamic" => train::DynParam::Dynamic,
+            Some(s) => {
+                let vals: Vec<f32> = s.split(',').filter_map(|v| v.parse().ok()).collect();
+                if vals.is_empty() { train::DynParam::Dynamic } else { train::DynParam::Fixed(vals) }
+            }
+        }
+    }
+
     // ─── Analyze mode ───
     if std::env::args().any(|a| a == "--analyze") {
         let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)
@@ -317,5 +330,9 @@ fn main() {
         freeze_ode: std::env::args().any(|a| a == "--freeze-ode"),
         head_lr_floor: parse_flag("--head-lr-floor", 0.0),
         no_corrector: std::env::args().any(|a| a == "--no-corrector"),
+        layer_scale: parse_dyn_param("--layer-scale"),
+        lr_scale: parse_dyn_param("--lr-scale"),
+        spring_k: parse_flag("--spring", 0.1),
+        active_layers: std::env::args().skip_while(|a| a != "--active-layers").nth(1).and_then(|s| s.parse().ok()),
     });
 }

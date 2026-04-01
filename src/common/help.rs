@@ -81,6 +81,10 @@ pub fn print_help() {
     println!("                        Default: ODE α/β/γ are learnable per layer");
     println!("    --no-corrector      Disable corrector plate (A/B testing)");
     println!("                        Default: per-band phase correction after ODE (Schmidt corrector)");
+    println!("    --layer-scale       Enable learnable per-layer residual scaling");
+    println!("    --spring F          Spring constant for dynamic params (default: 0.1)");
+    println!("                        Restoring force toward equilibrium, not a hard clamp");
+    println!("    --active-layers N   First N layers start at scale=1.0, rest at scale=0.0");
     println!("    --head-lr-floor F   Minimum effective LR for lm_head (prevents starvation)");
     println!();
     println!("    Always-on telemetry (no flag needed):");

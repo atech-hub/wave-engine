@@ -31,11 +31,13 @@ pub struct Dims {
     pub unfreeze_phases: bool,
     pub learnable_ode: bool, // true = ODE backward active, false = identity (--freeze-ode)
     pub use_corrector: bool, // true = corrector plate active (per-band phase correction after ODE)
+    pub use_layer_scale: bool, // true = per-layer residual scaling is learnable
+    pub use_lr_scale: bool, // true = per-group LR scaling is learnable
 }
 
 impl Dims {
     pub fn from_cli(n_bands: usize, n_head: usize, maestro_dim: usize, block_size: usize, rk4_steps: usize) -> Self {
-        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true }
+        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false }
     }
     pub fn with_tied(mut self, tied: bool) -> Self {
         self.tied = tied;
@@ -59,6 +61,14 @@ impl Dims {
     }
     pub fn with_corrector(mut self, c: bool) -> Self {
         self.use_corrector = c;
+        self
+    }
+    pub fn with_layer_scale(mut self, ls: bool) -> Self {
+        self.use_layer_scale = ls;
+        self
+    }
+    pub fn with_lr_scale(mut self, ls: bool) -> Self {
+        self.use_lr_scale = ls;
         self
     }
     pub fn with_moduli(mut self, m1: Option<usize>, m2: Option<usize>) -> Self {

@@ -35,18 +35,16 @@ pub fn run_generate(config: GenerateConfig) {
         let tok2 = bpe::BpeTokenizer::from_file(&config.tokenizer_path);
         (ids, ck_vocab, Box::new(move |id| tok2.decode(&[id])))
     } else {
-        // Char-level: build vocab from common ASCII
-        let vocab = ck_vocab;
-        let char_map: Vec<char> = {
-            let mut chars: Vec<char> = (0..128u8).filter_map(|b| {
-                let c = b as char;
-                if c.is_ascii() { Some(c) } else { None }
-            }).collect();
-            chars.sort();
-            chars.dedup();
-            chars.truncate(vocab);
-            chars
-        };
+        // Char-level: build vocab from training data file (same as training tokenizer)
+        let data_path = std::env::args().skip_while(|a| a != "--data").nth(1)
+            .unwrap_or_else(|| std::env::args().nth(1).unwrap_or("data/input.txt".to_string()));
+        let text = std::fs::read_to_string(&data_path).expect("Failed to read data file for char vocab");
+        let mut chars: Vec<char> = text.chars().collect();
+        chars.sort();
+        chars.dedup();
+        let vocab = chars.len().min(ck_vocab);
+        let char_map: Vec<char> = chars[..vocab].to_vec();
+        eprintln!("  Char vocab: {} chars from {}", vocab, data_path);
         let ids: Vec<usize> = config.prompt.chars().filter_map(|c| char_map.iter().position(|&ch| ch == c)).collect();
         let cm2 = char_map.clone();
         (ids, vocab, Box::new(move |id| if id < cm2.len() { cm2[id].to_string() } else { "?".to_string() }))
@@ -65,7 +63,17 @@ pub fn run_generate(config: GenerateConfig) {
         .with_learnable_ode(false)
         .with_corrector(true);
 
-    if params.len() == ext_count {
+    // Try ext+layer_scale, then ext, then base
+    let dims_ext_ls = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+        .with_corrector(true).with_layer_scale(true);
+    let mut model_ls = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_ext_ls, config.alpha, config.beta);
+    let ext_ls_count = count_trainable_ex(&model_ls, false);
+
+    if params.len() == ext_ls_count {
+        unflatten_params_ex(&mut model_ls, &params, false);
+        model = model_ls;
+        eprintln!("  Loaded {} params (with ODE/corrector/layer_scale) from {}", params.len(), config.resume_path);
+    } else if params.len() == ext_count {
         unflatten_params_ex(&mut model, &params, false);
         eprintln!("  Loaded {} params (with ODE/corrector) from {}", params.len(), config.resume_path);
     } else {

@@ -166,6 +166,23 @@ pub struct TrainConfig {
     pub freeze_ode: bool,
     pub head_lr_floor: f32, // 0.0 = disabled, e.g. 0.00003 = 30% of 1e-4
     pub no_corrector: bool, // --no-corrector: disable corrector plate (A/B testing)
+    pub layer_scale: DynParam, // --layer-scale dyn | --layer-scale 1.0,0.8,1.0,1.0
+    pub lr_scale: DynParam,    // --lr-scale dyn | --lr-scale 1.0,1.5,1.5,0.5,1.0
+    pub spring_k: f32, // spring constant for dynamic params (0.0 = no spring, 0.1 = moderate)
+    pub active_layers: Option<usize>, // --active-layers N: first N layers at eq=1.0, rest at eq=0.0
+}
+
+/// A parameter that can be fixed (manual value) or dynamic (model learns it).
+#[derive(Clone)]
+pub enum DynParam {
+    Off,                    // not used
+    Dynamic,                // model decides (with spring)
+    Fixed(Vec<f32>),        // human prescribes per-group values
+}
+
+impl DynParam {
+    pub fn is_active(&self) -> bool { !matches!(self, DynParam::Off) }
+    pub fn is_dynamic(&self) -> bool { matches!(self, DynParam::Dynamic) }
 }
 
 pub fn run_training(config: TrainConfig) {
@@ -213,7 +230,7 @@ pub fn run_training(config: TrainConfig) {
         println!("Resuming from checkpoint: {ckpt}");
         let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v, _ck_groups) = wave_checkpoint::load_checkpoint(ckpt);
         assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
-        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode), config.alpha, config.beta);
+        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()), config.alpha, config.beta);
         let ext_count = count_trainable_ex(&m, config.tied);
         if params.len() == ext_count {
             unflatten_params_ex(&mut m, &params, config.tied);
@@ -244,7 +261,7 @@ pub fn run_training(config: TrainConfig) {
         }
     } else {
         println!("Initializing model (seed=42)...");
-        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode), config.alpha, config.beta);
+        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()), config.alpha, config.beta);
         start_iter = 0;
         let n_t = count_trainable_ex(&model, config.tied);
         optimizer = Adam::new(config.lr, n_t);
@@ -260,7 +277,19 @@ pub fn run_training(config: TrainConfig) {
     println!("  Architecture: {} parallel blocks, {} harmonic heads, {} bands ({}-dim)", config.n_layers, config.n_head, config.n_bands, config.n_bands * 2);
 
     // Runtime dimensions (needed by pre-flight, forward, backward)
-    let dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode);
+    let dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active());
+
+    // Apply fixed values from CLI for dynamic params
+    if let DynParam::Fixed(ref vals) = config.layer_scale {
+        for (i, &v) in vals.iter().enumerate() {
+            if i < model.layer_scale.len() { model.layer_scale[i] = v; }
+        }
+    }
+    if let DynParam::Fixed(ref vals) = config.lr_scale {
+        for (i, &v) in vals.iter().enumerate() {
+            if i < model.lr_scale.len() { model.lr_scale[i] = v; }
+        }
+    }
 
     // ─── Pre-flight: out_proj_groups must divide n_embd ──────────────
     if config.out_proj_groups > 1 && dims.n_embd % config.out_proj_groups != 0 {
@@ -517,9 +546,80 @@ pub fn run_training(config: TrainConfig) {
             }
         }
 
+        // LR scale: per-group gradient scaling before optimizer step.
+        // Each group's gradients are multiplied by its lr_scale.
+        // The lr_scale evolves via spring toward 1.0.
+        if config.lr_scale.is_active() {
+            // Fixed mode: apply prescribed scales. Dynamic mode: hypergradient adjusts.
+            let is_dynamic_lr = config.lr_scale.is_dynamic();
+            let n_layers = model.blocks.len();
+            let n_embd = dims.n_embd;
+            let maestro_dim = crate::MAESTRO_DIM;
+            let per_block = n_embd * 4
+                + maestro_dim * n_embd + maestro_dim + n_embd * maestro_dim + n_embd
+                + maestro_dim * n_embd + maestro_dim + n_embd * maestro_dim + n_embd
+                + model.blocks[0].ffn.out_proj.param_count();
+            let ode_per = if model.learnable_ode {
+                model.blocks[0].ffn.kerr.gamma_raw.len() + 1 + 1 + model.blocks[0].ffn.kerr.phase_correction.len()
+            } else { 0 };
+            let block_total = per_block + ode_per;
+            let ls_count = if model.use_layer_scale { n_layers } else { 0 };
+
+            // Scale per-layer gradients
+            for l in 0..n_layers {
+                let start = l * block_total;
+                let end = start + block_total;
+                let s = model.lr_scale[l];
+                for i in start..end.min(total_grads.len()) {
+                    total_grads[i] *= s;
+                }
+            }
+            // Scale lm_head gradients (last group)
+            let head_start = n_layers * block_total + ls_count + n_embd * 2;
+            let s_head = model.lr_scale[n_layers];
+            for i in head_start..total_grads.len() {
+                total_grads[i] *= s_head;
+            }
+
+            // Spring + hypergradient only in dynamic mode (not when human prescribed values)
+            if is_dynamic_lr {
+            // Spring on lr_scale: pull toward 1.0
+            let k_lr = config.spring_k * 0.5;
+            for s in &mut model.lr_scale {
+                *s -= current_lr * k_lr * (*s - 1.0);
+                *s = s.clamp(0.1, 5.0);
+            }
+
+            // Hypergradient: adjust lr_scale based on gradient magnitude per group
+            for l in 0..n_layers {
+                let start = l * block_total;
+                let end = (start + block_total).min(total_grads.len());
+                let gn: f32 = total_grads[start..end].iter().map(|g| g * g).sum::<f32>().sqrt();
+                let avg_gn: f32 = total_grads.iter().map(|g| g * g).sum::<f32>().sqrt() / (n_layers as f32 + 1.0);
+                if avg_gn > 0.001 {
+                    // Nudge scale toward where gradients are larger
+                    model.lr_scale[l] += current_lr * 0.01 * (gn / avg_gn - 1.0);
+                    model.lr_scale[l] = model.lr_scale[l].clamp(0.1, 5.0);
+                }
+            }
+            } // end is_dynamic_lr
+        }
+
         let mut params = flatten_params_ex(&model, config.tied);
         optimizer.step(&mut params, &total_grads);
         unflatten_params_ex(&mut model, &params, config.tied);
+
+        // Layer scale spring: restoring force toward equilibrium.
+        // Spring is in the optimizer flow (like weight decay), not bolted onto loss.
+        // param -= lr * k * (param - eq)
+        if config.layer_scale.is_dynamic() && config.spring_k > 0.0 {
+            let active = config.active_layers.unwrap_or(model.blocks.len());
+            for l in 0..model.layer_scale.len() {
+                let eq = if l < active { 1.0 } else { 0.0 };
+                model.layer_scale[l] -= current_lr * config.spring_k * (model.layer_scale[l] - eq);
+                if model.layer_scale[l] < 0.0 { model.layer_scale[l] = 0.0; }
+            }
+        }
 
         // Dynamic AGC: update ceiling from learned coupling constants.
         // Uses min ceiling across all layers (most conservative — prevents divergence).
@@ -606,11 +706,23 @@ pub fn run_training(config: TrainConfig) {
             } else {
                 String::new()
             };
+            let ls_str = if config.layer_scale.is_active() {
+                let vals: Vec<String> = model.layer_scale.iter().map(|s| format!("{:.4}", s)).collect();
+                format!(r#","layer_scale":[{}]"#, vals.join(","))
+            } else {
+                String::new()
+            };
+            let lrs_str = if config.lr_scale.is_active() {
+                let vals: Vec<String> = model.lr_scale.iter().map(|s| format!("{:.4}", s)).collect();
+                format!(r#","lr_scale":[{}]"#, vals.join(","))
+            } else {
+                String::new()
+            };
             writeln!(log_writer,
-                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}{}}}"#,
+                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}{}{}{}}}"#,
                 iter, total_loss, current_lr, iter_start.elapsed().as_millis(), nan_skip_count,
                 model_gn, head_gn, head_pct, layer_str, clamp_count, max_mag,
-                agc.threshold, agc.ema_mean, agc.ema_std, ode_str
+                agc.threshold, agc.ema_mean, agc.ema_std, ode_str, ls_str, lrs_str
             ).ok();
         } else {
             writeln!(log_writer,

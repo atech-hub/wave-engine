@@ -23,6 +23,10 @@ pub struct WavePacketModel {
     // Wave transduction decoder (self-contained module)
     pub wd_state: Option<crate::common::wave_decode::WaveDecodeState>,
     pub learnable_ode: bool, // true = ODE params in flatten/unflatten, false = frozen
+    pub layer_scale: Vec<f32>, // per-layer residual scaling (1.0 = default, learnable when dynamic)
+    pub use_layer_scale: bool, // true = layer_scale is learnable parameter
+    pub lr_scale: Vec<f32>, // per-group LR multiplier [n_layers + 1 for lm_head] (training only)
+    pub use_lr_scale: bool,
 }
 
 pub fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
@@ -134,6 +138,10 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
     WavePacketModel {
         wte, wpe, blocks, ln_f, lm_head, lm_down, lm_up, lm_rank, vocab_size,
         tied_temperature: 1.0, wd_state, learnable_ode: d.learnable_ode,
+        layer_scale: vec![1.0; n_layers],
+        use_layer_scale: d.use_layer_scale,
+        lr_scale: vec![1.0; n_layers + 1], // +1 for lm_head group
+        use_lr_scale: d.use_lr_scale,
     }
 }
 
@@ -159,6 +167,9 @@ pub fn count_trainable_ex(model: &WavePacketModel, tied: bool) -> usize {
             n += 1; // beta
             n += block.ffn.kerr.phase_correction.len(); // corrector plate
         }
+    }
+    if model.use_layer_scale {
+        n += model.layer_scale.len(); // 1 per layer
     }
     n += n_embd * 2;
     if let Some(ref wds) = model.wd_state {
@@ -200,6 +211,9 @@ pub fn flatten_params_ex(model: &WavePacketModel, tied: bool) -> Vec<f32> {
             p.push(block.ffn.kerr.beta);
             p.extend_from_slice(&block.ffn.kerr.phase_correction);
         }
+    }
+    if model.use_layer_scale {
+        p.extend_from_slice(&model.layer_scale);
     }
     p.extend_from_slice(&model.ln_f.weight);
     p.extend_from_slice(&model.ln_f.bias);
@@ -250,6 +264,12 @@ pub fn unflatten_params_ex(model: &mut WavePacketModel, params: &[f32], tied: bo
             let nc = block.ffn.kerr.phase_correction.len();
             block.ffn.kerr.phase_correction.copy_from_slice(&params[idx..idx+nc]); idx += nc;
         }
+    }
+    if model.use_layer_scale {
+        let nl = model.layer_scale.len();
+        model.layer_scale.copy_from_slice(&params[idx..idx+nl]); idx += nl;
+        // Soft floor only — spring handles regulation, no gate clamp
+        for s in &mut model.layer_scale { if *s < 0.0 { *s = 0.0; } }
     }
     model.ln_f.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
     model.ln_f.bias.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
