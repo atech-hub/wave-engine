@@ -31,22 +31,16 @@ pub fn phase_native_loss(
         corrected[k * 2 + 1] = r * sin_c + s * cos_c;
     }
 
-    // Compute phase coherence with every token's embedding (using corrected hidden)
+    // Dot product against embeddings — same metric as lm_head but against fixed embeddings.
+    // Magnitude matters: the ODE gets gradient through both phase AND magnitude.
     let mut coherences = vec![0.0f32; vocab_size];
     for v in 0..vocab_size {
         let emb = &embeddings[v];
-        let mut coh = 0.0f32;
-        for k in 0..n_bands {
-            let r1 = corrected[k * 2];
-            let s1 = corrected[k * 2 + 1];
-            let r2 = emb[k * 2];
-            let s2 = emb[k * 2 + 1];
-            let dot = r1 * r2 + s1 * s2;
-            let mag1 = (r1 * r1 + s1 * s1).sqrt().max(1e-8);
-            let mag2 = (r2 * r2 + s2 * s2).sqrt().max(1e-8);
-            coh += dot / (mag1 * mag2);
+        let mut score = 0.0f32;
+        for j in 0..n_embd {
+            score += corrected[j] * emb[j];
         }
-        coherences[v] = coh / n_bands as f32 / temperature;
+        coherences[v] = score / temperature;
     }
 
     // Softmax over coherences → probabilities
@@ -58,27 +52,14 @@ pub fn phase_native_loss(
     // Cross-entropy loss
     let loss = -probs[target].max(1e-10).ln();
 
-    // Gradient: d_loss/d_corrected (then chain through corrector to get d_hidden and d_corrector)
-    // d_loss/d_coherence[v] = probs[v] - (v == target)
+    // Gradient: d_loss/d_corrected — dot product gradient is simple: d_score/d_corrected[j] = emb[j]
+    // d_loss/d_score[v] = probs[v] - (v == target)
     let mut d_corrected = vec![0.0f32; n_embd];
     for v in 0..vocab_size {
-        let weight = probs[v] - if v == target { 1.0 } else { 0.0 };
+        let weight = (probs[v] - if v == target { 1.0 } else { 0.0 }) / temperature;
         let emb = &embeddings[v];
-        for k in 0..n_bands {
-            let r1 = corrected[k * 2];
-            let s1 = corrected[k * 2 + 1];
-            let r2 = emb[k * 2];
-            let s2 = emb[k * 2 + 1];
-            let mag1 = (r1 * r1 + s1 * s1).sqrt().max(1e-8);
-            let mag2 = (r2 * r2 + s2 * s2).sqrt().max(1e-8);
-            let dot = r1 * r2 + s1 * s2;
-            // d(coh_k)/d(r1) = r2/(mag1*mag2) - r1*dot/(mag1^3 * mag2)
-            let d_r = (r2 / (mag1 * mag2) - r1 * dot / (mag1.powi(3) * mag2))
-                      / n_bands as f32 / temperature;
-            let d_s = (s2 / (mag1 * mag2) - s1 * dot / (mag1.powi(3) * mag2))
-                      / n_bands as f32 / temperature;
-            d_corrected[k * 2] += weight * d_r;
-            d_corrected[k * 2 + 1] += weight * d_s;
+        for j in 0..n_embd {
+            d_corrected[j] += weight * emb[j];
         }
     }
 

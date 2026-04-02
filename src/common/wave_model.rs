@@ -4,7 +4,7 @@
 use crate::model::*;
 use crate::wave_attn::{WaveAttnWeights, WaveAttnHeadWeights};
 use crate::wave_block::WaveBlockWeights;
-use crate::wave_embed::{build_harmonic_table_with_moduli, build_positional_table};
+use crate::wave_embed::{build_harmonic_table_with_moduli, build_harmonic_table_pythagorean, build_positional_table};
 use crate::common::rng::Rng;
 use crate::Dims;
 use crate::common::wave_decode;
@@ -43,7 +43,11 @@ pub fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32
 pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: usize, d: Dims, alpha: f32, beta: f32) -> WavePacketModel {
     let mut rng = Rng::new(seed);
 
-    let wte = build_harmonic_table_with_moduli(vocab_size, d.n_bands, d.m1, d.m2);
+    let wte = if d.pythagorean {
+        build_harmonic_table_pythagorean(vocab_size, d.n_bands)
+    } else {
+        build_harmonic_table_with_moduli(vocab_size, d.n_bands, d.m1, d.m2)
+    };
     let wpe = build_positional_table(d.block_size, d.n_bands);
 
     let mut blocks = Vec::new();

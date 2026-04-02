@@ -484,6 +484,7 @@ fn main() {
         lr_scale: parse_dyn_param("--lr-scale"),
         phase_native: std::env::args().any(|a| a == "--phase-native"),
         phase_temp: parse_flag("--phase-temp", 1.0),
+        pythagorean: std::env::args().any(|a| a == "--pythagorean"),
         spring_k: parse_flag("--spring", 0.1),
         active_layers: std::env::args().skip_while(|a| a != "--active-layers").nth(1).and_then(|s| s.parse().ok()),
     });

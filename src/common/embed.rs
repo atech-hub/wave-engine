@@ -39,6 +39,33 @@ pub fn build_harmonic_table(vocab_size: usize, n_bands: usize) -> Vec<Vec<f32>> 
     build_harmonic_table_with_moduli(vocab_size, n_bands, None, None)
 }
 
+/// Pythagorean sphere encoding: magnitude decays as 1/sqrt(n+1).
+/// Fundamental band loudest, harmonics decay like physical waves.
+/// Same total energy per token (normalised after construction).
+pub fn build_harmonic_table_pythagorean(vocab_size: usize, n_bands: usize) -> Vec<Vec<f32>> {
+    let mut table = build_harmonic_table_with_moduli(vocab_size, n_bands, None, None);
+    let half = n_bands / 2;
+    for emb in &mut table {
+        // Apply Pythagorean magnitude profile to both grids
+        for n in 0..half {
+            let mag = 1.0 / ((n + 1) as f32).sqrt();
+            emb[n * 2] *= mag;
+            emb[n * 2 + 1] *= mag;
+        }
+        for n in 0..half {
+            let idx = half + n;
+            let mag = 1.0 / ((n + 1) as f32).sqrt();
+            emb[idx * 2] *= mag;
+            emb[idx * 2 + 1] *= mag;
+        }
+        // Normalise to same total energy as flat (sum of mag² = n_bands for flat)
+        let energy: f32 = (0..n_bands).map(|k| emb[k*2]*emb[k*2] + emb[k*2+1]*emb[k*2+1]).sum();
+        let scale = (n_bands as f32 / energy.max(1e-8)).sqrt();
+        for j in 0..n_bands*2 { emb[j] *= scale; }
+    }
+    table
+}
+
 pub fn build_harmonic_table_with_moduli(vocab_size: usize, n_bands: usize, m1_override: Option<usize>, m2_override: Option<usize>) -> Vec<Vec<f32>> {
     let n_embd = n_bands * 2;
     let half = n_bands / 2;
