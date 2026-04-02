@@ -92,14 +92,7 @@ pub fn forward_with_cache(
         let _tf = std::time::Instant::now();
         let freeze_ode = !d.learnable_ode;
         let use_corrector = d.use_corrector;
-        // Reference map: pass embeddings to the LAST layer only when phase_native
-        let is_last_layer = block_idx == model.blocks.len() - 1;
-        let ref_map_opt: Option<(&[Vec<f32>], f32)> = if model.phase_native && is_last_layer {
-            Some((&model.wte, 0.01)) // kappa=0.01 gentle pull
-        } else {
-            None
-        };
-        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, freeze_ode, use_corrector, agc_for_layer, ref_map_opt);
+        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, freeze_ode, use_corrector, agc_for_layer);
         let ffn_dur = _tf.elapsed();
 
         // Attention (CPU — frozen, harmonic coherence scoring)

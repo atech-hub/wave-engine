@@ -57,20 +57,10 @@ fn neighbour_sum(r: &[f32], s: &[f32], k: usize) -> f32 {
 
 /// Compute the ODE derivative for all bands.
 /// Returns (dr, ds) where dr[k] = -gamma[k]*r[k] - phi[k]*s[k], etc.
-/// Optional reference map: adds κ(ref - state) pull toward nearest embedding.
 fn deriv(
     r: &[f32], s: &[f32],
     gamma: &[f32], omega: &[f32],
     alpha: f32, beta: f32,
-) -> (Vec<f32>, Vec<f32>) {
-    deriv_with_ref(r, s, gamma, omega, alpha, beta, None)
-}
-
-fn deriv_with_ref(
-    r: &[f32], s: &[f32],
-    gamma: &[f32], omega: &[f32],
-    alpha: f32, beta: f32,
-    ref_map: Option<(&[Vec<f32>], f32)>, // (embeddings, kappa)
 ) -> (Vec<f32>, Vec<f32>) {
     let n = r.len();
     let mut dr = vec![0.0f32; n];
@@ -82,32 +72,6 @@ fn deriv_with_ref(
         dr[k] = -gamma[k] * r[k] - phi * s[k];
         ds[k] = -gamma[k] * s[k] + phi * r[k];
     }
-
-    // Reference pull: κ(ref - state) toward nearest embedding
-    if let Some((embeddings, kappa)) = ref_map {
-        if kappa > 1e-6 {
-            // Find nearest embedding by phase coherence
-            let mut best_idx = 0;
-            let mut best_coh = f32::NEG_INFINITY;
-            for (v, emb) in embeddings.iter().enumerate() {
-                let mut coh = 0.0f32;
-                for k in 0..n {
-                    let dot = r[k] * emb[k * 2] + s[k] * emb[k * 2 + 1];
-                    let mag1 = (r[k] * r[k] + s[k] * s[k]).sqrt().max(1e-8);
-                    let mag2 = (emb[k*2]*emb[k*2] + emb[k*2+1]*emb[k*2+1]).sqrt().max(1e-8);
-                    coh += dot / (mag1 * mag2);
-                }
-                if coh > best_coh { best_coh = coh; best_idx = v; }
-            }
-            // Apply spring pull toward nearest embedding
-            let ref_emb = &embeddings[best_idx];
-            for k in 0..n {
-                dr[k] += kappa * (ref_emb[k * 2] - r[k]);
-                ds[k] += kappa * (ref_emb[k * 2 + 1] - s[k]);
-            }
-        }
-    }
-
     (dr, ds)
 }
 
@@ -119,15 +83,6 @@ fn deriv_with_ref(
 pub fn ode_forward_with_cache(
     x: &[f32],
     weights: &KerrWeights,
-) -> (Vec<f32>, OdeForwardCache) {
-    ode_forward_with_cache_ref(x, weights, None)
-}
-
-/// ODE forward with optional reference map (for phase-native L3).
-pub fn ode_forward_with_cache_ref(
-    x: &[f32],
-    weights: &KerrWeights,
-    ref_map: Option<(&[Vec<f32>], f32)>, // (embeddings, kappa)
 ) -> (Vec<f32>, OdeForwardCache) {
     let n_bands = weights.gamma_raw.len();
     let n_embd = n_bands * 2;
@@ -150,22 +105,22 @@ pub fn ode_forward_with_cache_ref(
         s_at_step.push(s.clone());
 
         // k1 at (r, s)
-        let (k1r, k1s) = deriv_with_ref(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, ref_map);
+        let (k1r, k1s) = deriv(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta);
 
         // k2 at (r + 0.5*dt*k1, s + 0.5*dt*k1)
         let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&a, &b)| a + 0.5*dt*b).collect();
         let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&a, &b)| a + 0.5*dt*b).collect();
-        let (k2r, k2s) = deriv_with_ref(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta, ref_map);
+        let (k2r, k2s) = deriv(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta);
 
         // k3 at (r + 0.5*dt*k2, s + 0.5*dt*k2)
         let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&a, &b)| a + 0.5*dt*b).collect();
         let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&a, &b)| a + 0.5*dt*b).collect();
-        let (k3r, k3s) = deriv_with_ref(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta, ref_map);
+        let (k3r, k3s) = deriv(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta);
 
         // k4 at (r + dt*k3, s + dt*k3)
         let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a, &b)| a + dt*b).collect();
         let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a, &b)| a + dt*b).collect();
-        let (k4r, k4s) = deriv_with_ref(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta, ref_map);
+        let (k4r, k4s) = deriv(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta);
 
         // Store k-values
         all_kr.push([k1r.clone(), k2r.clone(), k3r.clone(), k4r.clone()]);
@@ -469,13 +424,13 @@ mod tests {
             let (dr, ds) = deriv(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta);
             let r2: Vec<f32> = r.iter().zip(&dr).map(|(&a, &b)| a + 0.5*dt*b).collect();
             let s2: Vec<f32> = s.iter().zip(&ds).map(|(&a, &b)| a + 0.5*dt*b).collect();
-            let (k2r, k2s) = deriv_with_ref(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta, ref_map);
+            let (k2r, k2s) = deriv(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta);
             let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&a, &b)| a + 0.5*dt*b).collect();
             let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&a, &b)| a + 0.5*dt*b).collect();
-            let (k3r, k3s) = deriv_with_ref(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta, ref_map);
+            let (k3r, k3s) = deriv(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta);
             let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a, &b)| a + dt*b).collect();
             let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a, &b)| a + dt*b).collect();
-            let (k4r, k4s) = deriv_with_ref(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta, ref_map);
+            let (k4r, k4s) = deriv(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta);
             r = (0..n_bands).map(|i| r[i] + dt/6.0*(dr[i]+2.0*k2r[i]+2.0*k3r[i]+k4r[i])).collect();
             s = (0..n_bands).map(|i| s[i] + dt/6.0*(ds[i]+2.0*k2s[i]+2.0*k3s[i]+k4s[i])).collect();
         }
