@@ -46,6 +46,7 @@ pub fn ffn_forward_via_backend(
     freeze_ode: bool,
     use_corrector: bool,
     layer_agc: Option<&mut crate::common::agc::OdeAgc>,
+    ref_map: Option<(&[Vec<f32>], f32)>, // (embeddings, kappa) for L3 reference pull
 ) -> (Vec<Vec<f32>>, FfnCache) {
     let t = x.len();
     let n_embd = x[0].len();
@@ -91,7 +92,7 @@ pub fn ffn_forward_via_backend(
         let mut outs = Vec::with_capacity(t);
         let mut caches = Vec::with_capacity(t);
         for p in &precond {
-            let (out, cache) = crate::cpu::ode_backward::ode_forward_with_cache(p, &weights.kerr);
+            let (out, cache) = crate::cpu::ode_backward::ode_forward_with_cache_ref(p, &weights.kerr, ref_map);
             outs.push(out);
             caches.push(cache);
         }

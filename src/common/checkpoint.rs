@@ -112,9 +112,10 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let n_ext = n_base + ck_layers * (ck_bands + 1 + 1 + ck_bands);
     // Extended + layer_scale: +1 per layer for layer contribution scaling
     let n_ext_ls = n_ext + ck_layers;
-    // Phase-native variants: no lm_head (subtract vocab_size * n_embd)
-    let n_phase = n_ext - lm_head_params;
-    let n_phase_ls = n_ext_ls - lm_head_params;
+    // Phase-native variants: no lm_head, add output_corrector (n_bands phase rotations)
+    let n_phase = n_ext - lm_head_params + ck_bands; // with 84-param output corrector
+    let n_phase_no_oc = n_ext - lm_head_params; // without output corrector
+    let n_phase_ls = n_ext_ls - lm_head_params + ck_bands;
 
     // Determine actual param count from file size
     let file_len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
@@ -123,8 +124,9 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let data_bytes = file_len.saturating_sub(header_size);
     let n_params = if data_bytes == n_ext_ls * 12 { n_ext_ls }
                    else if data_bytes == n_phase_ls * 12 { n_phase_ls }
-                   else if data_bytes == n_ext * 12 { n_ext }
                    else if data_bytes == n_phase * 12 { n_phase }
+                   else if data_bytes == n_ext * 12 { n_ext }
+                   else if data_bytes == n_phase_no_oc * 12 { n_phase_no_oc }
                    else { n_base };
 
     let adam_t = read_u64(&mut f) as usize;

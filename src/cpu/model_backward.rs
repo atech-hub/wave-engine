@@ -55,6 +55,8 @@ pub struct Gradients {
     pub tied_temperature: f32,
     // Layer scale gradients
     pub layer_scale: Vec<f32>,
+    // Output corrector gradients (phase-native only)
+    pub d_output_corrector: Vec<f32>,
     // Wave transduction gradients (self-contained)
     pub wd_grads: Option<crate::common::wave_decode::WaveDecodeGrads>,
 }
@@ -91,6 +93,7 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         lm_down: if d.lm_rank > 0 { vec![vec![0.0; d.n_embd]; d.lm_rank] } else { vec![] },
         lm_up: if d.lm_rank > 0 { vec![vec![0.0; d.lm_rank]; vocab_size] } else { vec![] },
         layer_scale: if d.use_layer_scale { vec![0.0; n_blocks] } else { vec![] },
+        d_output_corrector: vec![],
         tied_temperature: 0.0,
         wd_grads: None, // populated by wave_decode::backward when active
     };
@@ -103,14 +106,19 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         // Phase-native loss: compare post_ln_f against embeddings using phase coherence.
         // No lm_head involved. The ODE learns to output in embedding space.
         let temp = if d.phase_temp > 0.0 { d.phase_temp } else { 1.0 };
+        let mut d_output_corrector = vec![0.0f32; d.n_bands];
         for pos in 0..t {
-            let (loss, d_h) = crate::common::phase_loss::phase_native_loss(
+            let (loss, d_h, d_oc) = crate::common::phase_loss::phase_native_loss(
                 &cache.post_ln_f[pos], &model.wte, targets[pos], d.n_bands, temp,
+                &model.output_corrector,
             );
             total_loss += loss;
             for j in 0..n_embd { d_hidden[pos][j] = d_h[j] / t as f32; }
+            for k in 0..d.n_bands { d_output_corrector[k] += d_oc[k] / t as f32; }
         }
         total_loss /= t as f32;
+        // Store output corrector gradient for flatten_grads
+        grads.d_output_corrector = d_output_corrector;
     } else {
     // Standard loss + d_logits through lm_head
     let mut d_logits: Vec<Vec<f32>> = Vec::with_capacity(t);
@@ -534,6 +542,9 @@ pub fn flatten_grads_ex(grads: &Gradients, tied: bool) -> Vec<f32> {
     }
     g.extend_from_slice(&grads.ln_f_w);
     g.extend_from_slice(&grads.ln_f_b);
+    if !grads.d_output_corrector.is_empty() {
+        g.extend_from_slice(&grads.d_output_corrector);
+    }
     if let Some(ref wg) = grads.wd_grads {
         g.extend_from_slice(&crate::common::wave_decode::flatten_grads(wg));
     } else if !grads.lm_down.is_empty() {

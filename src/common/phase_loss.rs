@@ -3,28 +3,42 @@
 //! No lm_head needed — the embedding table IS the decoder.
 
 /// Compute phase-native loss and gradient.
-/// Compares the final hidden state against all token embeddings using phase coherence,
-/// then applies cross-entropy over the coherence-derived probabilities.
+/// Applies output corrector (per-band phase rotation) before comparing against embeddings.
 ///
-/// Returns (loss, d_hidden) where d_hidden is the gradient w.r.t. the hidden state.
+/// Returns (loss, d_hidden, d_corrector) where:
+/// - d_hidden: gradient w.r.t. the hidden state (for backward through the model)
+/// - d_corrector: gradient w.r.t. the output corrector angles
 pub fn phase_native_loss(
     hidden: &[f32],           // [n_embd] — final hidden state (post ln_f)
     embeddings: &[Vec<f32>],  // [vocab_size][n_embd] — the embedding table (wte)
     target: usize,            // target token index
     n_bands: usize,
     temperature: f32,
-) -> (f32, Vec<f32>) {
+    output_corrector: &[f32], // [n_bands] — per-band phase rotation angles
+) -> (f32, Vec<f32>, Vec<f32>) {
     let vocab_size = embeddings.len();
     let n_embd = n_bands * 2;
 
-    // Compute phase coherence with every token's embedding
+    // Output corrector: per-band phase rotation only. 84 params.
+    // Rotates each band's phase to align with embedding space.
+    // The ODE handles magnitude. The corrector handles phase alignment.
+    let mut corrected = vec![0.0f32; n_embd];
+    for k in 0..n_bands {
+        let (sin_c, cos_c) = output_corrector[k].sin_cos();
+        let r = hidden[k * 2];
+        let s = hidden[k * 2 + 1];
+        corrected[k * 2]     = r * cos_c - s * sin_c;
+        corrected[k * 2 + 1] = r * sin_c + s * cos_c;
+    }
+
+    // Compute phase coherence with every token's embedding (using corrected hidden)
     let mut coherences = vec![0.0f32; vocab_size];
     for v in 0..vocab_size {
         let emb = &embeddings[v];
         let mut coh = 0.0f32;
         for k in 0..n_bands {
-            let r1 = hidden[k * 2];
-            let s1 = hidden[k * 2 + 1];
+            let r1 = corrected[k * 2];
+            let s1 = corrected[k * 2 + 1];
             let r2 = emb[k * 2];
             let s2 = emb[k * 2 + 1];
             let dot = r1 * r2 + s1 * s2;
@@ -44,16 +58,15 @@ pub fn phase_native_loss(
     // Cross-entropy loss
     let loss = -probs[target].max(1e-10).ln();
 
-    // Gradient: d_loss/d_hidden
-    // Chain: loss → softmax → coherences → hidden
+    // Gradient: d_loss/d_corrected (then chain through corrector to get d_hidden and d_corrector)
     // d_loss/d_coherence[v] = probs[v] - (v == target)
-    let mut d_hidden = vec![0.0f32; n_embd];
+    let mut d_corrected = vec![0.0f32; n_embd];
     for v in 0..vocab_size {
         let weight = probs[v] - if v == target { 1.0 } else { 0.0 };
         let emb = &embeddings[v];
         for k in 0..n_bands {
-            let r1 = hidden[k * 2];
-            let s1 = hidden[k * 2 + 1];
+            let r1 = corrected[k * 2];
+            let s1 = corrected[k * 2 + 1];
             let r2 = emb[k * 2];
             let s2 = emb[k * 2 + 1];
             let mag1 = (r1 * r1 + s1 * s1).sqrt().max(1e-8);
@@ -64,12 +77,31 @@ pub fn phase_native_loss(
                       / n_bands as f32 / temperature;
             let d_s = (s2 / (mag1 * mag2) - s1 * dot / (mag1.powi(3) * mag2))
                       / n_bands as f32 / temperature;
-            d_hidden[k * 2] += weight * d_r;
-            d_hidden[k * 2 + 1] += weight * d_s;
+            d_corrected[k * 2] += weight * d_r;
+            d_corrected[k * 2 + 1] += weight * d_s;
         }
     }
 
-    (loss, d_hidden)
+    // Chain through output corrector rotation to get d_hidden and d_corrector
+    let mut d_hidden = vec![0.0f32; n_embd];
+    let mut d_corrector = vec![0.0f32; n_bands];
+    for k in 0..n_bands {
+        let (sin_c, cos_c) = output_corrector[k].sin_cos();
+        let dc_r = d_corrected[k * 2];
+        let dc_s = d_corrected[k * 2 + 1];
+        let r = hidden[k * 2];
+        let s = hidden[k * 2 + 1];
+
+        // d_hidden: inverse rotation
+        d_hidden[k * 2]     =  cos_c * dc_r + sin_c * dc_s;
+        d_hidden[k * 2 + 1] = -sin_c * dc_r + cos_c * dc_s;
+
+        // d_corrector[k]: gradient of rotation angle
+        d_corrector[k] = dc_r * (-r * sin_c - s * cos_c)
+                       + dc_s * ( r * cos_c - s * sin_c);
+    }
+
+    (loss, d_hidden, d_corrector)
 }
 
 #[cfg(test)]
@@ -89,7 +121,8 @@ mod tests {
         let target = 1;
         let temp = 1.0;
 
-        let (loss, grad) = phase_native_loss(&hidden, &embeddings, target, n_bands, temp);
+        let corrector = vec![0.1, -0.2, 0.05, 0.3]; // 4 phase rotations
+        let (loss, grad, d_corr) = phase_native_loss(&hidden, &embeddings, target, n_bands, temp, &corrector);
         assert!(loss > 0.0, "Loss should be positive");
 
         // Finite difference check
@@ -99,16 +132,34 @@ mod tests {
             let mut h_minus = hidden.clone();
             h_plus[i] += eps;
             h_minus[i] -= eps;
-            let (l_plus, _) = phase_native_loss(&h_plus, &embeddings, target, n_bands, temp);
-            let (l_minus, _) = phase_native_loss(&h_minus, &embeddings, target, n_bands, temp);
+            let (l_plus, _, _) = phase_native_loss(&h_plus, &embeddings, target, n_bands, temp, &corrector);
+            let (l_minus, _, _) = phase_native_loss(&h_minus, &embeddings, target, n_bands, temp, &corrector);
             let fd = (l_plus - l_minus) / (2.0 * eps);
             let rel_err = if grad[i].abs() > 1e-6 {
                 (fd - grad[i]).abs() / grad[i].abs()
             } else {
                 (fd - grad[i]).abs()
             };
-            assert!(rel_err < 0.05, "Gradient mismatch at {}: fd={:.6} analytical={:.6} rel_err={:.4}",
+            assert!(rel_err < 0.05, "Hidden grad mismatch at {}: fd={:.6} analytical={:.6} rel_err={:.4}",
                 i, fd, grad[i], rel_err);
+        }
+
+        // Check corrector gradients too
+        for i in 0..corrector.len() {
+            let mut c_plus = corrector.clone();
+            let mut c_minus = corrector.clone();
+            c_plus[i] += eps;
+            c_minus[i] -= eps;
+            let (l_plus, _, _) = phase_native_loss(&hidden, &embeddings, target, n_bands, temp, &c_plus);
+            let (l_minus, _, _) = phase_native_loss(&hidden, &embeddings, target, n_bands, temp, &c_minus);
+            let fd = (l_plus - l_minus) / (2.0 * eps);
+            let rel_err = if d_corr[i].abs() > 1e-6 {
+                (fd - d_corr[i]).abs() / d_corr[i].abs()
+            } else {
+                (fd - d_corr[i]).abs()
+            };
+            assert!(rel_err < 0.05, "Corrector grad mismatch at {}: fd={:.6} analytical={:.6} rel_err={:.4}",
+                i, fd, d_corr[i], rel_err);
         }
     }
 }

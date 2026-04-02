@@ -163,15 +163,24 @@ pub fn run_generate(config: GenerateConfig) {
         // Get logits/scores for last position
         let last_pos = cache.post_ln_f.len() - 1;
         let last_logits: Vec<f32> = if mdl.phase_native {
-            // Phase-native decode: coherence against embedding table
+            // Phase-native decode: apply output corrector then coherence against embeddings
             let hidden = &cache.post_ln_f[last_pos];
             let n_bands = dims.n_bands;
+            // Apply output corrector: phase rotation only (84 params)
+            let mut corrected = vec![0.0f32; n_bands * 2];
+            for k in 0..n_bands {
+                let (sin_c, cos_c) = mdl.output_corrector[k].sin_cos();
+                let r = hidden[k * 2];
+                let s = hidden[k * 2 + 1];
+                corrected[k * 2]     = r * cos_c - s * sin_c;
+                corrected[k * 2 + 1] = r * sin_c + s * cos_c;
+            }
             (0..mdl.vocab_size).map(|v| {
                 let emb = &mdl.wte[v];
                 let mut coh = 0.0f32;
                 for k in 0..n_bands {
-                    let r1 = hidden[k * 2];
-                    let s1 = hidden[k * 2 + 1];
+                    let r1 = corrected[k * 2];
+                    let s1 = corrected[k * 2 + 1];
                     let r2 = emb[k * 2];
                     let s2 = emb[k * 2 + 1];
                     let dot = r1 * r2 + s1 * s2;
