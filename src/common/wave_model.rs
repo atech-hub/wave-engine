@@ -27,6 +27,7 @@ pub struct WavePacketModel {
     pub use_layer_scale: bool, // true = layer_scale is learnable parameter
     pub lr_scale: Vec<f32>, // per-group LR multiplier [n_layers + 1 for lm_head] (training only)
     pub use_lr_scale: bool,
+    pub phase_native: bool, // true = use phase coherence loss instead of lm_head
 }
 
 pub fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
@@ -142,6 +143,7 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
         use_layer_scale: d.use_layer_scale,
         lr_scale: vec![1.0; n_layers + 1], // +1 for lm_head group
         use_lr_scale: d.use_lr_scale,
+        phase_native: false,
     }
 }
 
@@ -172,7 +174,9 @@ pub fn count_trainable_ex(model: &WavePacketModel, tied: bool) -> usize {
         n += model.layer_scale.len(); // 1 per layer
     }
     n += n_embd * 2;
-    if let Some(ref wds) = model.wd_state {
+    if model.phase_native {
+        // No lm_head params — phase coherence replaces the decoder
+    } else if let Some(ref wds) = model.wd_state {
         n += wave_decode::param_count(wds);
     } else if model.lm_rank > 0 {
         n += model.lm_rank * n_embd;
@@ -217,7 +221,9 @@ pub fn flatten_params_ex(model: &WavePacketModel, tied: bool) -> Vec<f32> {
     }
     p.extend_from_slice(&model.ln_f.weight);
     p.extend_from_slice(&model.ln_f.bias);
-    if let Some(ref wds) = model.wd_state {
+    if model.phase_native {
+        // No lm_head in param vector — phase coherence replaces the decoder
+    } else if let Some(ref wds) = model.wd_state {
         p.extend_from_slice(&wave_decode::flatten_params(wds));
     } else if model.lm_rank > 0 {
         for row in &model.lm_down { p.extend_from_slice(row); }
@@ -273,7 +279,9 @@ pub fn unflatten_params_ex(model: &mut WavePacketModel, params: &[f32], tied: bo
     }
     model.ln_f.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
     model.ln_f.bias.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-    if let Some(ref mut wds) = model.wd_state {
+    if model.phase_native {
+        // No lm_head to unflatten
+    } else if let Some(ref mut wds) = model.wd_state {
         let wn = wave_decode::param_count(wds);
         wave_decode::unflatten_params(wds, &params[idx..idx + wn]);
         idx += wn;

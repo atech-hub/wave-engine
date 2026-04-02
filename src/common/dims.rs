@@ -33,11 +33,12 @@ pub struct Dims {
     pub use_corrector: bool, // true = corrector plate active (per-band phase correction after ODE)
     pub use_layer_scale: bool, // true = per-layer residual scaling is learnable
     pub use_lr_scale: bool, // true = per-group LR scaling is learnable
+    pub phase_temp: f32, // temperature for phase-native loss (0.0 = use default 1.0)
 }
 
 impl Dims {
     pub fn from_cli(n_bands: usize, n_head: usize, maestro_dim: usize, block_size: usize, rk4_steps: usize) -> Self {
-        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false }
+        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false, phase_temp: 0.0 }
     }
     pub fn with_tied(mut self, tied: bool) -> Self {
         self.tied = tied;

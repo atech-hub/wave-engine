@@ -204,6 +204,155 @@ fn main() {
         return;
     }
 
+    // ─── ODE monitor ───
+    if std::env::args().any(|a| a == "--ode-monitor") {
+        let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)
+            .expect("--ode-monitor requires --resume");
+        let n_layers: usize = parse_flag("--layers", N_LAYERS);
+        let n_bands: usize = parse_flag("--n-bands", N_BANDS);
+        let n_head: usize = parse_flag("--n-head", N_HEAD);
+        let out_proj_groups: usize = parse_flag("--out-proj-groups", 6);
+        let alpha: f32 = parse_flag("--alpha", 0.1);
+        let beta: f32 = parse_flag("--beta", parse_flag("--alpha", 0.1));
+        let data_path = std::env::args().skip_while(|a| a != "--data").nth(1)
+            .unwrap_or("data/arithmetic_single.txt".to_string());
+
+        let (params, ck_vocab, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&resume_path);
+        // Load model (try ext+ls, ext, base)
+        let dims_ext_ls = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true).with_layer_scale(true);
+        let mut model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_ext_ls, alpha, beta);
+        let ext_ls = common::wave_model::count_trainable_ex(&model, false);
+        let dims_ext = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true);
+        let mut model2 = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_ext, alpha, beta);
+        let ext_count = common::wave_model::count_trainable_ex(&model2, false);
+        if params.len() == ext_ls {
+            common::wave_model::unflatten_params_ex(&mut model, &params, false);
+        } else if params.len() == ext_count {
+            model = model2;
+            common::wave_model::unflatten_params_ex(&mut model, &params, false);
+        } else {
+            let dims_base = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+                .with_learnable_ode(false).with_corrector(false);
+            model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_base, alpha, beta);
+            unflatten_params(&mut model, &params);
+        }
+        model.learnable_ode = false;
+
+        let dims = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_learnable_ode(false).with_corrector(true);
+        let stencil = fft_ode::StencilFft::new(n_bands);
+        crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+
+        // Build char vocab
+        let text = std::fs::read_to_string(&data_path).expect("Failed to read data");
+        let mut chars: Vec<char> = text.chars().collect();
+        chars.sort(); chars.dedup();
+        let char_map: Vec<char> = chars[..chars.len().min(ck_vocab)].to_vec();
+        let encode = |s: &str| -> Vec<usize> {
+            s.chars().filter_map(|c| char_map.iter().position(|&ch| ch == c)).collect()
+        };
+        let decode = |id: usize| -> String {
+            if id < char_map.len() { char_map[id].to_string() } else { "?".to_string() }
+        };
+
+        let prompt = std::env::args().skip_while(|a| a != "--prompt").nth(1)
+            .unwrap_or("3+4=".to_string());
+        let compare = std::env::args().skip_while(|a| a != "--compare").nth(1);
+
+        println!("=== ODE Monitor ===\n");
+        let tokens = encode(&prompt);
+        common::ode_monitor::print_ode_summary(&model, &tokens, dims, &stencil, &prompt, &decode);
+
+        if let Some(ref cmp) = compare {
+            let tokens_b = encode(cmp);
+            common::ode_monitor::compare_prompts(&model, &tokens, &tokens_b, dims, &stencil, &prompt, cmp);
+        }
+
+        return;
+    }
+
+    // ─── Phase decode diagnostic ───
+    if std::env::args().any(|a| a == "--phase-decode") {
+        let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)
+            .expect("--phase-decode requires --resume");
+        let n_layers: usize = parse_flag("--layers", N_LAYERS);
+        let n_bands: usize = parse_flag("--n-bands", N_BANDS);
+        let n_head: usize = parse_flag("--n-head", N_HEAD);
+        let out_proj_groups: usize = parse_flag("--out-proj-groups", 6);
+        let alpha: f32 = parse_flag("--alpha", 0.1);
+        let beta: f32 = parse_flag("--beta", parse_flag("--alpha", 0.1));
+        let data_path = std::env::args().skip_while(|a| a != "--data").nth(1)
+            .unwrap_or("data/arithmetic_single.txt".to_string());
+
+        let (params, ck_vocab, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&resume_path);
+        let dims_ext = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true).with_layer_scale(true);
+        let mut model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_ext, alpha, beta);
+        let ext_ls = common::wave_model::count_trainable_ex(&model, false);
+        let dims_ext2 = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true);
+        let mut model2 = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_ext2, alpha, beta);
+        let ext_count = common::wave_model::count_trainable_ex(&model2, false);
+        if params.len() == ext_ls {
+            common::wave_model::unflatten_params_ex(&mut model, &params, false);
+        } else if params.len() == ext_count {
+            model = model2;
+            common::wave_model::unflatten_params_ex(&mut model, &params, false);
+        } else {
+            let dims_base = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+                .with_learnable_ode(false).with_corrector(false);
+            model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_base, alpha, beta);
+            unflatten_params(&mut model, &params);
+        }
+        model.learnable_ode = false;
+
+        let dims = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_learnable_ode(false).with_corrector(true);
+        let stencil = fft_ode::StencilFft::new(n_bands);
+        crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+
+        // Build char vocab from data file
+        let text = std::fs::read_to_string(&data_path).expect("Failed to read data file");
+        let mut chars: Vec<char> = text.chars().collect();
+        chars.sort(); chars.dedup();
+        let char_map: Vec<char> = chars[..chars.len().min(ck_vocab)].to_vec();
+        let encode = |s: &str| -> Vec<usize> {
+            s.chars().filter_map(|c| char_map.iter().position(|&ch| ch == c)).collect()
+        };
+        let decode = |id: usize| -> String {
+            if id < char_map.len() { char_map[id].to_string() } else { "?".to_string() }
+        };
+
+        println!("Phase decode diagnostic: {} params, {} vocab", params.len(), ck_vocab);
+        println!("{:<10} {:<10} {:<10} {:<10}", "Prompt", "Expected", "LM_Head", "Phase");
+        println!("{}", "-".repeat(45));
+
+        let prompts = ["9-1=", "3+4=", "5-2=", "7+2=", "1+1=", "8-3=", "6+3=", "4-0=", "0+5=", "9-9="];
+        let expected = ["8", "7", "3", "9", "2", "5", "9", "4", "5", "0"];
+        let mut lm_correct = 0;
+        let mut phase_correct = 0;
+
+        for (prompt, exp) in prompts.iter().zip(expected.iter()) {
+            let tokens = encode(prompt);
+            let (phase_tok, lm_tok, coherences) = common::phase_decode::phase_decode_compare(
+                &model, &tokens, dims, &stencil,
+            );
+            let lm_ans = decode(lm_tok);
+            let ph_ans = decode(phase_tok);
+            let lm_ok = lm_ans == *exp;
+            let ph_ok = ph_ans == *exp;
+            if lm_ok { lm_correct += 1; }
+            if ph_ok { phase_correct += 1; }
+            println!("{:<10} {:<10} {:<10} {:<10}",
+                prompt,
+                exp,
+                format!("{}{}", lm_ans, if lm_ok { " ✓" } else { " ✗" }),
+                format!("{}{}", ph_ans, if ph_ok { " ✓" } else { " ✗" }),
+            );
+        }
+        println!("{}", "-".repeat(45));
+        println!("LM Head: {}/10    Phase decode: {}/10", lm_correct, phase_correct);
+        return;
+    }
+
     // ─── Generate mode ───
     if std::env::args().any(|a| a == "--generate") {
         let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)
@@ -223,6 +372,7 @@ fn main() {
             alpha: parse_flag("--alpha", 0.1),
             beta: parse_flag("--beta", parse_flag("--alpha", 0.1)),
             temperature: parse_flag("--temperature", 0.0),
+            phase_native: std::env::args().any(|a| a == "--phase-native"),
         });
         return;
     }
@@ -332,6 +482,8 @@ fn main() {
         no_corrector: std::env::args().any(|a| a == "--no-corrector"),
         layer_scale: parse_dyn_param("--layer-scale"),
         lr_scale: parse_dyn_param("--lr-scale"),
+        phase_native: std::env::args().any(|a| a == "--phase-native"),
+        phase_temp: parse_flag("--phase-temp", 1.0),
         spring_k: parse_flag("--spring", 0.1),
         active_layers: std::env::args().skip_while(|a| a != "--active-layers").nth(1).and_then(|s| s.parse().ok()),
     });

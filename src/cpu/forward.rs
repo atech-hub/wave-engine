@@ -102,9 +102,10 @@ pub fn forward_with_cache(
         _attn_total += attn_dur;
         _ffn_total += ffn_dur;
 
+        let scale = if model.use_layer_scale { model.layer_scale[block_idx] } else { 1.0 };
         let output: Vec<Vec<f32>> = (0..t).map(|i| {
             let mut v = vec![0.0f32; d.n_embd];
-            for j in 0..d.n_embd { v[j] = hidden[i][j] + attn_out[i][j] + ffn_out[i][j]; }
+            for j in 0..d.n_embd { v[j] = hidden[i][j] + scale * (attn_out[i][j] + ffn_out[i][j]); }
             v
         }).collect();
 
@@ -129,7 +130,10 @@ pub fn forward_with_cache(
         .map(|h| layer_norm(h, &model.ln_f.weight, &model.ln_f.bias))
         .collect();
 
-    let logits: Vec<Vec<f32>> = if let Some(ref wds) = model.wd_state {
+    let logits: Vec<Vec<f32>> = if model.phase_native {
+        // Phase-native: no lm_head computation. Logits are empty — decode via phase coherence.
+        vec![vec![]; post_ln_f.len()]
+    } else if let Some(ref wds) = model.wd_state {
         crate::common::wave_decode::forward(&post_ln_f, wds)
     } else if model.lm_rank > 0 {
         // Low-rank: hidden → lm_down → lm_up → logits

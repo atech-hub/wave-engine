@@ -53,6 +53,8 @@ pub struct Gradients {
     pub lm_down: Vec<Vec<f32>>,
     pub lm_up: Vec<Vec<f32>>,
     pub tied_temperature: f32,
+    // Layer scale gradients
+    pub layer_scale: Vec<f32>,
     // Wave transduction gradients (self-contained)
     pub wd_grads: Option<crate::common::wave_decode::WaveDecodeGrads>,
 }
@@ -85,15 +87,32 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         block_ffn_out_proj_b: vec![vec![0.0; d.n_embd]; n_blocks],
         ln_f_w: vec![0.0; d.n_embd],
         ln_f_b: vec![0.0; d.n_embd],
-        lm_head: if d.wave_decode || d.lm_rank > 0 || d.tied { vec![] } else { vec![vec![0.0; d.n_embd]; vocab_size] },
+        lm_head: if d.wave_decode || d.lm_rank > 0 || d.tied || model.phase_native { vec![] } else { vec![vec![0.0; d.n_embd]; vocab_size] },
         lm_down: if d.lm_rank > 0 { vec![vec![0.0; d.n_embd]; d.lm_rank] } else { vec![] },
         lm_up: if d.lm_rank > 0 { vec![vec![0.0; d.lm_rank]; vocab_size] } else { vec![] },
+        layer_scale: if d.use_layer_scale { vec![0.0; n_blocks] } else { vec![] },
         tied_temperature: 0.0,
         wd_grads: None, // populated by wave_decode::backward when active
     };
 
-    // Loss + d_logits
+    let n_embd = d.n_embd;
     let mut total_loss = 0.0f32;
+    let mut d_hidden: Vec<Vec<f32>> = vec![vec![0.0f32; n_embd]; t];
+
+    if model.phase_native {
+        // Phase-native loss: compare post_ln_f against embeddings using phase coherence.
+        // No lm_head involved. The ODE learns to output in embedding space.
+        let temp = if d.phase_temp > 0.0 { d.phase_temp } else { 1.0 };
+        for pos in 0..t {
+            let (loss, d_h) = crate::common::phase_loss::phase_native_loss(
+                &cache.post_ln_f[pos], &model.wte, targets[pos], d.n_bands, temp,
+            );
+            total_loss += loss;
+            for j in 0..n_embd { d_hidden[pos][j] = d_h[j] / t as f32; }
+        }
+        total_loss /= t as f32;
+    } else {
+    // Standard loss + d_logits through lm_head
     let mut d_logits: Vec<Vec<f32>> = Vec::with_capacity(t);
     for pos in 0..t {
         let max_l = cache.logits[pos].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -107,9 +126,6 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
     total_loss /= t as f32;
 
     // Backward through output decoder
-    let n_embd = d.n_embd;
-    let mut d_hidden: Vec<Vec<f32>> = vec![vec![0.0f32; n_embd]; t];
-
     if let Some(ref wds) = model.wd_state {
         let (dh, wg) = crate::common::wave_decode::backward(&d_logits, &cache.post_ln_f, wds);
         d_hidden = dh;
@@ -174,6 +190,7 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
             }
         }
     }
+    } // end else (standard lm_head path)
 
     // Backward through final LN
     let mut d_pre_ln_f: Vec<Vec<f32>> = Vec::with_capacity(t);
@@ -192,9 +209,24 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         let bc = &cache.block_caches[block_idx];
 
         // d_output = d_hidden (from above)
-        // output = input + attn_out + ffn_out (parallel residual)
-        // d_input = d_output, d_attn_out = d_output, d_ffn_out = d_output
-        let d_ffn_out: Vec<Vec<f32>> = d_hidden.clone();
+        // output = input + scale * (attn_out + ffn_out) (parallel residual with layer scale)
+        // d_contribution = scale * d_output, d_scale = dot(d_output, attn_out + ffn_out)
+        let scale = if d.use_layer_scale { model.layer_scale[block_idx] } else { 1.0 };
+        let d_ffn_out: Vec<Vec<f32>> = if scale != 1.0 {
+            d_hidden.iter().map(|dh| dh.iter().map(|&v| v * scale).collect()).collect()
+        } else {
+            d_hidden.clone()
+        };
+        // Layer scale gradient: d_scale = sum_pos sum_dim d_hidden[pos][dim] * (attn_out[pos][dim] + ffn_out[pos][dim])
+        if !grads.layer_scale.is_empty() {
+            let mut d_s = 0.0f32;
+            for pos in 0..t {
+                for j in 0..d.n_embd {
+                    d_s += d_hidden[pos][j] * (bc.attn_out[pos][j] + bc.ffn_out[pos][j]);
+                }
+            }
+            grads.layer_scale[block_idx] += d_s;
+        }
 
         // ─── FFN backward via ComputeBackend (kerr-engine pattern) ───
         let be: &dyn backend::ComputeBackend = match gpu {
@@ -496,6 +528,9 @@ pub fn flatten_grads_ex(grads: &Gradients, tied: bool) -> Vec<f32> {
             g.push(grads.block_ffn_kerr_beta[b]);
             g.extend_from_slice(&grads.block_ffn_phase_correction[b]);
         }
+    }
+    if !grads.layer_scale.is_empty() {
+        g.extend_from_slice(&grads.layer_scale);
     }
     g.extend_from_slice(&grads.ln_f_w);
     g.extend_from_slice(&grads.ln_f_b);

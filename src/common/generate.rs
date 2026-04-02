@@ -18,6 +18,7 @@ pub struct GenerateConfig {
     pub alpha: f32,
     pub beta: f32,
     pub temperature: f32,
+    pub phase_native: bool,
 }
 
 pub fn run_generate(config: GenerateConfig) {
@@ -52,48 +53,85 @@ pub fn run_generate(config: GenerateConfig) {
 
     let effective_vocab = vocab_size.max(ck_vocab);
 
-    // Build model with correct dims
-    let dims_ext = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-        .with_corrector(true);
-    let mut model = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_ext, config.alpha, config.beta);
-    let ext_count = count_trainable_ex(&model, false);
-
-    // Use inference dims: no ODE backward caching, but corrector ACTIVE
+    // Build model with correct dims — try multiple param layouts to match checkpoint
     let dims = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
         .with_learnable_ode(false)
         .with_corrector(true);
+    let mut mdl = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims, config.alpha, config.beta);
 
-    // Try ext+layer_scale, then ext, then base
-    let dims_ext_ls = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-        .with_corrector(true).with_layer_scale(true);
-    let mut model_ls = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_ext_ls, config.alpha, config.beta);
-    let ext_ls_count = count_trainable_ex(&model_ls, false);
+    // Try phase-native + layer_scale, phase-native, ext+layer_scale, ext, base
+    let mut loaded = false;
 
-    if params.len() == ext_ls_count {
-        unflatten_params_ex(&mut model_ls, &params, false);
-        model = model_ls;
-        eprintln!("  Loaded {} params (with ODE/corrector/layer_scale) from {}", params.len(), config.resume_path);
-    } else if params.len() == ext_count {
-        unflatten_params_ex(&mut model, &params, false);
+    // Phase-native + layer_scale
+    if !loaded {
+        let d = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true).with_layer_scale(true).with_learnable_ode(true);
+        let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, d, config.alpha, config.beta);
+        m.phase_native = true;
+        if params.len() == count_trainable_ex(&m, false) {
+            unflatten_params_ex(&mut m, &params, false);
+            mdl = m;
+            eprintln!("  Loaded {} params (phase-native + layer_scale) from {}", params.len(), config.resume_path);
+            loaded = true;
+        }
+    }
+    // Phase-native (no layer_scale)
+    if !loaded {
+        let d = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true).with_learnable_ode(true);
+        let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, d, config.alpha, config.beta);
+        m.phase_native = true;
+        if params.len() == count_trainable_ex(&m, false) {
+            unflatten_params_ex(&mut m, &params, false);
+            mdl = m;
+            eprintln!("  Loaded {} params (phase-native) from {}", params.len(), config.resume_path);
+            loaded = true;
+        }
+    }
+    // Ext + layer_scale
+    if !loaded {
+        let d = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true).with_layer_scale(true);
+        let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, d, config.alpha, config.beta);
+        if params.len() == count_trainable_ex(&m, false) {
+            unflatten_params_ex(&mut m, &params, false);
+            mdl = m;
+            eprintln!("  Loaded {} params (with ODE/corrector/layer_scale) from {}", params.len(), config.resume_path);
+            loaded = true;
+        }
+    }
+    // Ext (ODE + corrector)
+    let dims_ext = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+        .with_corrector(true);
+    let mut model_ext = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_ext, config.alpha, config.beta);
+    let ext_count = count_trainable_ex(&model_ext, false);
+    if !loaded && params.len() == ext_count {
+        unflatten_params_ex(&mut model_ext, &params, false);
+        mdl = model_ext;
         eprintln!("  Loaded {} params (with ODE/corrector) from {}", params.len(), config.resume_path);
-    } else {
+        loaded = true;
+    }
+    // Base (no ODE params)
+    if !loaded {
         let dims_base = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
             .with_learnable_ode(false).with_corrector(false);
-        model = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_base, config.alpha, config.beta);
-        unflatten_params(&mut model, &params);
+        mdl = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_base, config.alpha, config.beta);
+        unflatten_params(&mut mdl, &params);
         eprintln!("  Loaded {} params (base) from {}", params.len(), config.resume_path);
     }
-    model.learnable_ode = false;
+    mdl.learnable_ode = false;
+    mdl.phase_native = config.phase_native;
 
-    eprintln!("  Model: {}L, {}bands, {}dim, {}vocab, iter {}",
-        config.n_layers, config.n_bands, n_embd, effective_vocab, ck_iter);
+    eprintln!("  Model: {}L, {}bands, {}dim, {}vocab, iter {}{}",
+        config.n_layers, config.n_bands, n_embd, effective_vocab, ck_iter,
+        if config.phase_native { " [phase-native]" } else { "" });
 
     // FFT stencil for ODE
     let stencil = fft_ode::StencilFft::new(config.n_bands);
 
     // Initialize AGC from model's coupling
-    let alpha = model.blocks[0].ffn.kerr.alpha;
-    let beta = model.blocks[0].ffn.kerr.beta;
+    let alpha = mdl.blocks[0].ffn.kerr.alpha;
+    let beta = mdl.blocks[0].ffn.kerr.beta;
     crate::ffn_backend::init_agc(alpha, beta);
 
     // Autoregressive generation
@@ -120,10 +158,32 @@ pub fn run_generate(config: GenerateConfig) {
         let input = &tokens[start..];
 
         // Forward pass — SAME as training
-        let cache = forward_with_cache(&model, input, dims, None, None, None, Some(&stencil), None, None);
+        let cache = forward_with_cache(&mdl, input, dims, None, None, None, Some(&stencil), None, None);
 
-        // Get logits for last position
-        let last_logits = &cache.logits[cache.logits.len() - 1];
+        // Get logits/scores for last position
+        let last_pos = cache.post_ln_f.len() - 1;
+        let last_logits: Vec<f32> = if mdl.phase_native {
+            // Phase-native decode: coherence against embedding table
+            let hidden = &cache.post_ln_f[last_pos];
+            let n_bands = dims.n_bands;
+            (0..mdl.vocab_size).map(|v| {
+                let emb = &mdl.wte[v];
+                let mut coh = 0.0f32;
+                for k in 0..n_bands {
+                    let r1 = hidden[k * 2];
+                    let s1 = hidden[k * 2 + 1];
+                    let r2 = emb[k * 2];
+                    let s2 = emb[k * 2 + 1];
+                    let dot = r1 * r2 + s1 * s2;
+                    let mag1 = (r1 * r1 + s1 * s1).sqrt().max(1e-8);
+                    let mag2 = (r2 * r2 + s2 * s2).sqrt().max(1e-8);
+                    coh += dot / (mag1 * mag2);
+                }
+                coh / n_bands as f32
+            }).collect()
+        } else {
+            cache.logits[last_pos].clone()
+        };
 
         // Sample next token
         let next_token = if config.temperature <= 0.0 {
