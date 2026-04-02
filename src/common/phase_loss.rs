@@ -31,16 +31,30 @@ pub fn phase_native_loss(
         corrected[k * 2 + 1] = r * sin_c + s * cos_c;
     }
 
-    // Dot product against embeddings — same metric as lm_head but against fixed embeddings.
-    // Magnitude matters: the ODE gets gradient through both phase AND magnitude.
+    // Phase-magnitude comparison: phase coherence for discrimination, magnitude match for confidence.
+    // Phase score: cos(Δθ) per band — equal weight, discriminates tokens.
+    // Magnitude match: 1 - |mag1-mag2|/(mag1+mag2) per band — confirms energy profile.
+    // Combined: phase_score * (1 + λ * mag_match) — phase tells WHICH, magnitude tells HOW SURE.
+    let mag_weight = 0.5f32; // λ: how much magnitude confirmation matters
     let mut coherences = vec![0.0f32; vocab_size];
     for v in 0..vocab_size {
         let emb = &embeddings[v];
         let mut score = 0.0f32;
-        for j in 0..n_embd {
-            score += corrected[j] * emb[j];
+        for k in 0..n_bands {
+            let r1 = corrected[k * 2];
+            let s1 = corrected[k * 2 + 1];
+            let r2 = emb[k * 2];
+            let s2 = emb[k * 2 + 1];
+            let dot = r1 * r2 + s1 * s2;
+            let mag1 = (r1 * r1 + s1 * s1).sqrt().max(1e-8);
+            let mag2 = (r2 * r2 + s2 * s2).sqrt().max(1e-8);
+            // Phase: cos(Δθ) — equal band weight
+            let phase_score = dot / (mag1 * mag2);
+            // Magnitude match: 0 to 1 (1 = perfect match)
+            let mag_match = 1.0 - (mag1 - mag2).abs() / (mag1 + mag2).max(1e-8);
+            score += phase_score * (1.0 + mag_weight * mag_match);
         }
-        coherences[v] = score / temperature;
+        coherences[v] = score / n_bands as f32 / temperature;
     }
 
     // Softmax over coherences → probabilities
@@ -52,14 +66,53 @@ pub fn phase_native_loss(
     // Cross-entropy loss
     let loss = -probs[target].max(1e-10).ln();
 
-    // Gradient: d_loss/d_corrected — dot product gradient is simple: d_score/d_corrected[j] = emb[j]
+    // Gradient: d_loss/d_corrected through phase-mag metric
     // d_loss/d_score[v] = probs[v] - (v == target)
     let mut d_corrected = vec![0.0f32; n_embd];
     for v in 0..vocab_size {
-        let weight = (probs[v] - if v == target { 1.0 } else { 0.0 }) / temperature;
+        let softmax_weight = probs[v] - if v == target { 1.0 } else { 0.0 };
         let emb = &embeddings[v];
-        for j in 0..n_embd {
-            d_corrected[j] += weight * emb[j];
+        for k in 0..n_bands {
+            let r1 = corrected[k * 2];
+            let s1 = corrected[k * 2 + 1];
+            let r2 = emb[k * 2];
+            let s2 = emb[k * 2 + 1];
+            let dot = r1 * r2 + s1 * s2;
+            let mag1 = (r1 * r1 + s1 * s1).sqrt().max(1e-8);
+            let mag2 = (r2 * r2 + s2 * s2).sqrt().max(1e-8);
+            let phase_score = dot / (mag1 * mag2);
+            let mag_diff = mag1 - mag2;
+            let mag_sum = (mag1 + mag2).max(1e-8);
+            let mag_match = 1.0 - mag_diff.abs() / mag_sum;
+
+            // d(phase_score)/d(r1) = r2/(mag1*mag2) - r1*dot/(mag1^3*mag2)
+            let d_phase_r = r2 / (mag1 * mag2) - r1 * dot / (mag1.powi(3) * mag2);
+            let d_phase_s = s2 / (mag1 * mag2) - s1 * dot / (mag1.powi(3) * mag2);
+
+            // d(mag_match)/d(r1): mag_match = 1 - |mag1-mag2|/(mag1+mag2)
+            // d(mag1)/d(r1) = r1/mag1, d(mag1)/d(s1) = s1/mag1
+            // If mag1 > mag2: ratio = (mag1-mag2)/(mag1+mag2), d_ratio/d_mag1 = 2*mag2/(mag1+mag2)²
+            // If mag1 < mag2: ratio = (mag2-mag1)/(mag1+mag2), d_ratio/d_mag1 = -2*mag2/(mag1+mag2)² ... wait
+            // Cleaner: use subgradient. d|x|/dx = sign(x).
+            // ratio = |mag1-mag2|/(mag1+mag2)
+            // d_ratio/d_mag1 = sign(mag1-mag2)/(mag1+mag2) - |mag1-mag2|/(mag1+mag2)²
+            //                = (sign(mag1-mag2)*(mag1+mag2) - |mag1-mag2|) / (mag1+mag2)²
+            let sign = if mag1 >= mag2 { 1.0 } else { -1.0 };
+            let d_ratio_dmag1 = (sign * mag_sum - mag_diff.abs()) / (mag_sum * mag_sum);
+            // d_mag_match/d_mag1 = -d_ratio/d_mag1
+            let d_mm_dmag1 = -d_ratio_dmag1;
+            let d_mag_r = d_mm_dmag1 * r1 / mag1;
+            let d_mag_s = d_mm_dmag1 * s1 / mag1;
+
+            // Combined: d(score_k)/d(r1) = d_phase*(1+λ*mag) + phase*λ*d_mag
+            let combined = (1.0 + mag_weight * mag_match);
+            let d_r = (d_phase_r * combined + phase_score * mag_weight * d_mag_r)
+                      / n_bands as f32 / temperature;
+            let d_s = (d_phase_s * combined + phase_score * mag_weight * d_mag_s)
+                      / n_bands as f32 / temperature;
+
+            d_corrected[k * 2] += softmax_weight * d_r;
+            d_corrected[k * 2 + 1] += softmax_weight * d_s;
         }
     }
 

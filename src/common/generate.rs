@@ -175,14 +175,24 @@ pub fn run_generate(config: GenerateConfig) {
                 corrected[k * 2]     = r * cos_c - s * sin_c;
                 corrected[k * 2 + 1] = r * sin_c + s * cos_c;
             }
-            // Dot product against embeddings (same metric as training)
+            // Phase-mag comparison (same metric as training)
+            let mag_weight = 0.5f32;
             (0..mdl.vocab_size).map(|v| {
                 let emb = &mdl.wte[v];
                 let mut score = 0.0f32;
-                for j in 0..(n_bands * 2) {
-                    score += corrected[j] * emb[j];
+                for k in 0..n_bands {
+                    let r1 = corrected[k * 2];
+                    let s1 = corrected[k * 2 + 1];
+                    let r2 = emb[k * 2];
+                    let s2 = emb[k * 2 + 1];
+                    let dot = r1 * r2 + s1 * s2;
+                    let mag1 = (r1 * r1 + s1 * s1).sqrt().max(1e-8);
+                    let mag2 = (r2 * r2 + s2 * s2).sqrt().max(1e-8);
+                    let phase_score = dot / (mag1 * mag2);
+                    let mag_match = 1.0 - (mag1 - mag2).abs() / (mag1 + mag2).max(1e-8);
+                    score += phase_score * (1.0 + mag_weight * mag_match);
                 }
-                score
+                score / n_bands as f32
             }).collect()
         } else {
             cache.logits[last_pos].clone()

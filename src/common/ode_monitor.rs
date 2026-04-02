@@ -110,14 +110,40 @@ pub fn print_ode_summary(
         println!("    avg_mag: {:.4} → {:.4}  avg|Δφ|: {:.4}", avg_mag_in, avg_mag_out, avg_dphase);
     }
 
-    // Final hidden state summary
+    // Final hidden state magnitude profile
     let hidden = &cache.post_ln_f[last_pos];
-    let total_mag: f32 = (0..n_bands).map(|k| {
+    let mags: Vec<f32> = (0..n_bands).map(|k| {
         let r = hidden[k * 2];
         let s = hidden[k * 2 + 1];
         (r * r + s * s).sqrt()
-    }).sum::<f32>();
-    println!("\n  Final hidden: total_mag={:.4}, avg_mag={:.4}", total_mag, total_mag / n_bands as f32);
+    }).collect();
+    let total_mag: f32 = mags.iter().sum();
+    let avg_mag = total_mag / n_bands as f32;
+    let min_mag = mags.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_mag = mags.iter().cloned().fold(0.0f32, f32::max);
+    let std_mag = (mags.iter().map(|m| (m - avg_mag).powi(2)).sum::<f32>() / n_bands as f32).sqrt();
+    let decay_ratio = if mags.last().unwrap_or(&1.0) > &0.001 { mags[0] / mags[n_bands - 1] } else { f32::INFINITY };
+    let shape = if decay_ratio > 2.0 { "DECAYING" } else if decay_ratio < 0.5 { "RISING" } else { "FLAT" };
+
+    println!("\n  Final hidden magnitude profile:");
+    println!("    min={:.4}  max={:.4}  mean={:.4}  std={:.4}", min_mag, max_mag, avg_mag, std_mag);
+    println!("    band0={:.4}  band{}={:.4}  ratio={:.2}  shape={}", mags[0], n_bands-1, mags[n_bands-1], decay_ratio, shape);
+
+    // Magnitude comparison against embeddings (per region)
+    println!("    Per-region vs embeddings:");
+    let regions = [(0, 10, "low"), (n_bands/3, n_bands/3+10, "mid"), (n_bands-10, n_bands, "high")];
+    for &(start, end, label) in &regions {
+        let end = end.min(n_bands);
+        let avg_ode: f32 = mags[start..end].iter().sum::<f32>() / (end - start) as f32;
+        let avg_emb: f32 = (start..end).map(|k| {
+            let r = model.wte[pred_token][k * 2];
+            let s = model.wte[pred_token][k * 2 + 1];
+            (r * r + s * s).sqrt()
+        }).sum::<f32>() / (end - start) as f32;
+        let match_ratio = 1.0 - (avg_ode - avg_emb).abs() / (avg_ode + avg_emb).max(1e-8);
+        println!("      {:<4} bands {}-{}: ODE={:.3}  emb={:.3}  match={:.2}",
+            label, start, end-1, avg_ode, avg_emb, match_ratio);
+    }
 }
 
 /// Compare ODE behavior between two prompts — shows where computation diverges.
