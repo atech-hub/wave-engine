@@ -175,6 +175,7 @@ pub struct TrainConfig {
     pub active_layers: Option<usize>, // --active-layers N: first N layers at eq=1.0, rest at eq=0.0
     pub rk4_weights: DynParam, // --rk4-weights dyn | --rk4-weights standard
     pub wd: DynParam,          // --wd dyn | --wd 0.01 | --wd 0.01,0.02,0.01,0.005,0.01
+    pub harmonics: DynParam,   // --harmonics dyn | --harmonics 0.5,1.0,1.5,2.0
 }
 
 /// A parameter that can be fixed (manual value) or dynamic (model learns it).
@@ -235,7 +236,7 @@ pub fn run_training(config: TrainConfig) {
         println!("Resuming from checkpoint: {ckpt}");
         let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v, _ck_groups) = wave_checkpoint::load_checkpoint(ckpt);
         assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
-        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()), config.alpha, config.beta);
+        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()), config.alpha, config.beta);
         m.phase_native = config.phase_native; // Must set before count_trainable for correct param count
         let ext_count = count_trainable_ex(&m, config.tied);
         if params.len() == ext_count {
@@ -267,7 +268,7 @@ pub fn run_training(config: TrainConfig) {
         }
     } else {
         println!("Initializing model (seed=42)...");
-        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()), config.alpha, config.beta);
+        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()), config.alpha, config.beta);
         model.phase_native = config.phase_native; // Must set before count_trainable
         start_iter = 0;
         let n_t = count_trainable_ex(&model, config.tied);
@@ -284,7 +285,7 @@ pub fn run_training(config: TrainConfig) {
     println!("  Architecture: {} parallel blocks, {} harmonic heads, {} bands ({}-dim)", config.n_layers, config.n_head, config.n_bands, config.n_bands * 2);
 
     // Runtime dimensions (needed by pre-flight, forward, backward)
-    let mut dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_rk4_weights(config.rk4_weights.is_active());
+    let mut dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active());
     dims.phase_temp = config.phase_temp;
     dims.pythagorean = config.pythagorean;
 
@@ -822,6 +823,19 @@ pub fn run_training(config: TrainConfig) {
             }
         }
 
+        // Harmonics spring: very stiff restoring force toward initial integer-ish harmonics.
+        // Equilibrium = ln((h+1)*0.5) which softplus→ approximately 0.5, 1.0, 1.5, 2.0
+        if config.harmonics.is_dynamic() && config.spring_k > 0.0 {
+            let k_harm = config.spring_k * 2.0; // very stiff — integer harmonics theoretically motivated
+            let n_head = model.blocks[0].attn.heads.len();
+            for block in &mut model.blocks {
+                for h in 0..n_head {
+                    let eq = ((h + 1) as f32 * 0.5f32).ln(); // same as init_model
+                    block.attn.heads[h].harmonic_raw -= current_lr * k_harm * (block.attn.heads[h].harmonic_raw - eq);
+                }
+            }
+        }
+
         // Dynamic AGC: update ceiling from learned coupling constants.
         // Uses min ceiling across all layers (most conservative — prevents divergence).
         if !config.freeze_ode {
@@ -936,11 +950,22 @@ pub fn run_training(config: TrainConfig) {
             } else {
                 String::new()
             };
+            let harm_str = if config.harmonics.is_active() {
+                fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
+                let mut parts = Vec::new();
+                for (l, block) in model.blocks.iter().enumerate() {
+                    let vals: Vec<String> = block.attn.heads.iter().map(|h| format!("{:.4}", softplus(h.harmonic_raw))).collect();
+                    parts.push(format!(r#"{{"L{}": [{}]}}"#, l, vals.join(",")));
+                }
+                format!(r#","harmonics":[{}]"#, parts.join(","))
+            } else {
+                String::new()
+            };
             writeln!(log_writer,
-                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}{}{}{}{}{}}}"#,
+                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}{}{}{}{}{}{}}}"#,
                 iter, total_loss, current_lr, iter_start.elapsed().as_millis(), nan_skip_count,
                 model_gn, head_gn, head_pct, layer_str, clamp_count, max_mag,
-                agc.threshold, agc.ema_mean, agc.ema_std, ode_str, ls_str, lrs_str, rk4w_str, wd_str
+                agc.threshold, agc.ema_mean, agc.ema_std, ode_str, ls_str, lrs_str, rk4w_str, wd_str, harm_str
             ).ok();
         } else {
             writeln!(log_writer,

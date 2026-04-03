@@ -37,7 +37,7 @@ pub struct WaveAttnWeights {
 
 /// Precompute phase angle for a position via learned projection.
 /// Projects [n_embd] → [2] (r, s), returns atan2(s, r) as scalar phase.
-fn project_phase(x: &[f32], proj_w: &[Vec<f32>], proj_b: &[f32]) -> f32 {
+pub fn project_phase(x: &[f32], proj_w: &[Vec<f32>], proj_b: &[f32]) -> f32 {
     let n_embd = x.len();
     let mut r = proj_b[0];
     let mut s = proj_b[1];

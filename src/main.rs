@@ -489,5 +489,6 @@ fn main() {
         active_layers: std::env::args().skip_while(|a| a != "--active-layers").nth(1).and_then(|s| s.parse().ok()),
         rk4_weights: parse_dyn_param("--rk4-weights"),
         wd: parse_dyn_param("--wd"),
+        harmonics: parse_dyn_param("--harmonics"),
     });
 }

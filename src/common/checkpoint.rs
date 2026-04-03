@@ -118,26 +118,48 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let n_phase_ls = n_ext_ls - lm_head_params + ck_bands;
     // RK4 weights variants: +4 per layer for learnable [w0,w1,w2,w3]
     let rk4_extra = ck_layers * 4;
-    let n_ext_rk4 = n_ext + rk4_extra;
-    let n_ext_ls_rk4 = n_ext_ls + rk4_extra;
-    let n_phase_rk4 = n_phase + rk4_extra;
-    let n_phase_ls_rk4 = n_phase_ls + rk4_extra;
+    // Harmonics variants: +n_head per layer for learnable harmonic_raw
+    let harm_extra = ck_layers * ck_head;
+    // Build all variant sizes (most features → fewest)
+    let variants: Vec<usize> = vec![
+        // phase-native + layer_scale + rk4 + harmonics
+        n_ext_ls + rk4_extra + harm_extra - lm_head_params + ck_bands,
+        // phase-native + rk4 + harmonics
+        n_ext + rk4_extra + harm_extra - lm_head_params + ck_bands,
+        // phase-native + layer_scale + rk4
+        n_ext_ls + rk4_extra - lm_head_params + ck_bands,
+        // ext + layer_scale + rk4 + harmonics
+        n_ext_ls + rk4_extra + harm_extra,
+        // phase-native + rk4
+        n_ext + rk4_extra - lm_head_params + ck_bands,
+        // ext + rk4 + harmonics
+        n_ext + rk4_extra + harm_extra,
+        // phase-native + harmonics
+        n_ext + harm_extra - lm_head_params + ck_bands,
+        // ext + layer_scale + rk4
+        n_ext_ls + rk4_extra,
+        // ext + rk4
+        n_ext + rk4_extra,
+        // ext + layer_scale
+        n_ext_ls,
+        // phase-native + layer_scale
+        n_ext_ls - lm_head_params + ck_bands,
+        // phase-native
+        n_ext - lm_head_params + ck_bands,
+        // ext
+        n_ext,
+        // phase-native no output corrector
+        n_ext - lm_head_params,
+        // base
+        n_base,
+    ];
 
     // Determine actual param count from file size
     let file_len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
     let header_size = 4 + 4 + 7*4 + 8 + 8 + 4 + 8 + 8; // magic + version + config + metadata + adam_t
     // file = header + adam_m(n*4) + adam_v(n*4) + params(n*4) = header + n*12
     let data_bytes = file_len.saturating_sub(header_size);
-    let n_params = if data_bytes == n_phase_ls_rk4 * 12 { n_phase_ls_rk4 }
-                   else if data_bytes == n_ext_ls_rk4 * 12 { n_ext_ls_rk4 }
-                   else if data_bytes == n_phase_rk4 * 12 { n_phase_rk4 }
-                   else if data_bytes == n_ext_rk4 * 12 { n_ext_rk4 }
-                   else if data_bytes == n_ext_ls * 12 { n_ext_ls }
-                   else if data_bytes == n_phase_ls * 12 { n_phase_ls }
-                   else if data_bytes == n_phase * 12 { n_phase }
-                   else if data_bytes == n_ext * 12 { n_ext }
-                   else if data_bytes == n_phase_no_oc * 12 { n_phase_no_oc }
-                   else { n_base };
+    let n_params = variants.iter().find(|&&v| data_bytes == v * 12).copied().unwrap_or(n_base);
 
     let adam_t = read_u64(&mut f) as usize;
     let read_f32_vec = |f: &mut std::fs::File, n: usize| -> Vec<f32> {

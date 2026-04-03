@@ -76,24 +76,28 @@ pub fn run_generate(config: GenerateConfig) {
         }
     };
 
-    // Phase-native variants (most features first)
-    let pn_variants: Vec<(Dims, &str)> = vec![
-        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(true).with_layer_scale(true).with_rk4_weights(true).with_learnable_ode(true),
-         "phase-native + layer_scale + rk4_weights"),
-        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(true).with_rk4_weights(true).with_learnable_ode(true),
-         "phase-native + rk4_weights"),
-        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(true).with_layer_scale(true).with_learnable_ode(true),
-         "phase-native + layer_scale"),
-        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(true).with_learnable_ode(true),
-         "phase-native"),
+    // Generate all Dims variants systematically (most features → fewest).
+    // Each combination of phase_native × layer_scale × rk4_weights × harmonics.
+    let base = || Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+        .with_corrector(true).with_learnable_ode(true);
+    let feature_combos: Vec<(bool, bool, bool, &str)> = vec![
+        // (layer_scale, rk4, harmonics, label)
+        (true,  true,  true,  "ls+rk4+harm"),
+        (false, true,  true,  "rk4+harm"),
+        (true,  true,  false, "ls+rk4"),
+        (false, true,  false, "rk4"),
+        (true,  false, true,  "ls+harm"),
+        (false, false, true,  "harm"),
+        (true,  false, false, "ls"),
+        (false, false, false, ""),
     ];
-    for (d, label) in &pn_variants {
+
+    // Phase-native variants
+    for &(ls, rk4, harm, suffix) in &feature_combos {
         if !loaded {
-            if let Some(m) = try_load(*d, true, label) {
+            let d = base().with_layer_scale(ls).with_rk4_weights(rk4).with_dyn_harmonics(harm);
+            let label = if suffix.is_empty() { "phase-native".to_string() } else { format!("phase-native + {}", suffix) };
+            if let Some(m) = try_load(d, true, &label) {
                 mdl = m;
                 loaded = true;
             }
@@ -101,23 +105,11 @@ pub fn run_generate(config: GenerateConfig) {
     }
 
     // Non-phase-native variants
-    let std_variants: Vec<(Dims, &str)> = vec![
-        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(true).with_layer_scale(true).with_rk4_weights(true),
-         "ext + layer_scale + rk4_weights"),
-        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(true).with_rk4_weights(true),
-         "ext + rk4_weights"),
-        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(true).with_layer_scale(true),
-         "ext + layer_scale"),
-        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(true),
-         "ext"),
-    ];
-    for (d, label) in &std_variants {
+    for &(ls, rk4, harm, suffix) in &feature_combos {
         if !loaded {
-            if let Some(m) = try_load(*d, false, label) {
+            let d = base().with_layer_scale(ls).with_rk4_weights(rk4).with_dyn_harmonics(harm);
+            let label = if suffix.is_empty() { "ext".to_string() } else { format!("ext + {}", suffix) };
+            if let Some(m) = try_load(d, false, &label) {
                 mdl = m;
                 loaded = true;
             }

@@ -38,6 +38,8 @@ pub struct Gradients {
     pub block_ffn_phase_correction: Vec<Vec<f32>>,
     pub block_ffn_rk4_weights: Vec<[f32; 4]>,
     pub rk4_weights_active: bool,
+    // Harmonic number gradients (per head per layer)
+    pub d_harmonic_raw: Vec<Vec<f32>>, // [n_layers][n_heads]
     pub block_ffn_mae_in_sq_w: Vec<Vec<Vec<f32>>>,
     pub block_ffn_mae_in_sq_b: Vec<Vec<f32>>,
     pub block_ffn_mae_in_pr_w: Vec<Vec<Vec<f32>>>,
@@ -81,6 +83,7 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         block_ffn_phase_correction: if d.learnable_ode { vec![vec![0.0; d.n_bands]; n_blocks] } else { vec![vec![]; n_blocks] },
         block_ffn_rk4_weights: vec![[0.0f32; 4]; n_blocks],
         rk4_weights_active: model.use_rk4_weights && d.learnable_ode,
+        d_harmonic_raw: if d.use_dyn_harmonics { vec![vec![0.0; d.n_head]; n_blocks] } else { vec![vec![]; n_blocks] },
         block_ffn_mae_in_sq_w: vec![vec![vec![0.0; d.n_embd]; d.maestro_dim]; n_blocks],
         block_ffn_mae_in_sq_b: vec![vec![0.0; d.maestro_dim]; n_blocks],
         block_ffn_mae_in_pr_w: vec![vec![vec![0.0; d.maestro_dim]; d.n_embd]; n_blocks],
@@ -276,6 +279,74 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         } else {
             ffn_backward(&block.ffn, &bc.normed, &d_ffn_out, &mut grads, block_idx, bc, d, gpu, ping_pong)
         };
+
+        // ─── Harmonic gradient (when --harmonics dyn) ───
+        // d_attn_out = scale * d_hidden (same gradient that goes to FFN)
+        // Backprop through attention: d_harmonic_raw[h] = sum over positions
+        if !grads.d_harmonic_raw[block_idx].is_empty() {
+            let n_head = block.attn.heads.len();
+            let head_dim = d.n_embd / n_head;
+            fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
+            fn softplus_derivative(x: f32) -> f32 { if x > 20.0 { 1.0 } else { 1.0 / (1.0 + (-x).exp()) } }
+
+            for h in 0..n_head {
+                let harmonic_n = softplus(block.attn.heads[h].harmonic_raw);
+                let offset = h * head_dim;
+
+                // Recompute phases (same as forward)
+                let phases: Vec<f32> = bc.normed.iter().map(|x| {
+                    crate::common::attn::project_phase(x, &block.attn.heads[h].phase_proj_w, &block.attn.heads[h].phase_proj_b)
+                }).collect();
+
+                // Recompute value projections
+                let v_all: Vec<Vec<f32>> = (0..t).map(|pos| {
+                    let mut v = vec![0.0f32; head_dim];
+                    for dd in 0..head_dim {
+                        let mut sum = 0.0f32;
+                        for j in 0..head_dim { sum += block.attn.heads[h].v_proj_w[dd][j] * bc.normed[pos][offset + j]; }
+                        v[dd] = sum + block.attn.heads[h].v_proj_b[dd];
+                    }
+                    v
+                }).collect();
+
+                // att_weights is [n_head][t][t] — bc.att_weights[h][qi][ki]
+                let att_w = &bc.att_weights[h];
+
+                let mut d_h = 0.0f32;
+                for qi in 0..t {
+                    // d_attn_out for this head at position qi
+                    let d_out: Vec<f32> = (0..head_dim).map(|dd| d_ffn_out[qi][offset + dd]).collect();
+
+                    // out[qi][d] = sum_ki w[qi][ki] * v[ki][d]
+                    // d_w[qi][ki] = sum_d d_out[d] * v[ki][d]
+                    let mut d_w_qi = vec![0.0f32; t];
+                    for ki in 0..=qi {
+                        if att_w[qi][ki] > 0.0 {
+                            let mut dw = 0.0f32;
+                            for dd in 0..head_dim { dw += d_out[dd] * v_all[ki][dd]; }
+                            d_w_qi[ki] = dw;
+                        }
+                    }
+
+                    // Backprop through softmax: d_score[ki] = w[ki] * (d_w[ki] - sum_j w[j] * d_w[j])
+                    let weighted_sum: f32 = (0..=qi).map(|ki| att_w[qi][ki] * d_w_qi[ki]).sum();
+                    let d_scores: Vec<f32> = (0..=qi).map(|ki| att_w[qi][ki] * (d_w_qi[ki] - weighted_sum)).collect();
+
+                    // score[ki] = cos(harmonic_n * delta) where delta = phases[qi] - phases[ki]
+                    // d_score/d_harmonic_n = -sin(harmonic_n * delta) * delta
+                    for ki in 0..d_scores.len() {
+                        if att_w[qi][ki] > 0.0 {
+                            let delta = phases[qi] - phases[ki];
+                            let d_score_d_h = -(harmonic_n * delta).sin() * delta;
+                            d_h += d_scores[ki] * d_score_d_h;
+                        }
+                    }
+                }
+
+                // Chain through softplus: d_loss/d_harmonic_raw = d_h * softplus'(harmonic_raw)
+                grads.d_harmonic_raw[block_idx][h] += d_h * softplus_derivative(block.attn.heads[h].harmonic_raw);
+            }
+        }
 
         // ─── LN backward (shared LN, FFN gradients only — attention frozen) ───
         let mut d_input = Vec::with_capacity(t);
@@ -546,6 +617,10 @@ pub fn flatten_grads_ex(grads: &Gradients, tied: bool) -> Vec<f32> {
             if grads.rk4_weights_active {
                 g.extend_from_slice(&grads.block_ffn_rk4_weights[b]);
             }
+        }
+        // Harmonic number gradients (when dynamic)
+        if !grads.d_harmonic_raw[b].is_empty() {
+            g.extend_from_slice(&grads.d_harmonic_raw[b]);
         }
     }
     if !grads.layer_scale.is_empty() {
