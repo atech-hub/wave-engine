@@ -76,6 +76,24 @@ fn deriv(
     (dr, ds)
 }
 
+/// In-place derivative — writes into pre-allocated output buffers.
+/// Same computation as `deriv` but zero allocation.
+fn deriv_into(
+    r: &[f32], s: &[f32],
+    gamma: &[f32], omega: &[f32],
+    alpha: f32, beta: f32,
+    dr: &mut [f32], ds: &mut [f32],
+) {
+    let n = r.len();
+    for k in 0..n {
+        let mag_sq = r[k]*r[k] + s[k]*s[k];
+        let ns = neighbour_sum(r, s, k);
+        let phi = omega[k] + alpha * mag_sq + beta * ns;
+        dr[k] = -gamma[k] * r[k] - phi * s[k];
+        ds[k] = -gamma[k] * s[k] + phi * r[k];
+    }
+}
+
 // ─── Forward with cache ────────────────────────────────────
 
 /// RK4 forward pass that stores all intermediates for backward.
@@ -100,39 +118,51 @@ pub fn ode_forward_with_cache(
     let mut all_kr = Vec::with_capacity(n_steps);
     let mut all_ks = Vec::with_capacity(n_steps);
 
+    // Pre-allocate scratch buffers (avoids 8 heap allocations per RK4 step)
+    let mut r_tmp = vec![0.0f32; n_bands];
+    let mut s_tmp = vec![0.0f32; n_bands];
+    let mut k1r = vec![0.0f32; n_bands];
+    let mut k1s = vec![0.0f32; n_bands];
+    let mut k2r = vec![0.0f32; n_bands];
+    let mut k2s = vec![0.0f32; n_bands];
+    let mut k3r = vec![0.0f32; n_bands];
+    let mut k3s = vec![0.0f32; n_bands];
+    let mut k4r = vec![0.0f32; n_bands];
+    let mut k4s = vec![0.0f32; n_bands];
+
     for _ in 0..n_steps {
         // Save state at start of this step
         r_at_step.push(r.clone());
         s_at_step.push(s.clone());
 
         // k1 at (r, s)
-        let (k1r, k1s) = deriv(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta);
+        deriv_into(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, &mut k1r, &mut k1s);
 
         // k2 at (r + 0.5*dt*k1, s + 0.5*dt*k1)
-        let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&a, &b)| a + 0.5*dt*b).collect();
-        let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&a, &b)| a + 0.5*dt*b).collect();
-        let (k2r, k2s) = deriv(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta);
+        for i in 0..n_bands { r_tmp[i] = r[i] + 0.5*dt*k1r[i]; }
+        for i in 0..n_bands { s_tmp[i] = s[i] + 0.5*dt*k1s[i]; }
+        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &mut k2r, &mut k2s);
 
         // k3 at (r + 0.5*dt*k2, s + 0.5*dt*k2)
-        let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&a, &b)| a + 0.5*dt*b).collect();
-        let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&a, &b)| a + 0.5*dt*b).collect();
-        let (k3r, k3s) = deriv(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta);
+        for i in 0..n_bands { r_tmp[i] = r[i] + 0.5*dt*k2r[i]; }
+        for i in 0..n_bands { s_tmp[i] = s[i] + 0.5*dt*k2s[i]; }
+        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &mut k3r, &mut k3s);
 
         // k4 at (r + dt*k3, s + dt*k3)
-        let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a, &b)| a + dt*b).collect();
-        let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a, &b)| a + dt*b).collect();
-        let (k4r, k4s) = deriv(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta);
+        for i in 0..n_bands { r_tmp[i] = r[i] + dt*k3r[i]; }
+        for i in 0..n_bands { s_tmp[i] = s[i] + dt*k3s[i]; }
+        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &mut k4r, &mut k4s);
 
-        // Store k-values
+        // Store k-values (backward needs these per-step)
         all_kr.push([k1r.clone(), k2r.clone(), k3r.clone(), k4r.clone()]);
         all_ks.push([k1s.clone(), k2s.clone(), k3s.clone(), k4s.clone()]);
 
         // Update state using RK4 combination weights
         let w = &weights.rk4_weights;
-        let r_new: Vec<f32> = (0..n_bands).map(|i| r[i] + dt * (w[0]*k1r[i] + w[1]*k2r[i] + w[2]*k3r[i] + w[3]*k4r[i])).collect();
-        let s_new: Vec<f32> = (0..n_bands).map(|i| s[i] + dt * (w[0]*k1s[i] + w[1]*k2s[i] + w[2]*k3s[i] + w[3]*k4s[i])).collect();
-        r = r_new;
-        s = s_new;
+        for i in 0..n_bands {
+            r[i] += dt * (w[0]*k1r[i] + w[1]*k2r[i] + w[2]*k3r[i] + w[3]*k4r[i]);
+            s[i] += dt * (w[0]*k1s[i] + w[1]*k2s[i] + w[2]*k3s[i] + w[3]*k4s[i]);
+        }
     }
 
     // Pack output

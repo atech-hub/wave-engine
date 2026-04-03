@@ -121,11 +121,17 @@ pub fn ffn_forward_via_backend(
     // 3b. Corrector plate: per-band phase rotation after ODE (Schmidt corrector).
     //     Magnitude preserved (rotation is orthogonal). Only phase changes.
     //     Zero-init = identity rotation = no-op until the model learns corrections.
+    //     Precompute sin/cos once per layer — angles don't change during a step.
     let mut kerr_out = kerr_out;
+    let corr_sincos: Vec<(f32, f32)> = if use_corrector {
+        (0..n_bands).map(|k| weights.kerr.phase_correction[k].sin_cos()).collect()
+    } else {
+        vec![]
+    };
     if use_corrector {
         for pos in &mut kerr_out {
             for k in 0..n_bands {
-                let (sin_c, cos_c) = weights.kerr.phase_correction[k].sin_cos();
+                let (sin_c, cos_c) = corr_sincos[k];
                 let r = pos[2 * k];
                 let s = pos[2 * k + 1];
                 pos[2 * k]     = r * cos_c - s * sin_c;
@@ -164,6 +170,7 @@ pub fn ffn_forward_via_backend(
         ode_caches,
         corrector_active: use_corrector,
         gpu_ode_backward: gpu_ode,
+        corr_sincos,
     };
 
     (output, cache)
@@ -212,12 +219,13 @@ pub fn ffn_backward_via_backend(
     let (d_kerr_out, d_phase_correction): (Vec<Vec<f32>>, Option<Vec<f32>>) =
     if cache.corrector_active {
         // Corrector is active — rotate gradients back and accumulate d_correction
+        // Use precomputed sin/cos from forward (same angles, no recomputation)
         let mut d_raw = Vec::with_capacity(t);
         let mut d_corr = vec![0.0f32; n_bands];
         for pos in 0..t {
             let mut d_pos = vec![0.0f32; n_embd];
             for k in 0..n_bands {
-                let (sin_c, cos_c) = weights.kerr.phase_correction[k].sin_cos();
+                let (sin_c, cos_c) = cache.corr_sincos[k];
                 let d_cr = d_corrected[pos][2 * k];
                 let d_cs = d_corrected[pos][2 * k + 1];
 
@@ -335,6 +343,9 @@ pub struct FfnCache {
     pub corrector_active: bool,
     /// GPU ODE backward path: precond stored, backward recomputes via GPU
     pub gpu_ode_backward: bool,
+    /// Precomputed corrector sin/cos — avoids recomputing in backward.
+    /// Empty when corrector is inactive.
+    pub corr_sincos: Vec<(f32, f32)>,
 }
 
 /// FFN weight gradients.

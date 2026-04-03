@@ -216,37 +216,71 @@ fn kerr_ode_forward_cpu(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
 
 fn rk4_step(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: f32, beta: f32, w: &[f32; 4]) -> (Vec<f32>, Vec<f32>) {
     let n = r.len();
-    let deriv = |r: &[f32], s: &[f32]| -> (Vec<f32>, Vec<f32>) {
-        let mut dr = vec![0.0f32; n];
-        let mut ds = vec![0.0f32; n];
-        for k in 0..n {
-            let mag_sq = r[k] * r[k] + s[k] * s[k];
-            let mut ns = 0.0f32;
-            if k >= 2 { ns += r[k-2]*r[k-2] + s[k-2]*s[k-2]; }
-            if k >= 1 { ns += r[k-1]*r[k-1] + s[k-1]*s[k-1]; }
-            if k+1 < n { ns += r[k+1]*r[k+1] + s[k+1]*s[k+1]; }
-            if k+2 < n { ns += r[k+2]*r[k+2] + s[k+2]*s[k+2]; }
-            let phi = omega[k] + alpha * mag_sq + beta * ns;
-            dr[k] = -gamma[k] * r[k] - phi * s[k];
-            ds[k] = -gamma[k] * s[k] + phi * r[k];
-        }
-        (dr, ds)
-    };
 
-    let (k1r, k1s) = deriv(r, s);
-    let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&a, &b)| a + 0.5*dt*b).collect();
-    let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&a, &b)| a + 0.5*dt*b).collect();
-    let (k2r, k2s) = deriv(&r2, &s2);
-    let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&a, &b)| a + 0.5*dt*b).collect();
-    let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&a, &b)| a + 0.5*dt*b).collect();
-    let (k3r, k3s) = deriv(&r3, &s3);
-    let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a, &b)| a + dt*b).collect();
-    let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a, &b)| a + dt*b).collect();
-    let (k4r, k4s) = deriv(&r4, &s4);
+    // Pre-allocate scratch buffers (avoids 8 heap allocations per step)
+    let mut r_tmp = vec![0.0f32; n];
+    let mut s_tmp = vec![0.0f32; n];
+    let mut k1r = vec![0.0f32; n];
+    let mut k1s = vec![0.0f32; n];
+    let mut k2r = vec![0.0f32; n];
+    let mut k2s = vec![0.0f32; n];
+    let mut k3r = vec![0.0f32; n];
+    let mut k3s = vec![0.0f32; n];
+    let mut k4r = vec![0.0f32; n];
+    let mut k4s = vec![0.0f32; n];
+
+    // k1 at (r, s)
+    deriv_into(r, s, gamma, omega, alpha, beta, &mut k1r, &mut k1s);
+
+    // r_tmp = r + 0.5*dt*k1r, s_tmp = s + 0.5*dt*k1s
+    for i in 0..n { r_tmp[i] = r[i] + 0.5*dt*k1r[i]; }
+    for i in 0..n { s_tmp[i] = s[i] + 0.5*dt*k1s[i]; }
+
+    // k2 at (r_tmp, s_tmp)
+    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, &mut k2r, &mut k2s);
+
+    // r_tmp = r + 0.5*dt*k2r, s_tmp = s + 0.5*dt*k2s
+    for i in 0..n { r_tmp[i] = r[i] + 0.5*dt*k2r[i]; }
+    for i in 0..n { s_tmp[i] = s[i] + 0.5*dt*k2s[i]; }
+
+    // k3 at (r_tmp, s_tmp)
+    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, &mut k3r, &mut k3s);
+
+    // r_tmp = r + dt*k3r, s_tmp = s + dt*k3s
+    for i in 0..n { r_tmp[i] = r[i] + dt*k3r[i]; }
+    for i in 0..n { s_tmp[i] = s[i] + dt*k3s[i]; }
+
+    // k4 at (r_tmp, s_tmp)
+    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, &mut k4r, &mut k4s);
 
     // RK4 combination: r_new = r + dt * (w0*k1 + w1*k2 + w2*k3 + w3*k4)
     // Standard: w = [1/6, 1/3, 1/3, 1/6]. Learnable: model decides.
-    let r_new: Vec<f32> = (0..n).map(|i| r[i] + dt * (w[0]*k1r[i] + w[1]*k2r[i] + w[2]*k3r[i] + w[3]*k4r[i])).collect();
-    let s_new: Vec<f32> = (0..n).map(|i| s[i] + dt * (w[0]*k1s[i] + w[1]*k2s[i] + w[2]*k3s[i] + w[3]*k4s[i])).collect();
+    let mut r_new = vec![0.0f32; n];
+    let mut s_new = vec![0.0f32; n];
+    for i in 0..n {
+        r_new[i] = r[i] + dt * (w[0]*k1r[i] + w[1]*k2r[i] + w[2]*k3r[i] + w[3]*k4r[i]);
+        s_new[i] = s[i] + dt * (w[0]*k1s[i] + w[1]*k2s[i] + w[2]*k3s[i] + w[3]*k4s[i]);
+    }
     (r_new, s_new)
+}
+
+/// In-place sequential derivative for block.rs RK4 — writes into pre-allocated output buffers.
+fn deriv_into(
+    r: &[f32], s: &[f32],
+    gamma: &[f32], omega: &[f32],
+    alpha: f32, beta: f32,
+    dr: &mut [f32], ds: &mut [f32],
+) {
+    let n = r.len();
+    for k in 0..n {
+        let mag_sq = r[k] * r[k] + s[k] * s[k];
+        let mut ns = 0.0f32;
+        if k >= 2 { ns += r[k-2]*r[k-2] + s[k-2]*s[k-2]; }
+        if k >= 1 { ns += r[k-1]*r[k-1] + s[k-1]*s[k-1]; }
+        if k+1 < n { ns += r[k+1]*r[k+1] + s[k+1]*s[k+1]; }
+        if k+2 < n { ns += r[k+2]*r[k+2] + s[k+2]*s[k+2]; }
+        let phi = omega[k] + alpha * mag_sq + beta * ns;
+        dr[k] = -gamma[k] * r[k] - phi * s[k];
+        ds[k] = -gamma[k] * s[k] + phi * r[k];
+    }
 }
