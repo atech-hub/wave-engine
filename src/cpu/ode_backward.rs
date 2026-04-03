@@ -31,6 +31,7 @@ pub struct OdeParamGrads {
     pub d_gamma_raw: Vec<f32>,  // [n_bands]
     pub d_alpha: f32,
     pub d_beta: f32,
+    pub d_rk4_weights: [f32; 4], // gradient w.r.t. RK4 combination weights
 }
 
 // ─── Helpers ───────────────────────────────────────────────
@@ -126,9 +127,10 @@ pub fn ode_forward_with_cache(
         all_kr.push([k1r.clone(), k2r.clone(), k3r.clone(), k4r.clone()]);
         all_ks.push([k1s.clone(), k2s.clone(), k3s.clone(), k4s.clone()]);
 
-        // Update state
-        let r_new: Vec<f32> = (0..n_bands).map(|i| r[i] + dt/6.0 * (k1r[i] + 2.0*k2r[i] + 2.0*k3r[i] + k4r[i])).collect();
-        let s_new: Vec<f32> = (0..n_bands).map(|i| s[i] + dt/6.0 * (k1s[i] + 2.0*k2s[i] + 2.0*k3s[i] + k4s[i])).collect();
+        // Update state using RK4 combination weights
+        let w = &weights.rk4_weights;
+        let r_new: Vec<f32> = (0..n_bands).map(|i| r[i] + dt * (w[0]*k1r[i] + w[1]*k2r[i] + w[2]*k3r[i] + w[3]*k4r[i])).collect();
+        let s_new: Vec<f32> = (0..n_bands).map(|i| s[i] + dt * (w[0]*k1s[i] + w[1]*k2s[i] + w[2]*k3s[i] + w[3]*k4s[i])).collect();
         r = r_new;
         s = s_new;
     }
@@ -258,6 +260,8 @@ pub fn ode_backward(
     let mut d_gamma = vec![0.0f32; n];   // gradient w.r.t. gamma (post-softplus)
     let mut d_alpha = 0.0f32;
     let mut d_beta = 0.0f32;
+    let mut d_rk4_weights = [0.0f32; 4];
+    let w = &weights.rk4_weights;
 
     // Walk backward through RK4 steps
     for step in (0..cache.rk4_steps).rev() {
@@ -266,22 +270,33 @@ pub fn ode_backward(
         let [ref k1r, ref k2r, ref k3r, ref k4r] = cache.kr[step];
         let [ref k1s, ref k2s, ref k3s, ref k4s] = cache.ks[step];
 
-        // The RK4 update: r_new = r0 + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
-        // Backward:
+        // The RK4 update: r_new = r0 + dt * (w0*k1 + w1*k2 + w2*k3 + w3*k4)
+        // Backward w.r.t. k values:
         //   d_r0 += d_r_new  (identity from r0 in the sum)
-        //   d_k1r = d_r_new * dt/6
-        //   d_k2r = d_r_new * dt/3  (factor of 2)
-        //   d_k3r = d_r_new * dt/3
-        //   d_k4r = d_r_new * dt/6
+        //   d_k1r = d_r_new * dt * w0
+        //   d_k2r = d_r_new * dt * w1
+        //   d_k3r = d_r_new * dt * w2
+        //   d_k4r = d_r_new * dt * w3
+        // Backward w.r.t. weights:
+        //   d_w0 += sum_i(d_r_new[i] * dt * k1r[i] + d_s_new[i] * dt * k1s[i])
+        //   etc.
 
-        let d_k1r: Vec<f32> = d_r.iter().map(|&v| v * dt / 6.0).collect();
-        let d_k1s: Vec<f32> = d_s.iter().map(|&v| v * dt / 6.0).collect();
-        let d_k2r: Vec<f32> = d_r.iter().map(|&v| v * dt / 3.0).collect();
-        let d_k2s: Vec<f32> = d_s.iter().map(|&v| v * dt / 3.0).collect();
-        let d_k3r: Vec<f32> = d_r.iter().map(|&v| v * dt / 3.0).collect();
-        let d_k3s: Vec<f32> = d_s.iter().map(|&v| v * dt / 3.0).collect();
-        let d_k4r: Vec<f32> = d_r.iter().map(|&v| v * dt / 6.0).collect();
-        let d_k4s: Vec<f32> = d_s.iter().map(|&v| v * dt / 6.0).collect();
+        let d_k1r: Vec<f32> = d_r.iter().map(|&v| v * dt * w[0]).collect();
+        let d_k1s: Vec<f32> = d_s.iter().map(|&v| v * dt * w[0]).collect();
+        let d_k2r: Vec<f32> = d_r.iter().map(|&v| v * dt * w[1]).collect();
+        let d_k2s: Vec<f32> = d_s.iter().map(|&v| v * dt * w[1]).collect();
+        let d_k3r: Vec<f32> = d_r.iter().map(|&v| v * dt * w[2]).collect();
+        let d_k3s: Vec<f32> = d_s.iter().map(|&v| v * dt * w[2]).collect();
+        let d_k4r: Vec<f32> = d_r.iter().map(|&v| v * dt * w[3]).collect();
+        let d_k4s: Vec<f32> = d_s.iter().map(|&v| v * dt * w[3]).collect();
+
+        // Gradient w.r.t. RK4 combination weights
+        for i in 0..n {
+            d_rk4_weights[0] += d_r[i] * dt * k1r[i] + d_s[i] * dt * k1s[i];
+            d_rk4_weights[1] += d_r[i] * dt * k2r[i] + d_s[i] * dt * k2s[i];
+            d_rk4_weights[2] += d_r[i] * dt * k3r[i] + d_s[i] * dt * k3s[i];
+            d_rk4_weights[3] += d_r[i] * dt * k4r[i] + d_s[i] * dt * k4s[i];
+        }
 
         // d_r0 already gets d_r_new (identity contribution)
         // (d_r already holds d_r_new, which is the right starting point for d_r0)
@@ -386,7 +401,7 @@ pub fn ode_backward(
         d_input[k * 2 + 1] = d_s[k];
     }
 
-    (d_input, OdeParamGrads { d_gamma_raw, d_alpha, d_beta })
+    (d_input, OdeParamGrads { d_gamma_raw, d_alpha, d_beta, d_rk4_weights })
 }
 
 // ─── Finite difference validation ──────────────────────────
@@ -404,6 +419,7 @@ mod tests {
             beta: 0.2,
             rk4_n_steps: 4, // fewer steps for faster test
             phase_correction: vec![0.0; n_bands],
+            rk4_weights: [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0],
         }
     }
 
@@ -431,8 +447,9 @@ mod tests {
             let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a, &b)| a + dt*b).collect();
             let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a, &b)| a + dt*b).collect();
             let (k4r, k4s) = deriv(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta);
-            r = (0..n_bands).map(|i| r[i] + dt/6.0*(dr[i]+2.0*k2r[i]+2.0*k3r[i]+k4r[i])).collect();
-            s = (0..n_bands).map(|i| s[i] + dt/6.0*(ds[i]+2.0*k2s[i]+2.0*k3s[i]+k4s[i])).collect();
+            let w = &weights.rk4_weights;
+            r = (0..n_bands).map(|i| r[i] + dt*(w[0]*dr[i]+w[1]*k2r[i]+w[2]*k3r[i]+w[3]*k4r[i])).collect();
+            s = (0..n_bands).map(|i| s[i] + dt*(w[0]*ds[i]+w[1]*k2s[i]+w[2]*k3s[i]+w[3]*k4s[i])).collect();
         }
 
         for k in 0..n_bands {

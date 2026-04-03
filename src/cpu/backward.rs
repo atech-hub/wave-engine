@@ -407,7 +407,7 @@ pub fn kerr_ode_backward(
 
     for _ in 0..n_steps {
         let (r_new, s_new) = crate::model::rk4_step_public(
-            &r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta,
+            &r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, &weights.rk4_weights,
         );
         r = r_new;
         s = s_new;

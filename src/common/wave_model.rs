@@ -23,10 +23,12 @@ pub struct WavePacketModel {
     // Wave transduction decoder (self-contained module)
     pub wd_state: Option<crate::common::wave_decode::WaveDecodeState>,
     pub learnable_ode: bool, // true = ODE params in flatten/unflatten, false = frozen
+    pub use_rk4_weights: bool, // true = RK4 combination weights are learnable
     pub layer_scale: Vec<f32>, // per-layer residual scaling (1.0 = default, learnable when dynamic)
     pub use_layer_scale: bool, // true = layer_scale is learnable parameter
     pub lr_scale: Vec<f32>, // per-group LR multiplier [n_layers + 1 for lm_head] (training only)
     pub use_lr_scale: bool,
+    pub wd_scale: Vec<f32>, // per-group WD multiplier [n_layers + 1] (1.0 = base WD, training only)
     pub phase_native: bool, // true = use phase coherence loss instead of lm_head
     pub output_corrector: Vec<f32>, // [n_bands] per-band phase rotation before phase comparison
 }
@@ -77,6 +79,7 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
             beta,
             rk4_n_steps: d.rk4_steps,
             phase_correction: vec![0.0; d.n_bands],
+            rk4_weights: [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0], // standard RK4
         };
         let (sq_w, sq_b) = init_linear(&mut rng, d.maestro_dim, d.n_embd);
         let (pr_w, pr_b) = init_linear(&mut rng, d.n_embd, d.maestro_dim);
@@ -144,10 +147,12 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
     WavePacketModel {
         wte, wpe, blocks, ln_f, lm_head, lm_down, lm_up, lm_rank, vocab_size,
         tied_temperature: 1.0, wd_state, learnable_ode: d.learnable_ode,
+        use_rk4_weights: d.use_rk4_weights,
         layer_scale: vec![1.0; n_layers],
         use_layer_scale: d.use_layer_scale,
         lr_scale: vec![1.0; n_layers + 1], // +1 for lm_head group
         use_lr_scale: d.use_lr_scale,
+        wd_scale: vec![1.0; n_layers + 1], // +1 for lm_head group
         phase_native: false,
         output_corrector: vec![0.0; d.n_bands], // 84 phase rotations, zero = transparent
     }
@@ -174,6 +179,9 @@ pub fn count_trainable_ex(model: &WavePacketModel, tied: bool) -> usize {
             n += 1; // alpha
             n += 1; // beta
             n += block.ffn.kerr.phase_correction.len(); // corrector plate
+            if model.use_rk4_weights {
+                n += 4; // rk4_weights [w1, w2, w3, w4]
+            }
         }
     }
     if model.use_layer_scale {
@@ -221,6 +229,9 @@ pub fn flatten_params_ex(model: &WavePacketModel, tied: bool) -> Vec<f32> {
             p.push(block.ffn.kerr.alpha);
             p.push(block.ffn.kerr.beta);
             p.extend_from_slice(&block.ffn.kerr.phase_correction);
+            if model.use_rk4_weights {
+                p.extend_from_slice(&block.ffn.kerr.rk4_weights);
+            }
         }
     }
     if model.use_layer_scale {
@@ -277,6 +288,10 @@ pub fn unflatten_params_ex(model: &mut WavePacketModel, params: &[f32], tied: bo
             // Corrector plate phase corrections
             let nc = block.ffn.kerr.phase_correction.len();
             block.ffn.kerr.phase_correction.copy_from_slice(&params[idx..idx+nc]); idx += nc;
+            // RK4 combination weights (when learnable)
+            if model.use_rk4_weights {
+                block.ffn.kerr.rk4_weights.copy_from_slice(&params[idx..idx+4]); idx += 4;
+            }
         }
     }
     if model.use_layer_scale {

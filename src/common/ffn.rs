@@ -107,7 +107,7 @@ pub fn ffn_forward_via_backend(
     } else if let Some(st) = stencil {
         let out = precond.iter().map(|p| {
             crate::fft_ode::kerr_ode_fft(p, &weights.kerr.gamma_raw, &weights.kerr.omega,
-                weights.kerr.alpha, weights.kerr.beta, weights.kerr.rk4_n_steps, st)
+                weights.kerr.alpha, weights.kerr.beta, weights.kerr.rk4_n_steps, st, &weights.kerr.rk4_weights)
         }).collect();
         (out, None, "CPU-FFT")
     } else {
@@ -258,6 +258,7 @@ pub fn ffn_backward_via_backend(
                 d_gamma_raw: if pos == 0 { d_gamma_raw.clone() } else { vec![0.0; n_bands] },
                 d_alpha: if pos == 0 { d_alpha } else { 0.0 },
                 d_beta: if pos == 0 { d_beta } else { 0.0 },
+                d_rk4_weights: [0.0; 4], // GPU backward doesn't compute RK4 weight grads yet
             });
         }
         (d_inputs, Some(param_grads))
@@ -287,19 +288,21 @@ pub fn ffn_backward_via_backend(
     let d_input = cpu.vec_add_batch(&d_precond, &d_input_from_mae);
 
     // Accumulate ODE param gradients across positions
-    let (d_kerr_gamma_raw, d_kerr_alpha, d_kerr_beta) = if let Some(ref pg_vec) = ode_param_grads {
+    let (d_kerr_gamma_raw, d_kerr_alpha, d_kerr_beta, d_rk4_weights) = if let Some(ref pg_vec) = ode_param_grads {
         let nb = pg_vec[0].d_gamma_raw.len();
         let mut d_gr = vec![0.0f32; nb];
         let mut d_a = 0.0f32;
         let mut d_b = 0.0f32;
+        let mut d_rw = [0.0f32; 4];
         for pg in pg_vec {
             for k in 0..nb { d_gr[k] += pg.d_gamma_raw[k]; }
             d_a += pg.d_alpha;
             d_b += pg.d_beta;
+            for w in 0..4 { d_rw[w] += pg.d_rk4_weights[w]; }
         }
-        (Some(d_gr), Some(d_a), Some(d_b))
+        (Some(d_gr), Some(d_a), Some(d_b), Some(d_rw))
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     let grads = FfnGrads {
@@ -310,6 +313,7 @@ pub fn ffn_backward_via_backend(
         d_mae_in_sq_w, d_mae_in_sq_b,
         d_kerr_gamma_raw, d_kerr_alpha, d_kerr_beta,
         d_phase_correction,
+        d_rk4_weights,
     };
 
     (d_input, grads)
@@ -350,4 +354,5 @@ pub struct FfnGrads {
     pub d_kerr_alpha: Option<f32>,
     pub d_kerr_beta: Option<f32>,
     pub d_phase_correction: Option<Vec<f32>>,  // [n_bands] corrector plate gradient
+    pub d_rk4_weights: Option<[f32; 4]>,  // RK4 combination weights gradient
 }

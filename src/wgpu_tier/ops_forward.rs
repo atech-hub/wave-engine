@@ -232,9 +232,10 @@ impl GpuBackend {
             let (mut k4r, mut k4s) = self.gpu_kerr_derivative(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta);
             clamp_single(&mut k4r, &mut k4s, DERIV_BOUND);
 
+            let w = &weights.rk4_weights;
             for k in 0..n_bands {
-                r[k] += dt / 6.0 * (k1r[k] + 2.0 * k2r[k] + 2.0 * k3r[k] + k4r[k]);
-                s[k] += dt / 6.0 * (k1s[k] + 2.0 * k2s[k] + 2.0 * k3s[k] + k4s[k]);
+                r[k] += dt * (w[0] * k1r[k] + w[1] * k2r[k] + w[2] * k3r[k] + w[3] * k4r[k]);
+                s[k] += dt * (w[0] * k1s[k] + w[1] * k2s[k] + w[2] * k3s[k] + w[3] * k4s[k]);
             }
             clamp_single(&mut r, &mut s, MAG_BOUND);
         }
@@ -801,9 +802,10 @@ impl GpuBackend {
             let (mut k4r, mut k4s) = self.gpu_kerr_derivative_batch(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
             clamp_mag(&mut k4r, &mut k4s, total, DERIV_BOUND);
 
+            let w = &weights.rk4_weights;
             for i in 0..total {
-                r[i] += dt / 6.0 * (k1r[i] + 2.0 * k2r[i] + 2.0 * k3r[i] + k4r[i]);
-                s[i] += dt / 6.0 * (k1s[i] + 2.0 * k2s[i] + 2.0 * k3s[i] + k4s[i]);
+                r[i] += dt * (w[0] * k1r[i] + w[1] * k2r[i] + w[2] * k3r[i] + w[3] * k4r[i]);
+                s[i] += dt * (w[0] * k1s[i] + w[1] * k2s[i] + w[2] * k3s[i] + w[3] * k4s[i]);
             }
             clamp_mag(&mut r, &mut s, total, MAG_BOUND);
         }

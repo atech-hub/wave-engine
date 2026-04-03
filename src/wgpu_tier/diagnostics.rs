@@ -22,6 +22,7 @@ pub fn diagnose_ode_gpu_vs_cpu(gpu_be: &gpu_pipelines::GpuBackend) {
         omega: (0..n_bands).map(|k| (k + 1) as f32 / n_bands as f32).collect(),
         alpha: 0.1, beta: 0.1, rk4_n_steps: RK4_STEPS,
         phase_correction: vec![0.0; n_bands],
+        rk4_weights: [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0],
     };
 
     // CPU ODE
@@ -137,8 +138,9 @@ fn kerr_ode_forward_cpu_standalone(weights: &KerrWeights, x: &[f32]) -> Vec<f32>
     let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
     let mut r: Vec<f32> = (0..n_bands).map(|k| x[k * 2]).collect();
     let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
+    let w = &weights.rk4_weights;
     for _ in 0..n_steps {
-        let (r_new, s_new) = rk4_step_standalone(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta);
+        let (r_new, s_new) = rk4_step_standalone(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, w);
         r = r_new; s = s_new;
     }
     let mut out = vec![0.0f32; n_embd];
@@ -146,7 +148,7 @@ fn kerr_ode_forward_cpu_standalone(weights: &KerrWeights, x: &[f32]) -> Vec<f32>
     out
 }
 
-fn rk4_step_standalone(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: f32, beta: f32) -> (Vec<f32>, Vec<f32>) {
+fn rk4_step_standalone(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: f32, beta: f32, w: &[f32; 4]) -> (Vec<f32>, Vec<f32>) {
     let n = r.len();
     let deriv = |r: &[f32], s: &[f32]| -> (Vec<f32>, Vec<f32>) {
         let mut dr = vec![0.0f32; n]; let mut ds = vec![0.0f32; n];
@@ -173,7 +175,7 @@ fn rk4_step_standalone(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f3
     let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a,&b)| a+dt*b).collect();
     let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a,&b)| a+dt*b).collect();
     let (k4r, k4s) = deriv(&r4, &s4);
-    let rn: Vec<f32> = (0..n).map(|i| r[i]+dt/6.0*(k1r[i]+2.0*k2r[i]+2.0*k3r[i]+k4r[i])).collect();
-    let sn: Vec<f32> = (0..n).map(|i| s[i]+dt/6.0*(k1s[i]+2.0*k2s[i]+2.0*k3s[i]+k4s[i])).collect();
+    let rn: Vec<f32> = (0..n).map(|i| r[i]+dt*(w[0]*k1r[i]+w[1]*k2r[i]+w[2]*k3r[i]+w[3]*k4r[i])).collect();
+    let sn: Vec<f32> = (0..n).map(|i| s[i]+dt*(w[0]*k1s[i]+w[1]*k2s[i]+w[2]*k3s[i]+w[3]*k4s[i])).collect();
     (rn, sn)
 }

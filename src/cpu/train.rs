@@ -173,6 +173,8 @@ pub struct TrainConfig {
     pub phase_temp: f32,       // temperature for phase-native softmax (default 1.0)
     pub spring_k: f32, // spring constant for dynamic params (0.0 = no spring, 0.1 = moderate)
     pub active_layers: Option<usize>, // --active-layers N: first N layers at eq=1.0, rest at eq=0.0
+    pub rk4_weights: DynParam, // --rk4-weights dyn | --rk4-weights standard
+    pub wd: DynParam,          // --wd dyn | --wd 0.01 | --wd 0.01,0.02,0.01,0.005,0.01
 }
 
 /// A parameter that can be fixed (manual value) or dynamic (model learns it).
@@ -233,7 +235,7 @@ pub fn run_training(config: TrainConfig) {
         println!("Resuming from checkpoint: {ckpt}");
         let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v, _ck_groups) = wave_checkpoint::load_checkpoint(ckpt);
         assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
-        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean), config.alpha, config.beta);
+        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()), config.alpha, config.beta);
         m.phase_native = config.phase_native; // Must set before count_trainable for correct param count
         let ext_count = count_trainable_ex(&m, config.tied);
         if params.len() == ext_count {
@@ -265,7 +267,7 @@ pub fn run_training(config: TrainConfig) {
         }
     } else {
         println!("Initializing model (seed=42)...");
-        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean), config.alpha, config.beta);
+        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()), config.alpha, config.beta);
         model.phase_native = config.phase_native; // Must set before count_trainable
         start_iter = 0;
         let n_t = count_trainable_ex(&model, config.tied);
@@ -282,7 +284,7 @@ pub fn run_training(config: TrainConfig) {
     println!("  Architecture: {} parallel blocks, {} harmonic heads, {} bands ({}-dim)", config.n_layers, config.n_head, config.n_bands, config.n_bands * 2);
 
     // Runtime dimensions (needed by pre-flight, forward, backward)
-    let mut dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active());
+    let mut dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(!config.no_corrector && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_rk4_weights(config.rk4_weights.is_active());
     dims.phase_temp = config.phase_temp;
     dims.pythagorean = config.pythagorean;
 
@@ -298,6 +300,11 @@ pub fn run_training(config: TrainConfig) {
     if let DynParam::Fixed(ref vals) = config.lr_scale {
         for (i, &v) in vals.iter().enumerate() {
             if i < model.lr_scale.len() { model.lr_scale[i] = v; }
+        }
+    }
+    if let DynParam::Fixed(ref vals) = config.wd {
+        for (i, &v) in vals.iter().enumerate() {
+            if i < model.wd_scale.len() { model.wd_scale[i] = v; }
         }
     }
 
@@ -616,7 +623,42 @@ pub fn run_training(config: TrainConfig) {
         }
 
         let mut params = flatten_params_ex(&model, config.tied);
-        optimizer.step(&mut params, &total_grads);
+        if config.wd.is_active() {
+            // Per-group weight decay: apply WD manually, then Adam without WD
+            let base_wd = 0.01f32;
+            let n_layers = model.blocks.len();
+            let n_embd = dims.n_embd;
+            let maestro_dim = crate::MAESTRO_DIM;
+            let per_block = n_embd * 4
+                + maestro_dim * n_embd + maestro_dim + n_embd * maestro_dim + n_embd
+                + maestro_dim * n_embd + maestro_dim + n_embd * maestro_dim + n_embd
+                + model.blocks[0].ffn.out_proj.param_count();
+            let ode_per = if model.learnable_ode {
+                model.blocks[0].ffn.kerr.gamma_raw.len() + 1 + 1 + model.blocks[0].ffn.kerr.phase_correction.len()
+                + if model.use_rk4_weights { 4 } else { 0 }
+            } else { 0 };
+            let block_total = per_block + ode_per;
+            let ls_count = if model.use_layer_scale { n_layers } else { 0 };
+
+            // Apply per-layer WD
+            for l in 0..n_layers {
+                let start = l * block_total;
+                let end = (start + block_total).min(params.len());
+                let wd_eff = base_wd * model.wd_scale[l];
+                for i in start..end {
+                    params[i] -= current_lr * wd_eff * params[i];
+                }
+            }
+            // Apply lm_head group WD
+            let head_start = n_layers * block_total + ls_count + n_embd * 2;
+            let wd_head = base_wd * model.wd_scale[n_layers];
+            for i in head_start..params.len() {
+                params[i] -= current_lr * wd_head * params[i];
+            }
+            optimizer.step_wd(&mut params, &total_grads, 0.0); // Adam without WD (already applied)
+        } else {
+            optimizer.step(&mut params, &total_grads);
+        }
         unflatten_params_ex(&mut model, &params, config.tied);
 
         // Layer scale spring: restoring force toward equilibrium.
@@ -628,6 +670,28 @@ pub fn run_training(config: TrainConfig) {
                 let eq = if l < active { 1.0 } else { 0.0 };
                 model.layer_scale[l] -= current_lr * config.spring_k * (model.layer_scale[l] - eq);
                 if model.layer_scale[l] < 0.0 { model.layer_scale[l] = 0.0; }
+            }
+        }
+
+        // WD spring: stiff restoring force toward uniform (1.0).
+        // param -= lr * k * (param - eq), eq=1.0, k=1.0 (stiff)
+        if config.wd.is_dynamic() && config.spring_k > 0.0 {
+            let k_wd = config.spring_k * 1.0; // stiff
+            for s in &mut model.wd_scale {
+                *s -= current_lr * k_wd * (*s - 1.0);
+                *s = s.clamp(0.01, 10.0); // don't let WD go negative or extreme
+            }
+        }
+
+        // RK4 weights spring: very stiff restoring force toward standard [1/6, 1/3, 1/3, 1/6].
+        // Spring k=2.0 (relative to global spring_k). Standard RK4 is mathematically motivated.
+        if config.rk4_weights.is_dynamic() && config.spring_k > 0.0 {
+            let k_rk4 = config.spring_k * 2.0; // very stiff
+            let eq: [f32; 4] = [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0];
+            for block in &mut model.blocks {
+                for w in 0..4 {
+                    block.ffn.kerr.rk4_weights[w] -= current_lr * k_rk4 * (block.ffn.kerr.rk4_weights[w] - eq[w]);
+                }
             }
         }
 
@@ -728,11 +792,27 @@ pub fn run_training(config: TrainConfig) {
             } else {
                 String::new()
             };
+            let rk4w_str = if config.rk4_weights.is_active() {
+                let mut parts = Vec::new();
+                for (l, block) in model.blocks.iter().enumerate() {
+                    let w = &block.ffn.kerr.rk4_weights;
+                    parts.push(format!(r#"{{"L{}": [{:.4},{:.4},{:.4},{:.4}]}}"#, l, w[0], w[1], w[2], w[3]));
+                }
+                format!(r#","rk4_weights":[{}]"#, parts.join(","))
+            } else {
+                String::new()
+            };
+            let wd_str = if config.wd.is_active() {
+                let vals: Vec<String> = model.wd_scale.iter().map(|s| format!("{:.4}", s)).collect();
+                format!(r#","wd_scale":[{}]"#, vals.join(","))
+            } else {
+                String::new()
+            };
             writeln!(log_writer,
-                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}{}{}{}}}"#,
+                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}{}{}{}{}{}}}"#,
                 iter, total_loss, current_lr, iter_start.elapsed().as_millis(), nan_skip_count,
                 model_gn, head_gn, head_pct, layer_str, clamp_count, max_mag,
-                agc.threshold, agc.ema_mean, agc.ema_std, ode_str, ls_str, lrs_str
+                agc.threshold, agc.ema_mean, agc.ema_std, ode_str, ls_str, lrs_str, rk4w_str, wd_str
             ).ok();
         } else {
             writeln!(log_writer,

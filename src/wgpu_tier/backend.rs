@@ -414,7 +414,7 @@ fn kerr_ode_cpu(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
     let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
 
     for _ in 0..n_steps {
-        let (r_new, s_new) = rk4_step_public(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta);
+        let (r_new, s_new) = rk4_step_public(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, &weights.rk4_weights);
         r = r_new;
         s = s_new;
     }

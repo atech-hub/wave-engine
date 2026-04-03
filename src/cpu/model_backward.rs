@@ -36,6 +36,8 @@ pub struct Gradients {
     pub block_ffn_kerr_alpha: Vec<f32>,
     pub block_ffn_kerr_beta: Vec<f32>,
     pub block_ffn_phase_correction: Vec<Vec<f32>>,
+    pub block_ffn_rk4_weights: Vec<[f32; 4]>,
+    pub rk4_weights_active: bool,
     pub block_ffn_mae_in_sq_w: Vec<Vec<Vec<f32>>>,
     pub block_ffn_mae_in_sq_b: Vec<Vec<f32>>,
     pub block_ffn_mae_in_pr_w: Vec<Vec<Vec<f32>>>,
@@ -77,6 +79,8 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         block_ffn_kerr_alpha: vec![0.0; n_blocks],
         block_ffn_kerr_beta: vec![0.0; n_blocks],
         block_ffn_phase_correction: if d.learnable_ode { vec![vec![0.0; d.n_bands]; n_blocks] } else { vec![vec![]; n_blocks] },
+        block_ffn_rk4_weights: vec![[0.0f32; 4]; n_blocks],
+        rk4_weights_active: model.use_rk4_weights && d.learnable_ode,
         block_ffn_mae_in_sq_w: vec![vec![vec![0.0; d.n_embd]; d.maestro_dim]; n_blocks],
         block_ffn_mae_in_sq_b: vec![vec![0.0; d.maestro_dim]; n_blocks],
         block_ffn_mae_in_pr_w: vec![vec![vec![0.0; d.maestro_dim]; d.n_embd]; n_blocks],
@@ -264,6 +268,9 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
             if let Some(d_b) = fg.d_kerr_beta { grads.block_ffn_kerr_beta[block_idx] += d_b; }
             if let Some(ref d_pc) = fg.d_phase_correction {
                 for k in 0..d_pc.len() { grads.block_ffn_phase_correction[block_idx][k] += d_pc[k]; }
+            }
+            if let Some(ref d_rw) = fg.d_rk4_weights {
+                for w in 0..4 { grads.block_ffn_rk4_weights[block_idx][w] += d_rw[w]; }
             }
             d_input
         } else {
@@ -467,8 +474,9 @@ fn kerr_ode_forward_cpu_standalone(weights: &KerrWeights, x: &[f32]) -> Vec<f32>
     let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
     let mut r: Vec<f32> = (0..n_bands).map(|k| x[k * 2]).collect();
     let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
+    let w = &weights.rk4_weights;
     for _ in 0..n_steps {
-        let (r_new, s_new) = rk4_step_standalone(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta);
+        let (r_new, s_new) = rk4_step_standalone(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, w);
         r = r_new; s = s_new;
     }
     let mut out = vec![0.0f32; n_embd];
@@ -476,7 +484,7 @@ fn kerr_ode_forward_cpu_standalone(weights: &KerrWeights, x: &[f32]) -> Vec<f32>
     out
 }
 
-fn rk4_step_standalone(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: f32, beta: f32) -> (Vec<f32>, Vec<f32>) {
+fn rk4_step_standalone(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: f32, beta: f32, w: &[f32; 4]) -> (Vec<f32>, Vec<f32>) {
     let n = r.len();
     let deriv = |r: &[f32], s: &[f32]| -> (Vec<f32>, Vec<f32>) {
         let mut dr = vec![0.0f32; n]; let mut ds = vec![0.0f32; n];
@@ -503,8 +511,8 @@ fn rk4_step_standalone(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f3
     let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a,&b)| a+dt*b).collect();
     let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a,&b)| a+dt*b).collect();
     let (k4r, k4s) = deriv(&r4, &s4);
-    let rn: Vec<f32> = (0..n).map(|i| r[i]+dt/6.0*(k1r[i]+2.0*k2r[i]+2.0*k3r[i]+k4r[i])).collect();
-    let sn: Vec<f32> = (0..n).map(|i| s[i]+dt/6.0*(k1s[i]+2.0*k2s[i]+2.0*k3s[i]+k4s[i])).collect();
+    let rn: Vec<f32> = (0..n).map(|i| r[i]+dt*(w[0]*k1r[i]+w[1]*k2r[i]+w[2]*k3r[i]+w[3]*k4r[i])).collect();
+    let sn: Vec<f32> = (0..n).map(|i| s[i]+dt*(w[0]*k1s[i]+w[1]*k2s[i]+w[2]*k3s[i]+w[3]*k4s[i])).collect();
     (rn, sn)
 }
 
@@ -535,6 +543,9 @@ pub fn flatten_grads_ex(grads: &Gradients, tied: bool) -> Vec<f32> {
             g.push(grads.block_ffn_kerr_alpha[b]);
             g.push(grads.block_ffn_kerr_beta[b]);
             g.extend_from_slice(&grads.block_ffn_phase_correction[b]);
+            if grads.rk4_weights_active {
+                g.extend_from_slice(&grads.block_ffn_rk4_weights[b]);
+            }
         }
     }
     if !grads.layer_scale.is_empty() {

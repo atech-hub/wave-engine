@@ -203,6 +203,7 @@ pub struct KerrWeights {
     pub beta: f32,
     pub rk4_n_steps: usize,   // ODE integration steps (default 8)
     pub phase_correction: Vec<f32>,  // [N_BANDS] corrector plate — per-band phase offset (init 0.0)
+    pub rk4_weights: [f32; 4],  // RK4 combination weights [w1,w2,w3,w4] (standard: 1/6, 1/3, 1/3, 1/6)
 }
 
 /// Weights for Maestro.
@@ -755,7 +756,7 @@ impl ModelWeights {
         // RK4 integration steps
         for _ in 0..n_steps {
             let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma,
-                                           &weights.omega, weights.alpha, weights.beta);
+                                           &weights.omega, weights.alpha, weights.beta, &weights.rk4_weights);
             r = r_new;
             s = s_new;
         }
@@ -848,7 +849,7 @@ impl ModelWeights {
                         let dt = 1.0 / n_steps as f32;
                         for _ in 0..n_steps {
                             let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma,
-                                &w.kerr.omega, w.kerr.alpha, w.kerr.beta);
+                                &w.kerr.omega, w.kerr.alpha, w.kerr.beta, &w.kerr.rk4_weights);
                             r = r_new;
                             s = s_new;
                         }
@@ -908,7 +909,7 @@ impl ModelWeights {
                         let dt = 1.0 / n_steps as f32;
                         for _ in 0..n_steps {
                             let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma,
-                                &w.kerr.omega, w.kerr.alpha, w.kerr.beta);
+                                &w.kerr.omega, w.kerr.alpha, w.kerr.beta, &w.kerr.rk4_weights);
                             r = r_new;
                             s = s_new;
                         }
@@ -986,7 +987,7 @@ fn kerr_derivative(
 fn rk4_step(
     r: &[f32], s: &[f32], dt: f32,
     gamma: &[f32], omega: &[f32],
-    alpha: f32, beta: f32,
+    alpha: f32, beta: f32, w: &[f32; 4],
 ) -> (Vec<f32>, Vec<f32>) {
     let n = r.len();
 
@@ -1008,13 +1009,12 @@ fn rk4_step(
     let s4: Vec<f32> = (0..n).map(|k| s[k] + dt * ds3[k]).collect();
     let (dr4, ds4) = kerr_derivative(&r4, &s4, gamma, omega, alpha, beta);
 
-    // Combine: y_new = y + (dt/6)(k1 + 2k2 + 2k3 + k4)
-    let dt6 = dt / 6.0;
+    // Combine: y_new = y + dt * (w0*k1 + w1*k2 + w2*k3 + w3*k4)
     let r_new: Vec<f32> = (0..n)
-        .map(|k| r[k] + dt6 * (dr1[k] + 2.0 * dr2[k] + 2.0 * dr3[k] + dr4[k]))
+        .map(|k| r[k] + dt * (w[0] * dr1[k] + w[1] * dr2[k] + w[2] * dr3[k] + w[3] * dr4[k]))
         .collect();
     let s_new: Vec<f32> = (0..n)
-        .map(|k| s[k] + dt6 * (ds1[k] + 2.0 * ds2[k] + 2.0 * ds3[k] + ds4[k]))
+        .map(|k| s[k] + dt * (w[0] * ds1[k] + w[1] * ds2[k] + w[2] * ds3[k] + w[3] * ds4[k]))
         .collect();
 
     (r_new, s_new)
@@ -1024,9 +1024,9 @@ fn rk4_step(
 pub fn rk4_step_public(
     r: &[f32], s: &[f32], dt: f32,
     gamma: &[f32], omega: &[f32],
-    alpha: f32, beta: f32,
+    alpha: f32, beta: f32, w: &[f32; 4],
 ) -> (Vec<f32>, Vec<f32>) {
-    rk4_step(r, s, dt, gamma, omega, alpha, beta)
+    rk4_step(r, s, dt, gamma, omega, alpha, beta, w)
 }
 
 /// Public wrapper for linear (needed by backward.rs).

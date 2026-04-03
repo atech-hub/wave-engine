@@ -487,5 +487,7 @@ fn main() {
         pythagorean: std::env::args().any(|a| a == "--pythagorean"),
         spring_k: parse_flag("--spring", 0.1),
         active_layers: std::env::args().skip_while(|a| a != "--active-layers").nth(1).and_then(|s| s.parse().ok()),
+        rk4_weights: parse_dyn_param("--rk4-weights"),
+        wd: parse_dyn_param("--wd"),
     });
 }

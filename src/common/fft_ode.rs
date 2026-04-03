@@ -129,7 +129,7 @@ pub fn deriv_sequential(
 }
 
 /// Full RK4 ODE step using FFT-based derivative.
-pub fn kerr_ode_fft(x: &[f32], gamma_raw: &[f32], omega: &[f32], alpha: f32, beta: f32, rk4_steps: usize, stencil: &StencilFft) -> Vec<f32> {
+pub fn kerr_ode_fft(x: &[f32], gamma_raw: &[f32], omega: &[f32], alpha: f32, beta: f32, rk4_steps: usize, stencil: &StencilFft, rk4_w: &[f32; 4]) -> Vec<f32> {
     let n_bands = gamma_raw.len();
     let n_embd = n_bands * 2;
     let dt = 1.0 / rk4_steps as f32;
@@ -152,8 +152,8 @@ pub fn kerr_ode_fft(x: &[f32], gamma_raw: &[f32], omega: &[f32], alpha: f32, bet
         let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a,&b)| a+dt*b).collect();
         let (k4r, k4s) = deriv_fft(&r4, &s4, &gamma, omega, alpha, beta, stencil);
         for i in 0..n_bands {
-            r[i] += dt/6.0 * (k1r[i] + 2.0*k2r[i] + 2.0*k3r[i] + k4r[i]);
-            s[i] += dt/6.0 * (k1s[i] + 2.0*k2s[i] + 2.0*k3s[i] + k4s[i]);
+            r[i] += dt * (rk4_w[0]*k1r[i] + rk4_w[1]*k2r[i] + rk4_w[2]*k3r[i] + rk4_w[3]*k4r[i]);
+            s[i] += dt * (rk4_w[0]*k1s[i] + rk4_w[1]*k2s[i] + rk4_w[2]*k3s[i] + rk4_w[3]*k4s[i]);
         }
     }
 
@@ -201,6 +201,7 @@ pub fn kerr_ode_batch_gpu_fft(
     rk4_steps: usize,
     gpu_kernel: &GpuKernelFft,
     gpu: &crate::gpu_pipelines::GpuBackend,
+    rk4_w: &[f32; 4],
 ) -> Vec<Vec<f32>> {
     let n_pos = xs.len();
     if n_pos == 0 { return vec![]; }
@@ -258,8 +259,8 @@ pub fn kerr_ode_batch_gpu_fft(
         let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a,&b)| a+dt*b).collect();
         let (k4r, k4s) = deriv_gpu(&r4, &s4);
         for i in 0..n_pos * n_bands {
-            r[i] += dt/6.0 * (k1r[i] + 2.0*k2r[i] + 2.0*k3r[i] + k4r[i]);
-            s[i] += dt/6.0 * (k1s[i] + 2.0*k2s[i] + 2.0*k3s[i] + k4s[i]);
+            r[i] += dt * (rk4_w[0]*k1r[i] + rk4_w[1]*k2r[i] + rk4_w[2]*k3r[i] + rk4_w[3]*k4r[i]);
+            s[i] += dt * (rk4_w[0]*k1s[i] + rk4_w[1]*k2s[i] + rk4_w[2]*k3s[i] + rk4_w[3]*k4s[i]);
         }
     }
 
