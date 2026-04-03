@@ -490,5 +490,6 @@ fn main() {
         rk4_weights: parse_dyn_param("--rk4-weights"),
         wd: parse_dyn_param("--wd"),
         harmonics: parse_dyn_param("--harmonics"),
+        agc_headroom: parse_dyn_param("--agc-headroom"),
     });
 }

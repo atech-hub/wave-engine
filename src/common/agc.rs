@@ -61,6 +61,21 @@ impl OdeAgc {
         }
     }
 
+    /// Create AGC with explicit ceiling and custom headroom.
+    pub fn with_ceiling_headroom(ceiling: f32, headroom: f32) -> Self {
+        let ceiling = ceiling.max(0.5);
+        Self {
+            ema_mean: 1.0,
+            ema_var: 0.5,
+            headroom,
+            decay: 0.995,
+            min_threshold: (ceiling * 0.3).max(0.5),
+            max_threshold: ceiling,
+            threshold: (ceiling * 0.75).max(0.5),
+            count: 0,
+        }
+    }
+
     /// Create with defaults (backward compat — uses α=0.1 coupling).
     pub fn new() -> Self {
         Self::from_coupling(0.1, 0.1)

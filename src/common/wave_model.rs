@@ -30,6 +30,7 @@ pub struct WavePacketModel {
     pub lr_scale: Vec<f32>, // per-group LR multiplier [n_layers + 1 for lm_head] (training only)
     pub use_lr_scale: bool,
     pub wd_scale: Vec<f32>, // per-group WD multiplier [n_layers + 1] (1.0 = base WD, training only)
+    pub agc_headroom: Vec<f32>, // per-layer AGC headroom (3.0 = 3-sigma default, training only)
     pub phase_native: bool, // true = use phase coherence loss instead of lm_head
     pub output_corrector: Vec<f32>, // [n_bands] per-band phase rotation before phase comparison
 }
@@ -155,6 +156,7 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
         lr_scale: vec![1.0; n_layers + 1], // +1 for lm_head group
         use_lr_scale: d.use_lr_scale,
         wd_scale: vec![1.0; n_layers + 1], // +1 for lm_head group
+        agc_headroom: vec![3.0; n_layers], // 3-sigma default per layer
         phase_native: false,
         output_corrector: vec![0.0; d.n_bands], // 84 phase rotations, zero = transparent
     }

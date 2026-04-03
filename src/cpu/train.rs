@@ -176,6 +176,7 @@ pub struct TrainConfig {
     pub rk4_weights: DynParam, // --rk4-weights dyn | --rk4-weights standard
     pub wd: DynParam,          // --wd dyn | --wd 0.01 | --wd 0.01,0.02,0.01,0.005,0.01
     pub harmonics: DynParam,   // --harmonics dyn | --harmonics 0.5,1.0,1.5,2.0
+    pub agc_headroom: DynParam, // --agc-headroom dyn | --agc-headroom 2.0,3.0,3.0,4.0
 }
 
 /// A parameter that can be fixed (manual value) or dynamic (model learns it).
@@ -306,6 +307,11 @@ pub fn run_training(config: TrainConfig) {
     if let DynParam::Fixed(ref vals) = config.wd {
         for (i, &v) in vals.iter().enumerate() {
             if i < model.wd_scale.len() { model.wd_scale[i] = v; }
+        }
+    }
+    if let DynParam::Fixed(ref vals) = config.agc_headroom {
+        for (i, &v) in vals.iter().enumerate() {
+            if i < model.agc_headroom.len() { model.agc_headroom[i] = v; }
         }
     }
 
@@ -497,8 +503,19 @@ pub fn run_training(config: TrainConfig) {
                 let st_ref = Some(&stencil);
                 let gk_ref: Option<(&fft_ode::GpuKernelFft, &gpu_pipelines::GpuBackend)> =
                     gpu_backend.as_ref().map(|be| (&gpu_kernel, be));
+                let agc_headrooms = if config.agc_headroom.is_active() { Some(model.agc_headroom.clone()) } else { None };
                 s.spawn(move || {
-                    let cache = forward_with_cache(model_ref, input, dims, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref, None);
+                    // Per-layer AGC with per-layer headroom (when --agc-headroom is active)
+                    let mut layer_agcs_storage: Option<Vec<crate::common::agc::OdeAgc>> = agc_headrooms.map(|headrooms| {
+                        headrooms.iter().map(|&hr| {
+                            let alpha = model_ref.blocks[0].ffn.kerr.alpha;
+                            let beta = model_ref.blocks[0].ffn.kerr.beta;
+                            let ceiling = (std::f32::consts::FRAC_PI_2 / (alpha + 4.0 * beta)).sqrt().max(0.5);
+                            crate::common::agc::OdeAgc::with_ceiling_headroom(ceiling, hr)
+                        }).collect()
+                    });
+                    let layer_agcs_ref = layer_agcs_storage.as_deref_mut();
+                    let cache = forward_with_cache(model_ref, input, dims, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref, layer_agcs_ref);
 
                     // Health monitors on first batch element only (before backward)
                     let is_health = measure_batch_distortion && batch_idx == 0;
@@ -836,6 +853,15 @@ pub fn run_training(config: TrainConfig) {
             }
         }
 
+        // AGC headroom spring: stiff restoring force toward 3.0 (3-sigma default).
+        if config.agc_headroom.is_dynamic() && config.spring_k > 0.0 {
+            let k_agc = config.spring_k * 1.0; // stiff — safety motivated
+            for hr in &mut model.agc_headroom {
+                *hr -= current_lr * k_agc * (*hr - 3.0);
+                *hr = hr.clamp(1.0, 6.0); // don't go below 1-sigma or above 6-sigma
+            }
+        }
+
         // Dynamic AGC: update ceiling from learned coupling constants.
         // Uses min ceiling across all layers (most conservative — prevents divergence).
         if !config.freeze_ode {
@@ -961,11 +987,17 @@ pub fn run_training(config: TrainConfig) {
             } else {
                 String::new()
             };
+            let agc_hr_str = if config.agc_headroom.is_active() {
+                let vals: Vec<String> = model.agc_headroom.iter().map(|h| format!("{:.2}", h)).collect();
+                format!(r#","agc_headroom":[{}]"#, vals.join(","))
+            } else {
+                String::new()
+            };
             writeln!(log_writer,
-                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}{}{}{}{}{}{}}}"#,
+                r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"time_ms":{},"nan_skips":{},"model_gn":{:.4},"head_gn":{:.4},"head_pct":{:.1},"layer_gn":[{}],"ode_clamps":{},"ode_max_mag":{:.2},"agc_threshold":{:.3},"agc_mean":{:.3},"agc_std":{:.3}{}{}{}{}{}{}{}}}"#,
                 iter, total_loss, current_lr, iter_start.elapsed().as_millis(), nan_skip_count,
                 model_gn, head_gn, head_pct, layer_str, clamp_count, max_mag,
-                agc.threshold, agc.ema_mean, agc.ema_std, ode_str, ls_str, lrs_str, rk4w_str, wd_str, harm_str
+                agc.threshold, agc.ema_mean, agc.ema_std, ode_str, ls_str, lrs_str, rk4w_str, wd_str, harm_str, agc_hr_str
             ).ok();
         } else {
             writeln!(log_writer,

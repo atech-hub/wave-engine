@@ -97,6 +97,9 @@ pub fn print_help() {
     println!("    --harmonics dyn     Per-head learnable harmonic numbers. Spring eq=initial, k=2.0.");
     println!("                        n_head params per layer. Model tunes attention frequency.");
     println!("    --harmonics V,V     Fixed harmonic values (comma-separated per head).");
+    println!("    --agc-headroom dyn  Per-layer AGC headroom (sigma). Spring eq=3.0, k=1.0.");
+    println!("                        Low headroom = tight compression (L0). High = loose (L3).");
+    println!("    --agc-headroom V,V  Fixed per-layer headroom (e.g. 2.0,3.0,3.0,4.0).");
     println!("    --lr-scale dyn      Per-group LR scaling. Spring eq=1.0, k=0.5.");
     println!("    --lr-scale V,V,V    Fixed per-group LR (per layer + head, comma-separated).");
     println!("    --spring F          Global spring constant for all dynamic params [default: 0.1]");
