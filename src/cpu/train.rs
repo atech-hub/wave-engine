@@ -249,8 +249,9 @@ pub fn run_training(config: TrainConfig) {
             let base_dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(false).with_corrector(false);
             m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, base_dims, config.alpha, config.beta);
             unflatten_params(&mut m, &params);
-            // Re-enable learnable ODE on the loaded model
+            // Re-enable learnable ODE and phase-native on the loaded model
             m.learnable_ode = !config.freeze_ode;
+            m.phase_native = config.phase_native;
             println!("  Loaded {} params (base — ODE/corrector start fresh)", params.len());
         }
         model = m;

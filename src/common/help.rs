@@ -151,6 +151,12 @@ pub fn print_help() {
     println!("    --port N            Server port                                [default: 8080]");
     println!("    --host ADDR         Server bind address                        [default: 127.0.0.1]");
     println!();
+    println!("ARCHITECTURE CALCULATOR:");
+    println!("    --recommend FILE    Analyze dataset and recommend optimal architecture");
+    println!("                        Two-bottleneck model: bands + attention must both pass.");
+    println!("                        Prints configuration, warnings, and copy-paste CLI commands.");
+    println!("    --task TYPE         Override task detection (arithmetic/words/grammar/language)");
+    println!();
     println!("ANALYSIS:");
     println!("    --analyze         Run wave structure diagnostics on a trained model (no training)");
     println!("                      Requires --resume <checkpoint>. Uses cos(n*dtheta) harmonic coherence.");
