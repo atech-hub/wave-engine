@@ -444,6 +444,15 @@ pub fn run_training(config: TrainConfig) {
     let warmup_iters = 100usize;
     let min_lr_ratio = 0.1f32; // decay to 10% of base LR
 
+    // Monitor state: dynamic parameter evolution tracking
+    let mut prev_dyn_snap: Option<crate::common::dyn_param_monitor::DynParamSnapshot> = None;
+
+    // Monitor state: curriculum transition tracking (#8)
+    let mut curriculum_tracker = crate::common::curriculum_monitor::CurriculumTracker::new();
+
+    // Monitor state: checkpoint drift tracking (#9)
+    let mut checkpoint_tracker = crate::common::checkpoint_monitor::CheckpointTracker::new(model.blocks.len());
+
     for iter in start_iter..total_iters {
         let iter_start = std::time::Instant::now();
 
@@ -465,7 +474,16 @@ pub fn run_training(config: TrainConfig) {
         let measure_batch_distortion = config.health_interval > 0 && iter % config.health_interval == 0;
 
         let t_fwd = monitor.start();
-        let batch_results: Vec<(f32, Vec<f32>, Option<Vec<crate::common::ode_distortion::LayerDistortionSummary>>)> = std::thread::scope(|s| {
+        // Health data extracted from first batch element at health intervals
+        struct BatchHealthData {
+            distortion: Option<Vec<crate::common::ode_distortion::LayerDistortionSummary>>,
+            grad_flow: Option<Vec<crate::common::gradient_monitor::GradientFlowStats>>,
+            attn_stats: Option<Vec<crate::common::attn_monitor::AttentionHeadStats>>,
+            flow_stats: Option<Vec<crate::common::layer_flow_monitor::LayerFlowStats>>,
+            output_stats: Option<crate::common::output_monitor::OutputDistStats>,
+            ode_dynamics: Option<Vec<crate::common::ode_dynamics_monitor::OdeDynamicsStats>>,
+        }
+        let batch_results: Vec<(f32, Vec<f32>, BatchHealthData)> = std::thread::scope(|s| {
             let handles: Vec<_> = starts.iter().enumerate().map(|(batch_idx, &start)| {
                 let model_ref = &model;
                 let gpu_ref: Option<&(dyn backend::ComputeBackend + Send + Sync)> = gpu_backend.as_ref().map(|be| be as &(dyn backend::ComputeBackend + Send + Sync));
@@ -481,8 +499,10 @@ pub fn run_training(config: TrainConfig) {
                 s.spawn(move || {
                     let cache = forward_with_cache(model_ref, input, dims, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref, None);
 
-                    // Measure batch distortion on first batch element only (before backward consumes cache)
-                    let distortion = if measure_batch_distortion && batch_idx == 0 {
+                    // Health monitors on first batch element only (before backward)
+                    let is_health = measure_batch_distortion && batch_idx == 0;
+
+                    let distortion = if is_health {
                         let mut layer_summaries = Vec::new();
                         for (li, bc) in cache.block_caches.iter().enumerate() {
                             if let Some(ref fc) = bc.ffn_backend_cache {
@@ -498,23 +518,122 @@ pub fn run_training(config: TrainConfig) {
                         None
                     };
 
+                    // Attention head activity (#1)
+                    let attn_stats = if is_health {
+                        Some(crate::common::attn_monitor::analyze_attention(model_ref, &cache))
+                    } else {
+                        None
+                    };
+
+                    // Layer signal flow (#2)
+                    let flow_stats = if is_health {
+                        Some(crate::common::layer_flow_monitor::analyze_flow(&cache, dims))
+                    } else {
+                        None
+                    };
+
+                    // Output distribution (#5)
+                    let output_stats = if is_health {
+                        let targets_vec: Vec<usize> = target.to_vec();
+                        Some(crate::common::output_monitor::analyze_output(&cache.logits, &targets_vec))
+                    } else {
+                        None
+                    };
+
+                    // ODE dynamics deep (#6)
+                    let ode_dynamics = if is_health {
+                        Some(crate::common::ode_dynamics_monitor::analyze_ode_dynamics(&cache, dims))
+                    } else {
+                        None
+                    };
+
                     let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref);
-                    (loss, flatten_grads_ex(&grads, dims.tied), distortion)
+                    // Gradient flow analysis on first batch element at health intervals
+                    let grad_flow = if is_health {
+                        Some(crate::common::gradient_monitor::analyze_gradients(&grads, dims))
+                    } else {
+                        None
+                    };
+                    (loss, flatten_grads_ex(&grads, dims.tied), BatchHealthData {
+                        distortion, grad_flow, attn_stats, flow_stats, output_stats, ode_dynamics,
+                    })
                 })
             }).collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        let fwd_bwd_elapsed = t_fwd.elapsed();
         monitor.record("fwd+bwd (batch)", t_fwd);
 
         let t_reduce = monitor.start();
         let mut total_loss = 0.0f32;
         let mut total_grads = vec![0.0f32; n_trainable];
         let mut batch_distortion_data: Option<Vec<crate::common::ode_distortion::LayerDistortionSummary>> = None;
-        for (loss, fg, distortion) in &batch_results {
+        let mut batch_grad_flow: Option<Vec<crate::common::gradient_monitor::GradientFlowStats>> = None;
+        let mut batch_attn_stats: Option<Vec<crate::common::attn_monitor::AttentionHeadStats>> = None;
+        let mut batch_flow_stats: Option<Vec<crate::common::layer_flow_monitor::LayerFlowStats>> = None;
+        let mut batch_output_stats: Option<crate::common::output_monitor::OutputDistStats> = None;
+        let mut batch_ode_dynamics: Option<Vec<crate::common::ode_dynamics_monitor::OdeDynamicsStats>> = None;
+        for (loss, fg, health) in &batch_results {
             total_loss += loss;
             for (a, g) in total_grads.iter_mut().zip(fg.iter()) { *a += g; }
-            if distortion.is_some() && batch_distortion_data.is_none() {
-                batch_distortion_data = distortion.clone();
+            if health.distortion.is_some() && batch_distortion_data.is_none() {
+                batch_distortion_data = health.distortion.clone();
+            }
+            if batch_grad_flow.is_none() {
+                if let Some(ref gf) = health.grad_flow {
+                    batch_grad_flow = Some(gf.iter().map(|s| crate::common::gradient_monitor::GradientFlowStats {
+                        layer: s.layer,
+                        ln_grad_norm: s.ln_grad_norm,
+                        maestro_in_grad_norm: s.maestro_in_grad_norm,
+                        ode_grad_norm: s.ode_grad_norm,
+                        maestro_out_grad_norm: s.maestro_out_grad_norm,
+                        out_proj_grad_norm: s.out_proj_grad_norm,
+                        alpha_grad: s.alpha_grad,
+                        beta_grad: s.beta_grad,
+                        corrector_grad_norm: s.corrector_grad_norm,
+                        rk4_grad_norm: s.rk4_grad_norm,
+                    }).collect());
+                }
+            }
+            // Extract batch 2 monitor data from first element that has it
+            if batch_attn_stats.is_none() {
+                if let Some(ref stats) = health.attn_stats {
+                    batch_attn_stats = Some(stats.iter().map(|s| crate::common::attn_monitor::AttentionHeadStats {
+                        layer: s.layer, head: s.head, harmonic: s.harmonic,
+                        entropy: s.entropy, max_weight: s.max_weight,
+                        top_position: s.top_position, self_attn_frac: s.self_attn_frac,
+                    }).collect());
+                }
+            }
+            if batch_flow_stats.is_none() {
+                if let Some(ref stats) = health.flow_stats {
+                    batch_flow_stats = Some(stats.iter().map(|s| crate::common::layer_flow_monitor::LayerFlowStats {
+                        layer: s.layer, input_norm: s.input_norm,
+                        attn_output_norm: s.attn_output_norm, ffn_output_norm: s.ffn_output_norm,
+                        output_norm: s.output_norm, attn_ratio: s.attn_ratio,
+                        ffn_ratio: s.ffn_ratio, residual_ratio: s.residual_ratio,
+                        cosine_in_out: s.cosine_in_out,
+                    }).collect());
+                }
+            }
+            if batch_output_stats.is_none() {
+                if let Some(ref stats) = health.output_stats {
+                    batch_output_stats = Some(crate::common::output_monitor::OutputDistStats {
+                        avg_entropy: stats.avg_entropy, avg_margin: stats.avg_margin,
+                        avg_correct_rank: stats.avg_correct_rank, worst_margin: stats.worst_margin,
+                        worst_prompt_pos: stats.worst_prompt_pos, mode_collapse: stats.mode_collapse,
+                    });
+                }
+            }
+            if batch_ode_dynamics.is_none() {
+                if let Some(ref stats) = health.ode_dynamics {
+                    batch_ode_dynamics = Some(stats.iter().map(|s| crate::common::ode_dynamics_monitor::OdeDynamicsStats {
+                        layer: s.layer, phase_velocity: s.phase_velocity,
+                        energy_in: s.energy_in, energy_out: s.energy_out,
+                        energy_ratio: s.energy_ratio, band_energy_std: s.band_energy_std,
+                        damping_effective: s.damping_effective,
+                    }).collect());
+                }
             }
         }
         total_loss /= batch_size as f32;
@@ -542,6 +661,14 @@ pub fn run_training(config: TrainConfig) {
             best_loss = total_loss;
             best_iter = iter;
         }
+
+        // Curriculum transition tracking (#8) — every iteration
+        let curriculum_event = if config.use_curriculum {
+            let active = curriculum.active_bands(iter, total_iters);
+            curriculum_tracker.update(iter, total_loss, active)
+        } else {
+            None
+        };
 
         let t_optim = monitor.start();
         clip_grad_norm(&mut total_grads, 1.0);
@@ -719,6 +846,7 @@ pub fn run_training(config: TrainConfig) {
                 );
             }
         }
+        let optim_elapsed = t_optim.elapsed();
         monitor.record("optimizer", t_optim);
 
         let grad_norm: f32 = total_grads.iter().map(|g| g * g).sum::<f32>().sqrt();
@@ -865,12 +993,123 @@ pub fn run_training(config: TrainConfig) {
                 }).collect();
                 eprintln!("  [batch-distortion {}] {}", iter, layer_strs.join(" | "));
             }
+
+            // --- Monitor suite (batch 1) ---
+
+            // Gradient flow per component (#3)
+            if let Some(ref gf_stats) = batch_grad_flow {
+                let gf_json = crate::common::gradient_monitor::to_json(gf_stats);
+                if !gf_json.is_empty() {
+                    use std::io::Write;
+                    writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, gf_json).ok();
+                    log_writer.flush().ok();
+                }
+            }
+
+            // Dynamic parameter evolution (#7)
+            {
+                let snap = crate::common::dyn_param_monitor::snapshot(&model, prev_dyn_snap.as_ref());
+                let dp_json = crate::common::dyn_param_monitor::to_json(&snap);
+                if !dp_json.is_empty() {
+                    use std::io::Write;
+                    writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, dp_json).ok();
+                    log_writer.flush().ok();
+                }
+                prev_dyn_snap = Some(snap);
+            }
+
+            // Throughput (#10)
+            {
+                let tp_stats = crate::common::throughput_monitor::compute(
+                    batch_size,
+                    seq_len,
+                    iter_start.elapsed().as_secs_f32() * 1000.0,
+                    fwd_bwd_elapsed.as_secs_f32() * 1000.0,
+                    optim_elapsed.as_secs_f32() * 1000.0,
+                );
+                let tp_json = crate::common::throughput_monitor::to_json(&tp_stats);
+                use std::io::Write;
+                writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, tp_json).ok();
+                log_writer.flush().ok();
+            }
+
+            // --- Monitor suite (batch 2) ---
+
+            // Attention head activity (#1)
+            if let Some(ref attn_stats) = batch_attn_stats {
+                let attn_json = crate::common::attn_monitor::to_json(attn_stats);
+                if !attn_json.is_empty() {
+                    use std::io::Write;
+                    writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, attn_json).ok();
+                    log_writer.flush().ok();
+                }
+            }
+
+            // Layer signal flow (#2)
+            if let Some(ref flow_stats) = batch_flow_stats {
+                let flow_json = crate::common::layer_flow_monitor::to_json(flow_stats);
+                if !flow_json.is_empty() {
+                    use std::io::Write;
+                    writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, flow_json).ok();
+                    log_writer.flush().ok();
+                }
+            }
+
+            // Output distribution (#5)
+            if let Some(ref output_stats) = batch_output_stats {
+                let out_json = crate::common::output_monitor::to_json(output_stats);
+                use std::io::Write;
+                writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, out_json).ok();
+                log_writer.flush().ok();
+            }
+
+            // --- Monitor suite (batch 3) ---
+
+            // Embedding space (#4) — medium cost, sample-based
+            {
+                let embed_stats = crate::common::embedding_monitor::analyze_embeddings(&model);
+                let embed_json = crate::common::embedding_monitor::to_json(&embed_stats);
+                use std::io::Write;
+                writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, embed_json).ok();
+                log_writer.flush().ok();
+            }
+
+            // ODE dynamics deep (#6)
+            if let Some(ref ode_dyn) = batch_ode_dynamics {
+                let ode_json = crate::common::ode_dynamics_monitor::to_json(ode_dyn);
+                if !ode_json.is_empty() {
+                    use std::io::Write;
+                    writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, ode_json).ok();
+                    log_writer.flush().ok();
+                }
+            }
+        }
+
+        // Curriculum transition (#8) — emits when transition detected (every iter tracking)
+        if let Some(ref event) = curriculum_event {
+            let cur_json = crate::common::curriculum_monitor::to_json(event);
+            use std::io::Write;
+            writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, cur_json).ok();
+            log_writer.flush().ok();
+            eprintln!("  [curriculum {}] stage {} → {} bands, loss jump {:.4}",
+                iter, event.stage, event.active_bands, event.loss_jump);
         }
 
         // Periodic checkpoint: save every 500 iters (all tiers, always untied format)
         // Uses flatten_params_ex to include ODE params + corrector plate (matches optimizer state)
         if (iter + 1) % 500 == 0 {
             let save_p = flatten_params_ex(&model, false);
+
+            // Checkpoint drift (#9) — measure before saving
+            if let Some(drift) = checkpoint_tracker.measure(&save_p) {
+                let drift_json = crate::common::checkpoint_monitor::to_json(&drift);
+                use std::io::Write;
+                writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, drift_json).ok();
+                log_writer.flush().ok();
+                eprintln!("  [drift {}] total={:.4} relative={:.6} ode={:.4}",
+                    iter, drift.total_drift, drift.relative_drift, drift.ode_drift);
+            }
+
             let path = format!("checkpoint_iter{}.bin", iter + 1);
             let groups = model.blocks[0].ffn.out_proj.n_groups();
             if config.tied {
