@@ -36,3 +36,4 @@ pub mod embedding_monitor;
 pub mod ode_dynamics_monitor;
 pub mod curriculum_monitor;
 pub mod checkpoint_monitor;
+pub mod recommend;

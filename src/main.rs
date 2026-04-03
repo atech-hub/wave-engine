@@ -97,6 +97,14 @@ fn main() {
         return;
     }
 
+    // ─── Recommend mode ───
+    if std::env::args().any(|a| a == "--recommend") {
+        let data_path = std::env::args().skip_while(|a| a != "--recommend").nth(1)
+            .expect("--recommend requires a data file path");
+        common::recommend::run_recommend(&data_path);
+        return;
+    }
+
     // Rayon thread pool — configurable via --threads (default: half available cores)
     fn parse_flag_early<T: std::str::FromStr>(name: &str, default: T) -> T {
         std::env::args().skip_while(|a| a != name).nth(1)
