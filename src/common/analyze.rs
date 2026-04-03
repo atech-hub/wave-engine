@@ -144,7 +144,7 @@ pub fn run_analyze(
     println!("  Pairs: {} related, {} random", related_pairs.len(), random_pairs.len());
 
     // Load model from checkpoint
-    let (params, ck_vocab, _ck_iter, _ck_lr, _ck_rng, _adam_t, _adam_m, _adam_v, _ck_groups) =
+    let (params, ck_vocab, _ck_iter, _ck_lr, _ck_rng, _adam_t, _adam_m, _adam_v, _ck_groups, _ck_flags) =
         wave_checkpoint::load_checkpoint(resume_path);
     let effective_vocab = vocab_size.max(ck_vocab);
     // Try extended params first (new checkpoints with ODE/corrector)

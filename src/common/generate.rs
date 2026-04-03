@@ -25,7 +25,7 @@ pub fn run_generate(config: GenerateConfig) {
     let n_embd = config.n_bands * 2;
 
     // Load checkpoint
-    let (params, ck_vocab, ck_iter, _lr, _rng, _at, _am, _av, _groups) =
+    let (params, ck_vocab, ck_iter, _lr, _rng, _at, _am, _av, _groups, ck_flags) =
         wave_checkpoint::load_checkpoint(&config.resume_path);
 
     // Tokenize prompt
@@ -53,15 +53,43 @@ pub fn run_generate(config: GenerateConfig) {
 
     let effective_vocab = vocab_size.max(ck_vocab);
 
-    // Build model with correct dims — try multiple param layouts to match checkpoint
+    // Build model with correct dims
     let dims = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
         .with_learnable_ode(false)
         .with_corrector(true);
     let mut mdl = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims, config.alpha, config.beta);
-
-    // Try checkpoint layouts in order of most features to fewest.
-    // Each combination of phase_native, layer_scale, rk4_weights produces a different param count.
     let mut loaded = false;
+
+    // v3 checkpoint: use feature flags directly — no ambiguity
+    if ck_flags > 0 {
+        let has_ode  = ck_flags & (1 << 0) != 0;
+        let has_ls   = ck_flags & (1 << 1) != 0;
+        let has_rk4  = ck_flags & (1 << 2) != 0;
+        let has_harm = ck_flags & (1 << 3) != 0;
+        let d = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(has_ode).with_learnable_ode(has_ode)
+            .with_layer_scale(has_ls).with_rk4_weights(has_rk4).with_dyn_harmonics(has_harm);
+        // Try phase-native first, then standard
+        let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, d, config.alpha, config.beta);
+        m.phase_native = true;
+        if params.len() == count_trainable_ex(&m, false) {
+            unflatten_params_ex(&mut m, &params, false);
+            let features: Vec<&str> = [has_ls.then_some("ls"), has_rk4.then_some("rk4"), has_harm.then_some("harm")]
+                .into_iter().flatten().collect();
+            let feat_str = if features.is_empty() { String::new() } else { format!(" + {}", features.join("+")) };
+            eprintln!("  Loaded {} params (phase-native{}, flags=0x{:02x}) from {}", params.len(), feat_str, ck_flags, config.resume_path);
+            mdl = m;
+            loaded = true;
+        } else {
+            let mut m2 = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, d, config.alpha, config.beta);
+            if params.len() == count_trainable_ex(&m2, false) {
+                unflatten_params_ex(&mut m2, &params, false);
+                eprintln!("  Loaded {} params (flags=0x{:02x}) from {}", params.len(), ck_flags, config.resume_path);
+                mdl = m2;
+                loaded = true;
+            }
+        }
+    }
 
     // Helper: try a specific Dims configuration
     let try_load = |d: Dims, phase_native: bool, label: &str| -> Option<WavePacketModel> {
