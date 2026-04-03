@@ -177,6 +177,7 @@ fn main() {
         match val {
             None => train::DynParam::Off,
             Some(s) if s == "dyn" || s == "dynamic" => train::DynParam::Dynamic,
+            Some(s) if s == "off" || s == "none" || s == "false" => train::DynParam::Off,
             Some(s) => {
                 let vals: Vec<f32> = s.split(',').filter_map(|v| v.parse().ok()).collect();
                 if vals.is_empty() { train::DynParam::Dynamic } else { train::DynParam::Fixed(vals) }
@@ -479,7 +480,7 @@ fn main() {
         health_interval: parse_flag("--health-interval", 0),
         freeze_ode: std::env::args().any(|a| a == "--freeze-ode"),
         head_lr_floor: parse_flag("--head-lr-floor", 0.0),
-        no_corrector: std::env::args().any(|a| a == "--no-corrector"),
+        no_corrector: false, // legacy — now controlled by --corrector flag
         layer_scale: parse_dyn_param("--layer-scale"),
         lr_scale: parse_dyn_param("--lr-scale"),
         phase_native: std::env::args().any(|a| a == "--phase-native"),
@@ -491,5 +492,14 @@ fn main() {
         wd: parse_dyn_param("--wd"),
         harmonics: parse_dyn_param("--harmonics"),
         agc_headroom: parse_dyn_param("--agc-headroom"),
+        corrector: {
+            // --corrector dyn | --corrector off | --no-corrector (legacy)
+            let c = parse_dyn_param("--corrector");
+            if matches!(c, train::DynParam::Off) && !std::env::args().any(|a| a == "--no-corrector") {
+                train::DynParam::Dynamic // default: corrector ON (learnable)
+            } else {
+                c
+            }
+        },
     });
 }

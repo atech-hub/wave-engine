@@ -80,8 +80,9 @@ pub fn print_help() {
     println!("                        checkpoint drift, throughput. All in JSONL.");
     println!("    --freeze-ode        Freeze ODE params (identity backward — legacy behaviour)");
     println!("                        Default: ODE α/β/γ are learnable per layer");
-    println!("    --no-corrector      Disable corrector plate (A/B testing)");
-    println!("                        Default: per-band phase correction after ODE (Schmidt corrector)");
+    println!("    --corrector dyn      Per-band phase correction after ODE (default, spring k=0.01)");
+    println!("    --corrector off      Disable corrector plate (A/B testing)");
+    println!("    --no-corrector       Legacy alias for --corrector off");
     println!("    --phase-native      Train ODE to output in embedding space (no lm_head)");
     println!("                        Dot product loss against frozen embeddings. 7/10 at 40K.");
     println!();
@@ -100,6 +101,9 @@ pub fn print_help() {
     println!("    --agc-headroom dyn  Per-layer AGC headroom (sigma). Spring eq=3.0, k=1.0.");
     println!("                        Low headroom = tight compression (L0). High = loose (L3).");
     println!("    --agc-headroom V,V  Fixed per-layer headroom (e.g. 2.0,3.0,3.0,4.0).");
+    println!("    --corrector dyn     Per-band phase correction after ODE. Spring eq=0.0, k=0.01.");
+    println!("                        Very loose spring — corrections earned easily.");
+    println!("    --corrector off     Disable corrector plate entirely.");
     println!("    --lr-scale dyn      Per-group LR scaling. Spring eq=1.0, k=0.5.");
     println!("    --lr-scale V,V,V    Fixed per-group LR (per layer + head, comma-separated).");
     println!("    --spring F          Global spring constant for all dynamic params [default: 0.1]");
