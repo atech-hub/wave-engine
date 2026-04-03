@@ -37,17 +37,19 @@ pub fn sample(
     beta: f32,
 ) -> Option<HealthSample> {
     // Tokenize fixed reference
-    let token_ids = if use_bpe {
+    let vocab_size = model.vocab_size;
+    let token_ids: Vec<usize> = if use_bpe {
         let bpe = crate::bpe::BpeTokenizer::from_file(tokenizer_path);
-        bpe.encode(REF_TEXT)
+        bpe.encode(REF_TEXT).into_iter().filter(|&id| id < vocab_size).collect()
     } else {
-        // Char-level fallback
+        // Char-level fallback — build vocab from REF_TEXT but clamp to model vocab
         let chars: Vec<char> = REF_TEXT.chars().collect();
         let mut vocab: Vec<char> = chars.clone();
         vocab.sort(); vocab.dedup();
         let c2i: std::collections::HashMap<char, usize> = vocab.iter()
             .enumerate().map(|(i, &c)| (c, i)).collect();
-        chars.iter().filter_map(|c| c2i.get(c).copied()).collect()
+        chars.iter().filter_map(|c| c2i.get(c).copied())
+            .filter(|&id| id < vocab_size).collect()
     };
 
     if token_ids.len() < 4 { return None; }
