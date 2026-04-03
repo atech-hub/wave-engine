@@ -131,8 +131,26 @@ pub fn forward_with_cache(
         .collect();
 
     let logits: Vec<Vec<f32>> = if model.phase_native {
-        // Phase-native: no lm_head computation. Logits are empty — decode via phase coherence.
-        vec![vec![]; post_ln_f.len()]
+        // Phase-native: dot product against embeddings (replaces lm_head)
+        let n_bands = d.n_bands;
+        post_ln_f.par_iter().map(|hidden| {
+            // Apply output corrector: per-band phase rotation
+            let mut corrected = vec![0.0f32; n_bands * 2];
+            for k in 0..n_bands {
+                let (sin_c, cos_c) = model.output_corrector[k].sin_cos();
+                let r = hidden[k * 2];
+                let s = hidden[k * 2 + 1];
+                corrected[k * 2]     = r * cos_c - s * sin_c;
+                corrected[k * 2 + 1] = r * sin_c + s * cos_c;
+            }
+            // Dot product against frozen embeddings
+            (0..model.vocab_size).map(|v| {
+                let emb = &model.wte[v];
+                let mut score = 0.0f32;
+                for j in 0..(n_bands * 2) { score += corrected[j] * emb[j]; }
+                score
+            }).collect()
+        }).collect()
     } else if let Some(ref wds) = model.wd_state {
         crate::common::wave_decode::forward(&post_ln_f, wds)
     } else if model.lm_rank > 0 {

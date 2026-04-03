@@ -13,6 +13,25 @@ use crate::common::dims::Dims;
 
 const N_BUCKETS: usize = 8;
 
+/// Phase-native decode: output corrector + dot product against embeddings.
+/// Replaces lm_head when model.phase_native is true.
+fn phase_native_decode(hidden: &[f32], model: &WavePacketModel, n_bands: usize) -> Vec<f32> {
+    let mut corrected = vec![0.0f32; n_bands * 2];
+    for k in 0..n_bands {
+        let (sin_c, cos_c) = model.output_corrector[k].sin_cos();
+        let r = hidden[k * 2];
+        let s = hidden[k * 2 + 1];
+        corrected[k * 2]     = r * cos_c - s * sin_c;
+        corrected[k * 2 + 1] = r * sin_c + s * cos_c;
+    }
+    (0..model.vocab_size).map(|v| {
+        let emb = &model.wte[v];
+        let mut score = 0.0f32;
+        for j in 0..(n_bands * 2) { score += corrected[j] * emb[j]; }
+        score
+    }).collect()
+}
+
 /// Per-head cached attention state.
 struct HeadCache {
     phases: Vec<f32>,
@@ -193,15 +212,19 @@ pub fn prefill(
 
     cache.n_cached = t;
 
-    // Final LN + lm_head for last position
+    // Final LN + decode for last position
     let final_normed = layer_norm(&hidden[t - 1], &model.ln_f.weight, &model.ln_f.bias);
-    let mut logits = vec![0.0f32; model.vocab_size];
-    for v in 0..model.vocab_size {
-        let mut sum = 0.0f32;
-        for j in 0..n_embd { sum += model.lm_head[v][j] * final_normed[j]; }
-        logits[v] = sum;
+    if model.phase_native {
+        phase_native_decode(&final_normed, model, dims.n_bands)
+    } else {
+        let mut logits = vec![0.0f32; model.vocab_size];
+        for v in 0..model.vocab_size {
+            let mut sum = 0.0f32;
+            for j in 0..n_embd { sum += model.lm_head[v][j] * final_normed[j]; }
+            logits[v] = sum;
+        }
+        logits
     }
-    logits
 }
 
 /// Forward one token using cached state. O(T) per layer instead of O(T²).
@@ -316,13 +339,17 @@ pub fn forward_one(
 
     cache.n_cached += 1;
 
-    // Final LN + lm_head
+    // Final LN + decode
     let final_normed = layer_norm(&hidden, &model.ln_f.weight, &model.ln_f.bias);
-    let mut logits = vec![0.0f32; model.vocab_size];
-    for v in 0..model.vocab_size {
-        let mut sum = 0.0f32;
-        for j in 0..n_embd { sum += model.lm_head[v][j] * final_normed[j]; }
-        logits[v] = sum;
+    if model.phase_native {
+        phase_native_decode(&final_normed, model, dims.n_bands)
+    } else {
+        let mut logits = vec![0.0f32; model.vocab_size];
+        for v in 0..model.vocab_size {
+            let mut sum = 0.0f32;
+            for j in 0..n_embd { sum += model.lm_head[v][j] * final_normed[j]; }
+            logits[v] = sum;
+        }
+        logits
     }
-    logits
 }
