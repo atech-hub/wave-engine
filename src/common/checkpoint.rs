@@ -116,13 +116,23 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let n_phase = n_ext - lm_head_params + ck_bands; // with 84-param output corrector
     let n_phase_no_oc = n_ext - lm_head_params; // without output corrector
     let n_phase_ls = n_ext_ls - lm_head_params + ck_bands;
+    // RK4 weights variants: +4 per layer for learnable [w0,w1,w2,w3]
+    let rk4_extra = ck_layers * 4;
+    let n_ext_rk4 = n_ext + rk4_extra;
+    let n_ext_ls_rk4 = n_ext_ls + rk4_extra;
+    let n_phase_rk4 = n_phase + rk4_extra;
+    let n_phase_ls_rk4 = n_phase_ls + rk4_extra;
 
     // Determine actual param count from file size
     let file_len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
     let header_size = 4 + 4 + 7*4 + 8 + 8 + 4 + 8 + 8; // magic + version + config + metadata + adam_t
     // file = header + adam_m(n*4) + adam_v(n*4) + params(n*4) = header + n*12
     let data_bytes = file_len.saturating_sub(header_size);
-    let n_params = if data_bytes == n_ext_ls * 12 { n_ext_ls }
+    let n_params = if data_bytes == n_phase_ls_rk4 * 12 { n_phase_ls_rk4 }
+                   else if data_bytes == n_ext_ls_rk4 * 12 { n_ext_ls_rk4 }
+                   else if data_bytes == n_phase_rk4 * 12 { n_phase_rk4 }
+                   else if data_bytes == n_ext_rk4 * 12 { n_ext_rk4 }
+                   else if data_bytes == n_ext_ls * 12 { n_ext_ls }
                    else if data_bytes == n_phase_ls * 12 { n_phase_ls }
                    else if data_bytes == n_phase * 12 { n_phase }
                    else if data_bytes == n_ext * 12 { n_ext }

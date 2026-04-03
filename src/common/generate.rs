@@ -59,33 +59,68 @@ pub fn run_generate(config: GenerateConfig) {
         .with_corrector(true);
     let mut mdl = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims, config.alpha, config.beta);
 
-    // Try phase-native + layer_scale, phase-native, ext+layer_scale, ext, base
+    // Try checkpoint layouts in order of most features to fewest.
+    // Each combination of phase_native, layer_scale, rk4_weights produces a different param count.
     let mut loaded = false;
 
-    // Phase-native + layer_scale
-    if !loaded {
-        let d = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(true).with_layer_scale(true).with_learnable_ode(true);
+    // Helper: try a specific Dims configuration
+    let try_load = |d: Dims, phase_native: bool, label: &str| -> Option<WavePacketModel> {
         let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, d, config.alpha, config.beta);
-        m.phase_native = true;
+        m.phase_native = phase_native;
         if params.len() == count_trainable_ex(&m, false) {
             unflatten_params_ex(&mut m, &params, false);
-            mdl = m;
-            eprintln!("  Loaded {} params (phase-native + layer_scale) from {}", params.len(), config.resume_path);
-            loaded = true;
+            eprintln!("  Loaded {} params ({}) from {}", params.len(), label, config.resume_path);
+            Some(m)
+        } else {
+            None
+        }
+    };
+
+    // Phase-native variants (most features first)
+    let pn_variants: Vec<(Dims, &str)> = vec![
+        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true).with_layer_scale(true).with_rk4_weights(true).with_learnable_ode(true),
+         "phase-native + layer_scale + rk4_weights"),
+        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true).with_rk4_weights(true).with_learnable_ode(true),
+         "phase-native + rk4_weights"),
+        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true).with_layer_scale(true).with_learnable_ode(true),
+         "phase-native + layer_scale"),
+        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true).with_learnable_ode(true),
+         "phase-native"),
+    ];
+    for (d, label) in &pn_variants {
+        if !loaded {
+            if let Some(m) = try_load(*d, true, label) {
+                mdl = m;
+                loaded = true;
+            }
         }
     }
-    // Phase-native (no layer_scale)
-    if !loaded {
-        let d = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(true).with_learnable_ode(true);
-        let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, d, config.alpha, config.beta);
-        m.phase_native = true;
-        if params.len() == count_trainable_ex(&m, false) {
-            unflatten_params_ex(&mut m, &params, false);
-            mdl = m;
-            eprintln!("  Loaded {} params (phase-native) from {}", params.len(), config.resume_path);
-            loaded = true;
+
+    // Non-phase-native variants
+    let std_variants: Vec<(Dims, &str)> = vec![
+        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true).with_layer_scale(true).with_rk4_weights(true),
+         "ext + layer_scale + rk4_weights"),
+        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true).with_rk4_weights(true),
+         "ext + rk4_weights"),
+        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true).with_layer_scale(true),
+         "ext + layer_scale"),
+        (Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true),
+         "ext"),
+    ];
+    for (d, label) in &std_variants {
+        if !loaded {
+            if let Some(m) = try_load(*d, false, label) {
+                mdl = m;
+                loaded = true;
+            }
         }
     }
     // Ext + layer_scale
