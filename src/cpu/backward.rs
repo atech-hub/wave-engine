@@ -156,10 +156,15 @@ pub fn softplus_backward(d_y: f32, x: f32) -> f32 {
 
 pub use crate::common::math::cross_entropy_backward;
 
-// ─── Kerr-ODE backward ─────────────────────────────────────────
+// ─── Kerr-ODE backward (legacy — used by wgpu CpuBackend fallback) ─────
 
-/// Saved state from one derivative evaluation (needed for backward).
-pub struct DerivativeCache {
+// NOTE: The primary ODE backward is in common/ode_backward.rs (validated with
+// finite differences). This legacy version is kept for the wgpu CpuBackend
+// fallback path which calls kerr_ode_backward with (d_output, input, weights)
+// instead of (d_output, cache, weights). Should migrate to common version.
+
+/// Saved state from one derivative evaluation.
+struct DerivativeCache {
     r: Vec<f32>,
     s: Vec<f32>,
     mag_sq: Vec<f32>,
@@ -168,7 +173,7 @@ pub struct DerivativeCache {
 }
 
 /// Forward derivative with cache for backward.
-pub fn kerr_derivative_with_cache_pub(
+fn kerr_derivative_with_cache_pub(
     r: &[f32], s: &[f32],
     gamma: &[f32], omega: &[f32],
     alpha: f32, beta: f32,
@@ -206,7 +211,7 @@ pub fn kerr_derivative_with_cache_pub(
 /// Given d_loss/d_dr and d_loss/d_ds, compute:
 /// - d_loss/d_r, d_loss/d_s (input gradients)
 /// - d_loss/d_gamma, d_loss/d_omega, d_loss/d_alpha, d_loss/d_beta (param gradients)
-pub fn kerr_derivative_backward_pub(
+fn kerr_derivative_backward_pub(
     d_dr: &[f32], d_ds: &[f32],
     cache: &DerivativeCache,
     gamma: &[f32],
@@ -279,7 +284,7 @@ pub fn kerr_derivative_backward_pub(
 ///          where k1 = f(r,s), k2 = f(r+dt/2*k1_r, s+dt/2*k1_s), etc.
 ///
 /// Returns: (d_r, d_s) input gradients + accumulated parameter gradients.
-pub fn rk4_step_backward(
+fn rk4_step_backward(
     d_r_new: &[f32], d_s_new: &[f32],
     // Forward caches (saved during forward pass)
     r: &[f32], s: &[f32],
@@ -502,40 +507,5 @@ pub fn attention_backward_single(
 
 // ─── Maestro backward ───────────────────────────────────────────
 
-/// Backward through Maestro: squeeze -> GELU -> process
-pub fn maestro_backward(
-    d_output: &[f32],
-    input: &[f32],
-    weights: &MaestroWeights,
-) -> (Vec<f32>, LinearGrads, LinearGrads) {
-    // Forward recompute
-    let squeezed = crate::model::linear_fn(&weights.squeeze.w, &weights.squeeze.b, input);
-    let activated: Vec<f32> = squeezed.iter().map(|&v| {
-        let sqrt_2_pi = (2.0f32 / PI).sqrt();
-        0.5 * v * (1.0 + (sqrt_2_pi * (v + 0.044715 * v * v * v)).tanh())
-    }).collect();
-
-    // Backward through process linear
-    let (d_activated, d_process_w, d_process_b) =
-        linear_backward(d_output, &activated, &weights.process_1.w);
-
-    // Backward through GELU
-    let d_squeezed = gelu_backward(&d_activated, &squeezed);
-
-    // Backward through squeeze linear
-    let (d_input, d_squeeze_w, d_squeeze_b) =
-        linear_backward(&d_squeezed, input, &weights.squeeze.w);
-
-    (
-        d_input,
-        LinearGrads { d_w: d_squeeze_w, d_b: d_squeeze_b },
-        LinearGrads { d_w: d_process_w, d_b: d_process_b },
-    )
-}
-
-/// Gradient storage for a Linear layer.
-pub struct LinearGrads {
-    pub d_w: Vec<Vec<f32>>,
-    pub d_b: Vec<f32>,
-}
+// maestro_backward and LinearGrads removed — dead code (unused after ffn_backward_via_backend)
 
