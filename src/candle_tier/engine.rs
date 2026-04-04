@@ -283,6 +283,7 @@ pub mod engine {
         lm_head: Tensor,
         output_corrector: Option<Tensor>,  // [1, n_bands] phase-native output corrector
         phase_native: bool,
+        layer_agcs: Option<Vec<crate::common::agc::OdeAgc>>,  // per-layer AGC (when --agc-headroom dyn)
 
         device: Device,
 
@@ -459,11 +460,11 @@ pub mod engine {
             };
 
             Ok(Self { wte, wpe, blocks, ln_f_w, ln_f_b, lm_head, output_corrector, phase_native,
-                device: device.clone(),
+                layer_agcs: None, device: device.clone(),
                 n_bands: n_bands_cfg, n_embd: n_embd_cfg, n_head: n_head_cfg, block_size: block_size_cfg, debug_nan: false })
         }
 
-        pub fn forward(&self, token_ids: &[usize]) -> Result<Tensor> {
+        pub fn forward(&mut self, token_ids: &[usize]) -> Result<Tensor> {
             self.forward_with_curriculum(token_ids, &vec![1.0f32; self.n_bands])
         }
 
@@ -471,7 +472,7 @@ pub mod engine {
         /// `band_masks[k]` is the mask value for band k (0.01 for suppressed, 1.0 for active,
         /// intermediate values during ramp transitions).
         /// Attention sees full vector (frozen). FFN sees masked vector (trains on active bands).
-        pub fn forward_with_curriculum(&self, token_ids: &[usize], band_masks: &[f32]) -> Result<Tensor> {
+        pub fn forward_with_curriculum(&mut self, token_ids: &[usize], band_masks: &[f32]) -> Result<Tensor> {
             let n_bands = self.n_bands;
             let n_embd = self.n_embd;
             let n_head = self.n_head;
@@ -532,13 +533,16 @@ pub mod engine {
                 let mae_in = block.mae_in_pr.forward(&mae_in)?;
                 let precond = (&ffn_input + &mae_in)?;
 
-                // AGC knee compression — CPU round-trip (~0.1ms, negligible vs ODE)
+                // AGC knee compression — per-layer or global
                 let precond = {
                     let mut pv: Vec<Vec<f32>> = precond.to_vec2()?;
                     let nb = pv[0].len() / 2;
-                    let mut agc = crate::ffn_backend::AGC.get().unwrap().lock().unwrap();
-                    agc.process(&mut pv, nb);
-                    drop(agc);
+                    if let Some(ref mut agcs) = self.layer_agcs {
+                        agcs[block_idx].process(&mut pv, nb);
+                    } else {
+                        let mut agc = crate::ffn_backend::AGC.get().unwrap().lock().unwrap();
+                        agc.process(&mut pv, nb);
+                    }
                     candle_core::Tensor::new(pv, precond.device())?
                 };
 
@@ -699,6 +703,8 @@ pub mod engine {
             std::env::args().skip_while(|a| a != "--layer-scale").nth(1).map_or(false, |s| s == "dyn");
         let use_wd_dyn = std::env::args().any(|a| a == "--wd") &&
             std::env::args().skip_while(|a| a != "--wd").nth(1).map_or(false, |s| s == "dyn");
+        let use_agc_headroom_dyn = std::env::args().any(|a| a == "--agc-headroom") &&
+            std::env::args().skip_while(|a| a != "--agc-headroom").nth(1).map_or(false, |s| s == "dyn");
 
         // Model
         let mut varmap = VarMap::new();
@@ -784,6 +790,7 @@ pub mod engine {
             if use_harmonics_dyn { dyn_flags.push("harmonics"); }
             if use_wd_dyn { dyn_flags.push("wd"); }
             if use_layer_scale_dyn { dyn_flags.push("layer-scale"); }
+            if use_agc_headroom_dyn { dyn_flags.push("agc-headroom"); }
             if !dyn_flags.is_empty() {
                 println!("  Dynamic params: {} (spring k={:.2})", dyn_flags.join(", "), spring_k);
             }
@@ -798,6 +805,13 @@ pub mod engine {
         )?;
         // Per-group WD scale: [n_layers + 1] (layers + lm_head), init at 1.0 (uniform)
         let mut wd_scale: Vec<f32> = vec![1.0; n_layers + 1];
+        // Per-layer AGC headroom: init at 3.0 (3-sigma default)
+        let mut agc_headroom: Vec<f32> = vec![3.0; n_layers];
+        // Per-layer AGC instances when --agc-headroom dyn (stored on model)
+        if use_agc_headroom_dyn {
+            let ceiling = (std::f32::consts::FRAC_PI_2 / (alpha + 4.0 * beta)).sqrt().max(0.5);
+            model.layer_agcs = Some((0..n_layers).map(|_| crate::common::agc::OdeAgc::with_ceiling_headroom(ceiling, 3.0)).collect());
+        }
         let mut rng = crate::rng::Rng::new(1337);
 
         // Curriculum: soft-mask inactive bands (0.01 scale, not zero)
@@ -1025,6 +1039,22 @@ pub mod engine {
                     for s in &mut wd_scale {
                         *s -= (k_wd as f32) * (*s - 1.0);
                         *s = s.clamp(0.01, 10.0);
+                    }
+                }
+
+                // AGC headroom spring: eq=3.0, k=1.0 (stiff — safety motivated)
+                if use_agc_headroom_dyn {
+                    let k_agc = clr * spring_k * 1.0;
+                    for hr in &mut agc_headroom {
+                        *hr -= (k_agc as f32) * (*hr - 3.0);
+                        *hr = hr.clamp(1.0, 6.0);
+                    }
+                    // Update per-layer AGC instances with new headroom
+                    if let Some(ref mut agcs) = model.layer_agcs {
+                        let ceiling = (std::f32::consts::FRAC_PI_2 / (alpha + 4.0 * beta)).sqrt().max(0.5);
+                        for (i, agc) in agcs.iter_mut().enumerate() {
+                            *agc = crate::common::agc::OdeAgc::with_ceiling_headroom(ceiling, agc_headroom[i]);
+                        }
                     }
                 }
 
