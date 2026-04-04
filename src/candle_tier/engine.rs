@@ -393,19 +393,17 @@ pub mod engine {
                     n_embd, out_proj_groups, vs_block.pp("out_proj"),  // configurable groups
                 )?;
 
-                // ODE params (frozen)
+                // ODE params (learnable via VarMap — autograd computes gradients)
                 let gamma_raw_val = ((0.1f32).exp() - 1.0).ln();
                 let ode_params = OdeParams {
                     gamma_raw: vec![gamma_raw_val; n_bands],
                     omega: (0..n_bands).map(|k| (k + 1) as f32 / n_bands as f32).collect(),
-                    // Coupling from CLI --alpha/--beta flags
                     alpha,
                     beta,
                     rk4_n_steps: rk4_steps,
                 };
-                let gpu_ode_params = crate::gpu_ode::gpu_ode::GpuOdeParams::new(
-                    &ode_params.gamma_raw, &ode_params.omega,
-                    ode_params.alpha, ode_params.beta, rk4_steps, device,
+                let gpu_ode_params = crate::gpu_ode::gpu_ode::GpuOdeParams::learnable(
+                    n_bands, alpha, beta, rk4_steps, vs_block.pp("ode"),
                 )?;
 
                 // Cache frozen attention weights on CPU — eliminates 48 GPU→CPU transfers per layer per forward
