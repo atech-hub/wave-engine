@@ -1,25 +1,25 @@
-//! GPU-native perturbative ODE — zero CPU transfers.
+//! GPU-native Kerr-ODE via Candle tensor ops — RK4-N integration.
 //!
-//! Replaces the CustomOp1 RK4 ODE that moves data GPU→CPU→GPU 96 times per iteration.
-//! All operations are Candle tensor ops running natively on GPU via cuBLAS/CUDA.
-//! Autograd computes the TRUE gradient (not identity backward), giving maestro layers
-//! actual gradient signal about what the ODE transform does.
+//! Full RK4 integration matching CPU/wgpu tiers. All operations are
+//! Candle tensor ops → GPU-native, autograd-compatible. Gradient flows
+//! through the actual computation (not identity backward).
 //!
-//! Lab-validated: MSE 0.000005 vs RK4-16, trains better (2.97 vs 3.07).
+//! Replaces the perturbative single-step approximation with proper
+//! multi-step RK4 integration for accuracy parity with CPU/wgpu.
 
 #[cfg(feature = "candle-backend")]
 pub mod gpu_ode {
-    use candle_core::{Tensor, DType, Device, Result, D};
+    use candle_core::{Tensor, DType, Device, Result};
 
     /// Precomputed ODE parameters as GPU-resident tensors.
     /// Created once at model init, reused every forward pass.
     pub struct GpuOdeParams {
-        pub decay: Tensor,    // [1, n_bands] — exp(-softplus(gamma_raw))
-        pub cos_w: Tensor,    // [1, n_bands] — cos(omega)
-        pub sin_w: Tensor,    // [1, n_bands] — sin(omega)
-        pub alpha: f64,
-        pub beta: f64,
+        pub gamma: Tensor,    // [1, n_bands] — softplus(gamma_raw), damping coefficient
+        pub omega: Tensor,    // [1, n_bands] — natural frequency per band
+        pub alpha: Tensor,    // scalar as [1, 1] — self-coupling
+        pub beta: Tensor,     // scalar as [1, 1] — cross-coupling
         pub n_bands: usize,
+        pub rk4_steps: usize,
     }
 
     impl GpuOdeParams {
@@ -29,91 +29,123 @@ pub mod gpu_ode {
             omega: &[f32],
             alpha: f32,
             beta: f32,
+            rk4_steps: usize,
             device: &Device,
         ) -> Result<Self> {
             let n_bands = gamma_raw.len();
             fn softplus(v: f32) -> f32 { if v > 20.0 { v } else { (1.0 + v.exp()).ln() } }
 
-            let decay_vals: Vec<f32> = gamma_raw.iter()
-                .map(|&g| (-softplus(g)).exp()).collect();
-            let cos_vals: Vec<f32> = omega.iter().map(|&w| w.cos()).collect();
-            let sin_vals: Vec<f32> = omega.iter().map(|&w| w.sin()).collect();
+            let gamma_vals: Vec<f32> = gamma_raw.iter().map(|&g| softplus(g)).collect();
+            let omega_vals: Vec<f32> = omega.to_vec();
 
             Ok(Self {
-                decay: Tensor::from_vec(decay_vals, (1, n_bands), device)?,
-                cos_w: Tensor::from_vec(cos_vals, (1, n_bands), device)?,
-                sin_w: Tensor::from_vec(sin_vals, (1, n_bands), device)?,
-                alpha: alpha as f64,
-                beta: beta as f64,
+                gamma: Tensor::from_vec(gamma_vals, (1, n_bands), device)?,
+                omega: Tensor::from_vec(omega_vals, (1, n_bands), device)?,
+                alpha: Tensor::from_vec(vec![alpha], (1, 1), device)?,
+                beta: Tensor::from_vec(vec![beta], (1, 1), device)?,
                 n_bands,
+                rk4_steps,
             })
+        }
+
+        /// Update from learned coupling values (called after optimizer step).
+        pub fn update_coupling(&mut self, alpha: f32, beta: f32, gamma_raw: &[f32]) -> Result<()> {
+            fn softplus(v: f32) -> f32 { if v > 20.0 { v } else { (1.0 + v.exp()).ln() } }
+            let device = self.gamma.device().clone();
+            let n_bands = self.n_bands;
+            let gamma_vals: Vec<f32> = gamma_raw.iter().map(|&g| softplus(g)).collect();
+            self.gamma = Tensor::from_vec(gamma_vals, (1, n_bands), &device)?;
+            self.alpha = Tensor::from_vec(vec![alpha], (1, 1), &device)?;
+            self.beta = Tensor::from_vec(vec![beta], (1, 1), &device)?;
+            Ok(())
         }
     }
 
-    /// GPU-native perturbative ODE forward pass.
+    /// Compute the Kerr-ODE derivative for all bands.
+    ///
+    /// dr[k] = -gamma[k] * r[k] - phi[k] * s[k]
+    /// ds[k] = -gamma[k] * s[k] + phi[k] * r[k]
+    /// where phi[k] = omega[k] + alpha * (r[k]² + s[k]²) + beta * neighbour_sum
+    ///
+    /// All operations are batched across positions: r, s are [n_pos, n_bands].
+    fn kerr_derivative(
+        r: &Tensor, s: &Tensor,
+        params: &GpuOdeParams,
+    ) -> Result<(Tensor, Tensor)> {
+        let (n_pos, n_bands) = r.dims2()?;
+
+        // mag_sq = r² + s²
+        let mag_sq = (r * r)?.add(&(s * s)?)?;
+
+        // Neighbour sum via pad + narrow (GPU-friendly, no loops)
+        let zeros = Tensor::zeros((n_pos, 2), DType::F32, r.device())?;
+        let padded = Tensor::cat(&[&zeros, &mag_sq, &zeros], 1)?;
+        let ns_m2 = padded.narrow(1, 0, n_bands)?;
+        let ns_m1 = padded.narrow(1, 1, n_bands)?;
+        let ns_p1 = padded.narrow(1, 3, n_bands)?;
+        let ns_p2 = padded.narrow(1, 4, n_bands)?;
+        let neighbour_sum = ((ns_m2 + ns_m1)? + (ns_p1 + ns_p2)?)?;
+
+        // phi = omega + alpha * mag_sq + beta * neighbour_sum
+        let phi = (mag_sq.broadcast_mul(&params.alpha)? + neighbour_sum.broadcast_mul(&params.beta)?)?
+            .broadcast_add(&params.omega)?;
+
+        // dr = -gamma * r - phi * s
+        // ds = -gamma * s + phi * r
+        let dr = (r.broadcast_mul(&params.gamma)?.neg()? - (&phi * s)?)?;
+        let ds = (s.broadcast_mul(&params.gamma)?.neg()? + (&phi * r)?)?;
+
+        Ok((dr, ds))
+    }
+
+    /// GPU-native RK4 ODE forward pass.
     ///
     /// Input: x of shape [n_pos, n_embd] (interleaved r,s pairs)
     /// Output: transformed x of same shape
     ///
     /// All operations are Candle tensor ops → GPU-native, autograd-compatible.
-    /// Gradient flows through the actual computation, not identity backward.
+    /// Matches CPU/wgpu RK4-N integration exactly.
     pub fn kerr_ode_gpu(x: &Tensor, params: &GpuOdeParams) -> Result<Tensor> {
         let (n_pos, n_embd) = x.dims2()?;
         let n_bands = params.n_bands;
+        let n_steps = params.rk4_steps;
+        let dt = 1.0 / n_steps as f64;
 
         // Split interleaved [r0,s0,r1,s1,...] into separate r and s
-        // Reshape to [n_pos, n_bands, 2], then narrow
         let x_reshaped = x.reshape((n_pos, n_bands, 2))?;
-        let r = x_reshaped.narrow(2, 0, 1)?.squeeze(2)?;  // [n_pos, n_bands]
-        let s = x_reshaped.narrow(2, 1, 1)?.squeeze(2)?;  // [n_pos, n_bands]
+        let mut r = x_reshaped.narrow(2, 0, 1)?.squeeze(2)?;  // [n_pos, n_bands]
+        let mut s = x_reshaped.narrow(2, 1, 1)?.squeeze(2)?;  // [n_pos, n_bands]
 
-        // Step 1: Linear solution — damping + base rotation
-        // r_lin = decay * (r*cos_w - s*sin_w)
-        // s_lin = decay * (r*sin_w + s*cos_w)
-        let r_cos = r.broadcast_mul(&params.cos_w)?;
-        let s_sin = s.broadcast_mul(&params.sin_w)?;
-        let r_sin = r.broadcast_mul(&params.sin_w)?;
-        let s_cos = s.broadcast_mul(&params.cos_w)?;
+        // RK4 integration loop
+        for _ in 0..n_steps {
+            // k1 at (r, s)
+            let (k1r, k1s) = kerr_derivative(&r, &s, params)?;
 
-        let r_lin = (r_cos - s_sin)?.broadcast_mul(&params.decay)?;
-        let s_lin = (r_sin + s_cos)?.broadcast_mul(&params.decay)?;
+            // k2 at (r + 0.5*dt*k1, s + 0.5*dt*k1)
+            let r2 = (&r + (&k1r * (0.5 * dt))?)?;
+            let s2 = (&s + (&k1s * (0.5 * dt))?)?;
+            let (k2r, k2s) = kerr_derivative(&r2, &s2, params)?;
 
-        // Step 2: Self-phase modulation — mag_sq = r_lin² + s_lin²
-        let r_lin_sq = (&r_lin * &r_lin)?;
-        let s_lin_sq = (&s_lin * &s_lin)?;
-        let mag_sq = (&r_lin_sq + &s_lin_sq)?;
+            // k3 at (r + 0.5*dt*k2, s + 0.5*dt*k2)
+            let r3 = (&r + (&k2r * (0.5 * dt))?)?;
+            let s3 = (&s + (&k2s * (0.5 * dt))?)?;
+            let (k3r, k3s) = kerr_derivative(&r3, &s3, params)?;
 
-        // Step 3: Cross-phase modulation — neighbour sum via padding + narrow
-        // Pad mag_sq with 2 zeros on each side: [n_pos, n_bands+4]
-        let zeros = Tensor::zeros((n_pos, 2), DType::F32, x.device())?;
-        let padded = Tensor::cat(&[&zeros, &mag_sq, &zeros], 1)?;
+            // k4 at (r + dt*k3, s + dt*k3)
+            let r4 = (&r + (&k3r * dt)?)?;
+            let s4 = (&s + (&k3s * dt)?)?;
+            let (k4r, k4s) = kerr_derivative(&r4, &s4, params)?;
 
-        // Extract shifted views (all [n_pos, n_bands])
-        let ns_m2 = padded.narrow(1, 0, n_bands)?;       // k-2
-        let ns_m1 = padded.narrow(1, 1, n_bands)?;       // k-1
-        let ns_p1 = padded.narrow(1, 3, n_bands)?;       // k+1
-        let ns_p2 = padded.narrow(1, 4, n_bands)?;       // k+2
-        let ns_left = (ns_m2 + ns_m1)?;
-        let ns_right = (ns_p1 + ns_p2)?;
-        let neighbour_sum = (ns_left + ns_right)?;
+            // Combine: r_new = r + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+            let dt6 = dt / 6.0;
+            r = (&r + ((&k1r + (&k2r * 2.0)? + (&k3r * 2.0)? + &k4r)? * dt6)?)?;
+            s = (&s + ((&k1s + (&k2s * 2.0)? + (&k3s * 2.0)? + &k4s)? * dt6)?)?;
+        }
 
-        // Step 4: Phase correction — delta_phi = alpha * mag_sq + beta * neighbours
-        let spm = (mag_sq * params.alpha)?;
-        let xpm = (neighbour_sum * params.beta)?;
-        let delta_phi = (spm + xpm)?;
-
-        // Step 5: Apply perturbative correction
-        // r_out = r_lin - delta_phi * s_lin
-        // s_out = s_lin + delta_phi * r_lin
-        let dp_s = (&delta_phi * &s_lin)?;
-        let dp_r = (&delta_phi * &r_lin)?;
-        let r_out = (&r_lin - &dp_s)?;
-        let s_out = (&s_lin + &dp_r)?;
-
-        // Step 6: Interleave back to [n_pos, n_embd]
-        let r_expanded = r_out.unsqueeze(2)?;  // [n_pos, n_bands, 1]
-        let s_expanded = s_out.unsqueeze(2)?;  // [n_pos, n_bands, 1]
-        let interleaved = Tensor::cat(&[&r_expanded, &s_expanded], 2)?;  // [n_pos, n_bands, 2]
+        // Interleave back to [n_pos, n_embd]
+        let r_expanded = r.unsqueeze(2)?;  // [n_pos, n_bands, 1]
+        let s_expanded = s.unsqueeze(2)?;  // [n_pos, n_bands, 1]
+        let interleaved = Tensor::cat(&[&r_expanded, &s_expanded], 2)?;
         interleaved.reshape((n_pos, n_embd))
     }
 }

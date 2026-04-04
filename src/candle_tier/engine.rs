@@ -405,7 +405,7 @@ pub mod engine {
                 };
                 let gpu_ode_params = crate::gpu_ode::gpu_ode::GpuOdeParams::new(
                     &ode_params.gamma_raw, &ode_params.omega,
-                    ode_params.alpha, ode_params.beta, device,
+                    ode_params.alpha, ode_params.beta, rk4_steps, device,
                 )?;
 
                 // Cache frozen attention weights on CPU — eliminates 48 GPU→CPU transfers per layer per forward
