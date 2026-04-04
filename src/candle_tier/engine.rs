@@ -692,11 +692,13 @@ pub mod engine {
         let train_data = &tokens[..split];
         println!("  Train tokens: {}", train_data.len());
 
-        // Parse dynamic param flags early (needed for model construction)
+        // Parse dynamic param flags early (needed for model construction + optimizer config)
         let use_rk4_dyn = std::env::args().any(|a| a == "--rk4-weights") &&
             std::env::args().skip_while(|a| a != "--rk4-weights").nth(1).map_or(false, |s| s == "dyn");
         let use_layer_scale_dyn = std::env::args().any(|a| a == "--layer-scale") &&
             std::env::args().skip_while(|a| a != "--layer-scale").nth(1).map_or(false, |s| s == "dyn");
+        let use_wd_dyn = std::env::args().any(|a| a == "--wd") &&
+            std::env::args().skip_while(|a| a != "--wd").nth(1).map_or(false, |s| s == "dyn");
 
         // Model
         let mut varmap = VarMap::new();
@@ -787,12 +789,15 @@ pub mod engine {
             }
         }
 
-        // Optimizer
+        // Optimizer — when WD is dynamic, disable built-in WD (we apply per-group manually)
         use candle_nn::Optimizer;
+        let wd_builtin = if use_wd_dyn { 0.0 } else { 0.01 };
         let mut optimizer = candle_nn::AdamW::new(
             varmap.all_vars(),
-            candle_nn::ParamsAdamW { lr, ..Default::default() },
+            candle_nn::ParamsAdamW { lr, weight_decay: wd_builtin, ..Default::default() },
         )?;
+        // Per-group WD scale: [n_layers + 1] (layers + lm_head), init at 1.0 (uniform)
+        let mut wd_scale: Vec<f32> = vec![1.0; n_layers + 1];
         let mut rng = crate::rng::Rng::new(1337);
 
         // Curriculum: soft-mask inactive bands (0.01 scale, not zero)
@@ -981,6 +986,47 @@ pub mod engine {
                 // TODO: port the manual harmonic gradient from model_backward.rs to candle
                 // For now: --harmonics dyn is PARSED but harmonics stay frozen on candle.
                 // Use CPU/wgpu tier for --harmonics dyn experiments.
+
+                // Per-group weight decay (when --wd dyn)
+                if use_wd_dyn {
+                    let base_wd = 0.01f32;
+                    // Apply WD per layer group: param -= lr * base_wd * wd_scale * param
+                    for layer in 0..n_layers {
+                        let wd_eff = base_wd * wd_scale[layer];
+                        let prefix = format!("block.{layer}.");
+                        for (key, var) in data.iter() {
+                            if key.starts_with(&prefix) {
+                                let vals: Vec<f32> = var.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                let new_vals: Vec<f32> = vals.iter()
+                                    .map(|&v| v - (clr as f32) * wd_eff * v)
+                                    .collect();
+                                let new_t = Tensor::from_vec(new_vals, var.shape(), var.device()).unwrap();
+                                var.set(&new_t).unwrap();
+                            }
+                        }
+                    }
+                    // lm_head group (last wd_scale entry)
+                    let wd_head = base_wd * wd_scale[n_layers];
+                    for (key, var) in data.iter() {
+                        if key == "lm_head" || key == "output_corrector" || key.starts_with("ln_f") {
+                            let vals: Vec<f32> = var.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                            let new_vals: Vec<f32> = vals.iter()
+                                .map(|&v| v - (clr as f32) * wd_head * v)
+                                .collect();
+                            let new_t = Tensor::from_vec(new_vals, var.shape(), var.device()).unwrap();
+                            var.set(&new_t).unwrap();
+                        }
+                    }
+                }
+
+                // WD spring: eq=1.0, k=1.0 (stiff — uniform regularisation well-motivated)
+                if use_wd_dyn {
+                    let k_wd = clr * spring_k * 1.0;
+                    for s in &mut wd_scale {
+                        *s -= (k_wd as f32) * (*s - 1.0);
+                        *s = s.clamp(0.01, 10.0);
+                    }
+                }
 
                 // Layer scale spring: eq=1.0, k=1.0 (moderate)
                 if use_layer_scale_dyn {
