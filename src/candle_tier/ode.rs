@@ -15,10 +15,11 @@ pub mod gpu_ode {
     /// When learnable, alpha/beta/gamma_raw are Tensors tracked by autograd.
     /// When frozen, they're constant tensors (no gradient).
     pub struct GpuOdeParams {
-        pub gamma_raw: Tensor,  // [1, n_bands] — raw damping (before softplus)
-        pub omega: Tensor,      // [1, n_bands] — natural frequency per band (always frozen)
-        pub alpha: Tensor,      // [1, 1] — self-coupling
-        pub beta: Tensor,       // [1, 1] — cross-coupling
+        pub gamma_raw: Tensor,     // [1, n_bands] — raw damping (before softplus)
+        pub omega: Tensor,         // [1, n_bands] — natural frequency per band (always frozen)
+        pub alpha: Tensor,         // [1, 1] — self-coupling
+        pub beta: Tensor,          // [1, 1] — cross-coupling
+        pub rk4_w: Option<Tensor>, // [4] — RK4 combination weights (None = standard 1/6,1/3,1/3,1/6)
         pub n_bands: usize,
         pub rk4_steps: usize,
         pub learnable: bool,
@@ -40,6 +41,7 @@ pub mod gpu_ode {
                 omega: Tensor::from_vec(omega.to_vec(), (1, n_bands), device)?,
                 alpha: Tensor::from_vec(vec![alpha], (1, 1), device)?,
                 beta: Tensor::from_vec(vec![beta], (1, 1), device)?,
+                rk4_w: None, // standard weights
                 n_bands,
                 rk4_steps,
                 learnable: false,
@@ -78,10 +80,34 @@ pub mod gpu_ode {
                 omega,
                 alpha: alpha_t,
                 beta: beta_t,
+                rk4_w: None, // set via set_rk4_learnable() if --rk4-weights dyn
                 n_bands,
                 rk4_steps,
                 learnable: true,
             })
+        }
+    }
+
+    impl GpuOdeParams {
+        /// Make RK4 weights learnable (call after construction).
+        pub fn set_rk4_learnable(&mut self, varmap: &candle_nn::VarMap, key_prefix: &str, device: &Device) -> Result<()> {
+            let key = format!("{key_prefix}.rk4_weights");
+            // Step 1: Create var in VarMap (zero placeholder)
+            let _tensor = varmap.get((4,), &key, candle_nn::Init::Const(0.0), DType::F32, device)?;
+            // Step 2: Overwrite with correct [1/6, 1/3, 1/3, 1/6]
+            let correct_init = Tensor::from_slice(
+                &[1.0f32/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0], (4,), device,
+            )?;
+            {
+                let data = varmap.data().lock().unwrap();
+                if let Some(var) = data.get(&key) {
+                    var.set(&correct_init)?;
+                }
+            }
+            // Step 3: Re-get tensor (now correct values, tracked by optimizer)
+            let tensor = varmap.get((4,), &key, candle_nn::Init::Const(0.0), DType::F32, device)?;
+            self.rk4_w = Some(tensor);
+            Ok(())
         }
     }
 
@@ -174,10 +200,21 @@ pub mod gpu_ode {
             let s4 = (&s + (&k3s * dt)?)?;
             let (k4r, k4s) = kerr_derivative(&r4, &s4, &gamma, params)?;
 
-            // Combine: r_new = r + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
-            let dt6 = dt / 6.0;
-            r = (&r + ((&k1r + (&k2r * 2.0)? + (&k3r * 2.0)? + &k4r)? * dt6)?)?;
-            s = (&s + ((&k1s + (&k2s * 2.0)? + (&k3s * 2.0)? + &k4s)? * dt6)?)?;
+            // Combine: r_new = r + dt * (w0*k1 + w1*k2 + w2*k3 + w3*k4)
+            if let Some(ref w) = params.rk4_w {
+                // Learnable weights — extract scalars (autograd traces through)
+                let w0 = w.narrow(0, 0, 1)?.reshape(())?;
+                let w1 = w.narrow(0, 1, 1)?.reshape(())?;
+                let w2 = w.narrow(0, 2, 1)?.reshape(())?;
+                let w3 = w.narrow(0, 3, 1)?.reshape(())?;
+                r = (&r + ((k1r.broadcast_mul(&w0)? + k2r.broadcast_mul(&w1)? + k3r.broadcast_mul(&w2)? + k4r.broadcast_mul(&w3)?)? * dt)?)?;
+                s = (&s + ((k1s.broadcast_mul(&w0)? + k2s.broadcast_mul(&w1)? + k3s.broadcast_mul(&w2)? + k4s.broadcast_mul(&w3)?)? * dt)?)?;
+            } else {
+                // Standard RK4: dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+                let dt6 = dt / 6.0;
+                r = (&r + ((&k1r + (&k2r * 2.0)? + (&k3r * 2.0)? + &k4r)? * dt6)?)?;
+                s = (&s + ((&k1s + (&k2s * 2.0)? + (&k3s * 2.0)? + &k4s)? * dt6)?)?;
+            }
         }
 
         // Interleave back to [n_pos, n_embd]

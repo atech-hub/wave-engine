@@ -682,12 +682,23 @@ pub mod engine {
         let train_data = &tokens[..split];
         println!("  Train tokens: {}", train_data.len());
 
+        // Parse dynamic param flags early (needed for model construction)
+        let use_rk4_dyn = std::env::args().any(|a| a == "--rk4-weights") &&
+            std::env::args().skip_while(|a| a != "--rk4-weights").nth(1).map_or(false, |s| s == "dyn");
+
         // Model
         let mut varmap = VarMap::new();
         let mut model = CandleWaveModel::new(&varmap, vocab_size, &device,
             n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups, alpha, beta)?;
         model.debug_nan = debug_nan;
         model.phase_native = phase_native;
+        // Wire dynamic params
+        if use_rk4_dyn {
+            for i in 0..model.blocks.len() {
+                let key = format!("block.{i}.ode");
+                model.blocks[i].gpu_ode_params.set_rk4_learnable(&varmap, &key, &device)?;
+            }
+        }
         if phase_native {
             // Create output corrector in VarMap
             let vs = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -734,6 +745,25 @@ pub mod engine {
         let batch_size: usize = parse_flag_c("--batch", 4);
         let seq_len: usize = parse_flag_c("--seq", 256);
         let lr: f64 = parse_flag_c("--lr", if n_bands > 256 { 1e-4 } else { 3e-4 });
+        let spring_k: f64 = parse_flag_c("--spring", 0.1);
+        let use_rk4_dyn = std::env::args().any(|a| a == "--rk4-weights") &&
+            std::env::args().skip_while(|a| a != "--rk4-weights").nth(1).map_or(false, |s| s == "dyn");
+        let use_harmonics_dyn = std::env::args().any(|a| a == "--harmonics") &&
+            std::env::args().skip_while(|a| a != "--harmonics").nth(1).map_or(false, |s| s == "dyn");
+        let use_wd_dyn = std::env::args().any(|a| a == "--wd") &&
+            std::env::args().skip_while(|a| a != "--wd").nth(1).map_or(false, |s| s == "dyn");
+        let use_layer_scale_dyn = std::env::args().any(|a| a == "--layer-scale") &&
+            std::env::args().skip_while(|a| a != "--layer-scale").nth(1).map_or(false, |s| s == "dyn");
+        if spring_k > 0.0 {
+            let mut dyn_flags = Vec::new();
+            if use_rk4_dyn { dyn_flags.push("rk4-weights"); }
+            if use_harmonics_dyn { dyn_flags.push("harmonics"); }
+            if use_wd_dyn { dyn_flags.push("wd"); }
+            if use_layer_scale_dyn { dyn_flags.push("layer-scale"); }
+            if !dyn_flags.is_empty() {
+                println!("  Dynamic params: {} (spring k={:.2})", dyn_flags.join(", "), spring_k);
+            }
+        }
 
         // Optimizer
         use candle_nn::Optimizer;
@@ -882,6 +912,52 @@ pub mod engine {
             }
 
             total_loss /= batch_size as f32;
+
+            // Spring regulation on dynamic params (after optimizer step, like CPU tier)
+            // param -= lr * k * (param - equilibrium)
+            if spring_k > 0.0 {
+                let clr = current_lr;
+                let data = varmap.data().lock().unwrap();
+
+                // ODE alpha/beta springs (free, k=0 — self-regulating via AGC)
+                // No spring needed — matches CPU tier behavior
+
+                // Corrector plate spring: very loose (k=0.01), eq=0.0 (transparent)
+                if phase_native {
+                    let k_corr = clr * spring_k * 0.01;
+                    for layer in 0..n_layers {
+                        let key = format!("block.{layer}.phase_correction");
+                        if let Some(var) = data.get(&key) {
+                            let vals: Vec<f32> = var.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                            let new_vals: Vec<f32> = vals.iter().map(|&v| v - (k_corr as f32) * v).collect();
+                            let new_tensor = Tensor::from_vec(new_vals, var.shape(), var.device()).unwrap();
+                            var.set(&new_tensor).unwrap();
+                        }
+                    }
+                }
+
+                // RK4 weights spring: eq=[1/6,1/3,1/3,1/6], k=2.0 (very stiff)
+                if use_rk4_dyn {
+                    let k_rk4 = clr * spring_k * 2.0;
+                    let eq = [1.0f32/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0];
+                    for layer in 0..n_layers {
+                        let key = format!("block.{layer}.ode.rk4_weights");
+                        if let Some(var) = data.get(&key) {
+                            let vals: Vec<f32> = var.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                            let new_vals: Vec<f32> = vals.iter().enumerate()
+                                .map(|(i, &v)| v - (k_rk4 as f32) * (v - eq[i]))
+                                .collect();
+                            let new_tensor = Tensor::from_vec(new_vals, var.shape(), var.device()).unwrap();
+                            var.set(&new_tensor).unwrap();
+                        }
+                    }
+                }
+
+                // Layer scale spring: eq=1.0, k=1.0 — not yet in candle model
+                // Harmonics spring: eq=initial, k=2.0 — not yet in candle model
+
+                drop(data);
+            }
             let iter_time = iter_start.elapsed();
 
             // VRAM monitoring via cudarc (direct CUDA query — shows ALL GPU memory)
