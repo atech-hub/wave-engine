@@ -280,6 +280,8 @@ pub mod engine {
         ln_f_w: Tensor,
         ln_f_b: Tensor,
         lm_head: Tensor,
+        output_corrector: Option<Tensor>,  // [1, n_bands] phase-native output corrector
+        phase_native: bool,
 
         device: Device,
 
@@ -316,6 +318,7 @@ pub mod engine {
         mae_in_pr: Linear,
         ode_params: OdeParams,
         gpu_ode_params: crate::gpu_ode::gpu_ode::GpuOdeParams,
+        phase_correction: Tensor,  // [1, n_bands] — corrector plate phase angles (learnable)
         mae_out_sq: Linear,
         mae_out_pr: Linear,
         out_proj: crate::block_diagonal::block_diag::BlockDiagonalLinear,
@@ -416,22 +419,42 @@ pub mod engine {
                 let v_proj_bs_cpu: Vec<Vec<f32>> = v_proj_bs.iter()
                     .map(|t| t.to_vec1::<f32>().unwrap()).collect();
 
+                // Corrector plate: per-band phase rotation (zero-init = transparent, learnable)
+                let phase_correction = vs_block.get_with_hints(
+                    (1, n_bands), "phase_correction",
+                    candle_nn::Init::Const(0.0),
+                )?;
+
                 blocks.push(CandleBlock {
                     ln_w, ln_b,
                     phase_proj_ws, phase_proj_bs, v_proj_ws, v_proj_bs,
                     phase_proj_ws_cpu, phase_proj_bs_cpu, v_proj_ws_cpu, v_proj_bs_cpu,
                     harmonic_ns, attn_out_proj_w, attn_out_proj_b,
-                    mae_in_sq, mae_in_pr, ode_params, gpu_ode_params, mae_out_sq, mae_out_pr, out_proj,
+                    mae_in_sq, mae_in_pr, ode_params, gpu_ode_params, phase_correction,
+                    mae_out_sq, mae_out_pr, out_proj,
                 });
             }
 
-            // Final LN + LM head (trained)
+            // Final LN + LM head (trained) or output corrector (phase-native)
             let ln_f_w = vs.get_with_hints((n_embd,), "ln_f_w", candle_nn::Init::Const(1.0))?;
             let ln_f_b = vs.get_with_hints((n_embd,), "ln_f_b", candle_nn::Init::Const(0.0))?;
-            let lm_head = vs.get_with_hints((vocab_size, n_embd), "lm_head",
-                candle_nn::Init::Randn { mean: 0.0, stdev: 1.0 / (n_embd as f64).sqrt() })?;
+            // TODO: make phase_native configurable via CLI flag
+            let phase_native = false; // will be set by caller
+            let lm_head = if !phase_native {
+                vs.get_with_hints((vocab_size, n_embd), "lm_head",
+                    candle_nn::Init::Randn { mean: 0.0, stdev: 1.0 / (n_embd as f64).sqrt() })?
+            } else {
+                // Dummy — not used in phase-native mode
+                Tensor::zeros((1, 1), DType::F32, device)?
+            };
+            let output_corrector = if phase_native {
+                Some(vs.get_with_hints((1, n_bands), "output_corrector", candle_nn::Init::Const(0.0))?)
+            } else {
+                None
+            };
 
-            Ok(Self { wte, wpe, blocks, ln_f_w, ln_f_b, lm_head, device: device.clone(),
+            Ok(Self { wte, wpe, blocks, ln_f_w, ln_f_b, lm_head, output_corrector, phase_native,
+                device: device.clone(),
                 n_bands: n_bands_cfg, n_embd: n_embd_cfg, n_head: n_head_cfg, block_size: block_size_cfg, debug_nan: false })
         }
 
@@ -523,11 +546,25 @@ pub mod engine {
                     }
                 }
 
-                // ODE via CustomOp1 — forward runs RK4 (no clamping), backward is identity
-                // GPU-native perturbative ODE — zero CPU transfers, true autograd backward
-                let effective_ode_out = crate::gpu_ode::gpu_ode::kerr_ode_gpu(&precond, &block.gpu_ode_params)?;
+                // ODE — GPU-native RK4, autograd-compatible
+                let ode_out = crate::gpu_ode::gpu_ode::kerr_ode_gpu(&precond, &block.gpu_ode_params)?;
 
-                // Maestro out (operates on effective ODE output — gradients flow through precond)
+                // Corrector plate: per-band phase rotation (autograd through sin/cos)
+                let effective_ode_out = {
+                    let n_b = self.n_bands;
+                    let reshaped = ode_out.reshape((n_pos, n_b, 2))?;
+                    let r = reshaped.narrow(2, 0, 1)?.squeeze(2)?;
+                    let s = reshaped.narrow(2, 1, 1)?.squeeze(2)?;
+                    let cos_c = block.phase_correction.cos()?;
+                    let sin_c = block.phase_correction.sin()?;
+                    let r_rot = (r.broadcast_mul(&cos_c)? - s.broadcast_mul(&sin_c)?)?;
+                    let s_rot = (r.broadcast_mul(&sin_c)? + s.broadcast_mul(&cos_c)?)?;
+                    let r_exp = r_rot.unsqueeze(2)?;
+                    let s_exp = s_rot.unsqueeze(2)?;
+                    Tensor::cat(&[&r_exp, &s_exp], 2)?.reshape((n_pos, n_embd))?
+                };
+
+                // Maestro out (operates on corrected ODE output — gradients flow through corrector)
                 let mae_out = block.mae_out_sq.forward(&effective_ode_out)?;
                 let mae_out = mae_out.gelu()?;
                 let mae_out = block.mae_out_pr.forward(&mae_out)?;
@@ -558,9 +595,33 @@ pub mod engine {
                 hidden = (&hidden + &attn_out + &ffn_out)?;
             }
 
-            // Final LN + LM head
+            // Final LN
             let normed = layer_norm(&hidden, &self.ln_f_w, &self.ln_f_b)?;
-            let logits = normed.matmul(&self.lm_head.t()?)?;
+
+            let logits = if self.phase_native {
+                // Phase-native: output corrector + dot product against frozen embeddings
+                if let Some(ref oc) = self.output_corrector {
+                    let n_b = self.n_bands;
+                    let reshaped = normed.reshape((n_pos, n_b, 2))?;
+                    let r = reshaped.narrow(2, 0, 1)?.squeeze(2)?;
+                    let s = reshaped.narrow(2, 1, 1)?.squeeze(2)?;
+                    let cos_c = oc.cos()?;
+                    let sin_c = oc.sin()?;
+                    let r_rot = (r.broadcast_mul(&cos_c)? - s.broadcast_mul(&sin_c)?)?;
+                    let s_rot = (r.broadcast_mul(&sin_c)? + s.broadcast_mul(&cos_c)?)?;
+                    let r_exp = r_rot.unsqueeze(2)?;
+                    let s_exp = s_rot.unsqueeze(2)?;
+                    let corrected = Tensor::cat(&[&r_exp, &s_exp], 2)?.reshape((n_pos, self.n_embd))?;
+                    // Dot product against frozen embeddings (wte): [n_pos, n_embd] × [n_embd, vocab] = [n_pos, vocab]
+                    corrected.matmul(&self.wte.t()?)?
+                } else {
+                    // No output corrector — direct dot product
+                    normed.matmul(&self.wte.t()?)?
+                }
+            } else {
+                // Standard: lm_head projection
+                normed.matmul(&self.lm_head.t()?)?
+            };
 
             Ok(logits)
         }
