@@ -195,8 +195,7 @@ impl GpuBackend {
         let mut s = vec![0.0f32; n_bands];
         for k in 0..n_bands { r[k] = x[k * 2]; s[k] = x[k * 2 + 1]; }
 
-        fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
-        let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
+        let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
 
         const MAG_BOUND: f32 = 50.0;
         const DERIV_BOUND: f32 = 1000.0;
@@ -421,8 +420,7 @@ impl GpuBackend {
             }
         }
 
-        fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
-        let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
+        let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
         let ab = [weights.alpha, weights.beta];
 
         let buf_size = (total * 4) as u64;
@@ -633,8 +631,7 @@ impl GpuBackend {
         }
 
         // Precompute decay = exp(-softplus(gamma)), cos(omega), sin(omega) on CPU
-        fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
-        let decay: Vec<f32> = weights.gamma_raw.iter().map(|&g| (-softplus(g)).exp()).collect();
+        let decay: Vec<f32> = weights.gamma_raw.iter().map(|&g| (-crate::common::math::softplus(g)).exp()).collect();
         let cos_w: Vec<f32> = weights.omega.iter().map(|&w| w.cos()).collect();
         let sin_w: Vec<f32> = weights.omega.iter().map(|&w| w.sin()).collect();
 
@@ -750,8 +747,7 @@ impl GpuBackend {
             for k in 0..n_bands { r[pos * n_bands + k] = xs[pos][k * 2]; s[pos * n_bands + k] = xs[pos][k * 2 + 1]; }
         }
 
-        fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
-        let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
+        let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
         let total = n_pos * n_bands;
 
         // Magnitude bound for GPU numerical stability at 768-dim+.

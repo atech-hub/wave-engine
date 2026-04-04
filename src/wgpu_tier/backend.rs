@@ -392,9 +392,7 @@ impl ComputeBackend for CpuBackend {
 
 use std::f32::consts::PI;
 
-fn softplus(x: f32) -> f32 {
-    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
-}
+use crate::common::math::softplus;
 
 fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + ((2.0 / PI).sqrt() * (x + 0.044715 * x * x * x)).tanh())

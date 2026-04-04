@@ -62,14 +62,7 @@ pub const RK4_N_STEPS: usize = 8;
 pub const RK4_DT: f32 = 1.0 / RK4_N_STEPS as f32;
 pub const N_LAYERS: usize = 4;
 
-/// Softplus: log(1 + exp(x))
-fn softplus(x: f32) -> f32 {
-    if x > 20.0 {
-        x  // avoid overflow
-    } else {
-        (1.0 + x.exp()).ln()
-    }
-}
+use super::math::softplus;
 
 /// GELU activation (approximate version matching PyTorch default)
 pub fn gelu(x: f32) -> f32 {

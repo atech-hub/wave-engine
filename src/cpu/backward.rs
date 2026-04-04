@@ -154,20 +154,7 @@ pub fn softplus_backward(d_y: f32, x: f32) -> f32 {
 
 // ─── Cross-entropy loss backward ────────────────────────────────
 
-/// Backward through cross-entropy loss with logits.
-/// Returns d_logits = softmax(logits) - one_hot(target)
-pub fn cross_entropy_backward(logits: &[f32], target: usize) -> Vec<f32> {
-    let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-    let exp_l: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
-    let sum_exp: f32 = exp_l.iter().sum();
-
-    let mut d_logits: Vec<f32> = exp_l.iter().map(|&e| e / sum_exp).collect();
-    d_logits[target] -= 1.0;
-
-    // Normalize by 1 (single token loss, not batch-averaged here)
-    d_logits
-}
+pub use crate::common::math::cross_entropy_backward;
 
 // ─── Kerr-ODE backward ─────────────────────────────────────────
 

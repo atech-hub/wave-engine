@@ -17,9 +17,7 @@ pub struct AttentionHeadStats {
     pub self_attn_frac: f32,
 }
 
-fn softplus(x: f32) -> f32 {
-    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
-}
+use super::math::softplus;
 
 /// Analyze attention heads from a forward cache.
 ///

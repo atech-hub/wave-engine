@@ -64,8 +64,7 @@ pub mod engine {
         }
         let x = &clamped;
 
-        fn softplus(v: f32) -> f32 { if v > 20.0 { v } else { (1.0 + v.exp()).ln() } }
-        let gamma: Vec<f32> = params.gamma_raw.iter().map(|&g| softplus(g)).collect();
+        let gamma: Vec<f32> = params.gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
 
         // Step 1: Linear solution (damping + base rotation)
         let mut r_lin = vec![0.0f32; n_bands];
@@ -224,8 +223,7 @@ pub mod engine {
 
         for head in 0..n_head {
             let offset = head * head_dim;
-            fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
-            let harmonic_n = softplus(harmonic_ns[head]);
+            let harmonic_n = crate::common::math::softplus(harmonic_ns[head]);
 
             // Phase projection — from CPU cache, zero GPU transfers
             let pp_w = &pp_ws_cpu[head];
@@ -298,7 +296,6 @@ pub mod engine {
         let n_head = block.harmonic_ns.len();
         let head_dim = n_embd / n_head;
 
-        fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
         fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 
         let att_w = block.cached_att_weights.as_ref()
@@ -309,7 +306,7 @@ pub mod engine {
         let mut d_harmonic_raws = vec![0.0f32; n_head];
 
         for h in 0..n_head {
-            let harmonic_n = softplus(block.harmonic_ns[h]);
+            let harmonic_n = crate::common::math::softplus(block.harmonic_ns[h]);
             let offset = h * head_dim;
 
             // Recompute phases (same as forward)
@@ -1046,8 +1043,7 @@ pub mod engine {
 
                 for head in 0..n_head {
                     let offset = head * head_dim;
-                    fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
-                    let harmonic_n = softplus(block.harmonic_ns[head]);
+                    let harmonic_n = crate::common::math::softplus(block.harmonic_ns[head]);
 
                     let pp_w = &block.phase_proj_ws_cpu[head];
                     let pp_b = &block.phase_proj_bs_cpu[head];
@@ -1913,10 +1909,9 @@ pub mod engine {
                             s += &format!(r#","agc_headroom":[{}]"#, vals.join(","));
                         }
                         if use_harmonics_dyn {
-                            fn softplus_t(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
                             let mut parts = Vec::new();
                             for (l, block) in model.blocks.iter().enumerate() {
-                                let vals: Vec<String> = block.harmonic_ns.iter().map(|&h| format!("{:.4}", softplus_t(h))).collect();
+                                let vals: Vec<String> = block.harmonic_ns.iter().map(|&h| format!("{:.4}", crate::common::math::softplus(h))).collect();
                                 parts.push(format!(r#"{{"L{}": [{}]}}"#, l, vals.join(",")));
                             }
                             s += &format!(r#","harmonics":[{}]"#, parts.join(","));

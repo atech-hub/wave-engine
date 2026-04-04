@@ -142,9 +142,7 @@ fn flatten_weights(w: &[Vec<f32>]) -> Vec<f32> {
     w.iter().flat_map(|row| row.iter().copied()).collect()
 }
 
-fn softplus(x: f32) -> f32 {
-    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
-}
+use crate::common::math::softplus;
 
 impl ResidentWeightBuffers {
     /// Upload all model weights to GPU VRAM.

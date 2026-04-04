@@ -1,3 +1,4 @@
+pub mod math;
 pub mod model;
 pub mod embed;
 pub mod attn;

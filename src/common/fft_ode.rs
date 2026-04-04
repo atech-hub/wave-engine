@@ -174,8 +174,7 @@ pub fn kerr_ode_fft(x: &[f32], gamma_raw: &[f32], omega: &[f32], alpha: f32, bet
     let dt = 1.0 / rk4_steps as f32;
     let use_sequential = n_bands < 256;
 
-    fn softplus(v: f32) -> f32 { if v > 20.0 { v } else { (1.0 + v.exp()).ln() } }
-    let gamma: Vec<f32> = gamma_raw.iter().map(|&g| softplus(g)).collect();
+    let gamma: Vec<f32> = gamma_raw.iter().map(|&g| super::math::softplus(g)).collect();
 
     let mut r: Vec<f32> = (0..n_bands).map(|k| x[k * 2]).collect();
     let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
@@ -292,8 +291,7 @@ pub fn kerr_ode_batch_gpu_fft(
     let n_embd = n_bands * 2;
     let dt = 1.0 / rk4_steps as f32;
 
-    fn softplus(v: f32) -> f32 { if v > 20.0 { v } else { (1.0 + v.exp()).ln() } }
-    let gamma: Vec<f32> = gamma_raw.iter().map(|&g| softplus(g)).collect();
+    let gamma: Vec<f32> = gamma_raw.iter().map(|&g| super::math::softplus(g)).collect();
 
     // Deinterleave all positions into flat r/s arrays [n_pos * n_bands]
     let mut r = vec![0.0f32; n_pos * n_bands];

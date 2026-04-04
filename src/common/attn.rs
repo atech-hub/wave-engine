@@ -64,12 +64,10 @@ pub fn wave_attention_forward(
     let n_head = weights.heads.len();
     let head_dim = n_embd / n_head;
 
-    fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
-
     // Parallel over attention heads — each head is fully independent.
     // 12 heads on 28 threads: ~4-6x speedup at 24 layers.
     let head_results: Vec<(Vec<Vec<f32>>, Vec<Vec<f32>>)> = (0..n_head).into_par_iter().map(|head| {
-        let harmonic_n = softplus(weights.heads[head].harmonic_raw);
+        let harmonic_n = super::math::softplus(weights.heads[head].harmonic_raw);
         let offset = head * head_dim;
 
         // Phase 1: Precompute phase angles

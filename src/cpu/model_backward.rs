@@ -15,15 +15,7 @@ use crate::WavePacketModel;
 use crate::cpu::forward::{BlockCache, ForwardCache};
 use crate::cpu::backward::layer_norm_backward;
 use rayon::prelude::*;
-
-fn cross_entropy_backward(logits: &[f32], target: usize) -> Vec<f32> {
-    let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp_l: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
-    let sum_exp: f32 = exp_l.iter().sum();
-    let mut d = exp_l.iter().map(|&e| e / sum_exp).collect::<Vec<f32>>();
-    d[target] -= 1.0;
-    d
-}
+use crate::common::math::cross_entropy_backward;
 
 pub struct Gradients {
     // Per-block FFN gradients
@@ -286,11 +278,8 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         if !grads.d_harmonic_raw[block_idx].is_empty() {
             let n_head = block.attn.heads.len();
             let head_dim = d.n_embd / n_head;
-            fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
-            fn softplus_derivative(x: f32) -> f32 { if x > 20.0 { 1.0 } else { 1.0 / (1.0 + (-x).exp()) } }
-
             for h in 0..n_head {
-                let harmonic_n = softplus(block.attn.heads[h].harmonic_raw);
+                let harmonic_n = crate::common::math::softplus(block.attn.heads[h].harmonic_raw);
                 let offset = h * head_dim;
 
                 // Recompute phases (same as forward)
@@ -344,7 +333,7 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
                 }
 
                 // Chain through softplus: d_loss/d_harmonic_raw = d_h * softplus'(harmonic_raw)
-                grads.d_harmonic_raw[block_idx][h] += d_h * softplus_derivative(block.attn.heads[h].harmonic_raw);
+                grads.d_harmonic_raw[block_idx][h] += d_h * crate::common::math::softplus_derivative(block.attn.heads[h].harmonic_raw);
             }
         }
 
@@ -541,8 +530,7 @@ fn kerr_ode_forward_cpu_standalone(weights: &KerrWeights, x: &[f32]) -> Vec<f32>
     let n_embd = n_bands * 2;
     let n_steps = weights.rk4_n_steps;
     let dt = 1.0 / n_steps as f32;
-    fn softplus(v: f32) -> f32 { if v > 20.0 { v } else { (1.0 + v.exp()).ln() } }
-    let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
+    let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
     let mut r: Vec<f32> = (0..n_bands).map(|k| x[k * 2]).collect();
     let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
     let w = &weights.rk4_weights;

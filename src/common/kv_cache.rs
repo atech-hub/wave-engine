@@ -69,7 +69,7 @@ fn phase_to_bucket(phase: f32) -> usize {
     ((normalized / bucket_width) as usize).min(N_BUCKETS - 1)
 }
 
-fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
+use super::math::softplus;
 
 impl KvCache {
     pub fn new(n_layers: usize, n_head: usize) -> Self {

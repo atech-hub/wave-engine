@@ -134,8 +134,7 @@ fn kerr_ode_forward_cpu_standalone(weights: &KerrWeights, x: &[f32]) -> Vec<f32>
     let n_embd = n_bands * 2;
     let n_steps = weights.rk4_n_steps;
     let dt = 1.0 / n_steps as f32;
-    fn softplus(v: f32) -> f32 { if v > 20.0 { v } else { (1.0 + v.exp()).ln() } }
-    let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
+    let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
     let mut r: Vec<f32> = (0..n_bands).map(|k| x[k * 2]).collect();
     let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
     let w = &weights.rk4_weights;

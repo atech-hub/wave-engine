@@ -97,8 +97,7 @@ impl GpuBackend {
         let total = n_pos * n_bands;
         let buf_size = (total * 4) as u64;
 
-        fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
-        let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
+        let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
 
         // Deinterleave inputs and d_outputs
         let mut r_flat = vec![0.0f32; total];

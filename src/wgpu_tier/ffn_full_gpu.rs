@@ -147,8 +147,7 @@ pub fn ffn_forward_gpu(
     let b_op = upload(&weights.out_proj.as_linear().b);
 
     // ODE weights
-    fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
-    let gamma: Vec<f32> = weights.kerr.gamma_raw.iter().map(|&g| softplus(g)).collect();
+    let gamma: Vec<f32> = weights.kerr.gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
     let w_gamma = upload(&gamma);
     let w_omega = upload(&weights.kerr.omega);
     let ab = [weights.kerr.alpha, weights.kerr.beta];

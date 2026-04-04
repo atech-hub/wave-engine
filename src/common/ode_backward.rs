@@ -36,14 +36,7 @@ pub struct OdeParamGrads {
 
 // ─── Helpers ───────────────────────────────────────────────
 
-fn softplus(v: f32) -> f32 {
-    if v > 20.0 { v } else { (1.0 + v.exp()).ln() }
-}
-
-fn softplus_derivative(v: f32) -> f32 {
-    // d/dx softplus(x) = sigmoid(x) = 1 / (1 + exp(-x))
-    if v > 20.0 { 1.0 } else { 1.0 / (1.0 + (-v).exp()) }
-}
+use super::math::{softplus, softplus_derivative};
 
 /// Compute neighbour sum of mag_sq for band k (stencil ±2).
 fn neighbour_sum(r: &[f32], s: &[f32], k: usize) -> f32 {

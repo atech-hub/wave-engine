@@ -967,10 +967,9 @@ pub fn run_training(config: TrainConfig) {
                 String::new()
             };
             let harm_str = if config.harmonics.is_active() {
-                fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
                 let mut parts = Vec::new();
                 for (l, block) in model.blocks.iter().enumerate() {
-                    let vals: Vec<String> = block.attn.heads.iter().map(|h| format!("{:.4}", softplus(h.harmonic_raw))).collect();
+                    let vals: Vec<String> = block.attn.heads.iter().map(|h| format!("{:.4}", crate::common::math::softplus(h.harmonic_raw))).collect();
                     parts.push(format!(r#"{{"L{}": [{}]}}"#, l, vals.join(",")));
                 }
                 format!(r#","harmonics":[{}]"#, parts.join(","))
