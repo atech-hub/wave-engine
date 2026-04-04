@@ -1290,32 +1290,7 @@ pub mod engine {
             .unwrap_or("data/tokenizer.json".to_string());
 
         let tok_path_opt = if use_bpe { Some(tokenizer_path.as_str()) } else { None };
-        let (tokens, vocab_size) = if let Some((cached_toks, cached_vs)) = crate::token_cache::load_cache(data_path, use_bpe, tok_path_opt) {
-            (cached_toks, cached_vs)
-        } else {
-            let raw = std::fs::read_to_string(data_path)
-                .map_err(|e| candle_core::Error::Msg(format!("Failed to read {data_path}: {e}")))?;
-            let (toks, vs) = if use_bpe {
-                let tokenizer = crate::bpe::BpeTokenizer::from_file(&tokenizer_path);
-                let t = tokenizer.encode(&raw);
-                let v = tokenizer.vocab_size;
-                println!("  BPE tokens: {}, vocab: {}", t.len(), v);
-                (t, v)
-            } else {
-                let chars: Vec<char> = raw.chars().collect();
-                let mut vocab: Vec<char> = chars.clone();
-                vocab.sort();
-                vocab.dedup();
-                let v = vocab.len();
-                let char_to_idx: std::collections::HashMap<char, usize> =
-                    vocab.iter().enumerate().map(|(i, &c)| (c, i)).collect();
-                let t: Vec<usize> = chars.iter().map(|c| *char_to_idx.get(c).unwrap_or(&0)).collect();
-                println!("  Char-level tokens: {}, vocab: {}", t.len(), v);
-                (t, v)
-            };
-            crate::token_cache::save_cache(data_path, use_bpe, tok_path_opt, &toks, vs);
-            (toks, vs)
-        };
+        let (tokens, vocab_size) = crate::common::data_loader::load_data(data_path, use_bpe, tok_path_opt);
         let split = (tokens.len() as f32 * 0.9) as usize;
         let train_data = &tokens[..split];
         println!("  Train tokens: {}", train_data.len());

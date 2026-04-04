@@ -67,8 +67,8 @@ struct DataProfile {
 }
 
 fn analyze_data(path: &str, task_override: Option<TaskType>) -> DataProfile {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| { eprintln!("Error reading {}: {}", path, e); std::process::exit(1); });
+    // Use data_loader for format detection (handles .txt, .jsonl, directories)
+    let text = crate::common::data_loader::load_text_raw(path);
 
     let corpus_chars = text.len();
 

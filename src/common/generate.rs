@@ -39,7 +39,7 @@ pub fn run_generate(config: GenerateConfig) {
         // Char-level: build vocab from training data file (same as training tokenizer)
         let data_path = std::env::args().skip_while(|a| a != "--data").nth(1)
             .unwrap_or_else(|| std::env::args().nth(1).unwrap_or("data/input.txt".to_string()));
-        let text = std::fs::read_to_string(&data_path).expect("Failed to read data file for char vocab");
+        let text = crate::common::data_loader::load_text_raw(&data_path);
         let mut chars: Vec<char> = text.chars().collect();
         chars.sort();
         chars.dedup();

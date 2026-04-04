@@ -8,7 +8,12 @@ pub fn print_help() {
     println!("    wave-engine <DATA> [OPTIONS]");
     println!();
     println!("ARGUMENTS:");
-    println!("    DATA              Path to training data file (e.g. data/input.txt)");
+    println!("    DATA              Path to training data (auto-detects format)");
+    println!("                      Supported formats:");
+    println!("                        data/input.txt          Plain text");
+    println!("                        data/corpus.jsonl       HuggingFace JSONL (extracts 'text' field)");
+    println!("                        data/wikitext/          Directory (concatenates .txt + .jsonl)");
+    println!("                      Files > 500MB: auto-tokenized to .wtok binary, memory-mapped");
     println!();
     println!("TRAINING:");
     println!("    --iters N         Training iterations                    [default: 500]");

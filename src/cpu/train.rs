@@ -204,30 +204,7 @@ pub fn run_training(config: TrainConfig) {
     println!("Loading dataset from {}...", config.data_path);
 
     let tok_path = if config.use_bpe { Some(config.tokenizer_path.as_str()) } else { None };
-    let (tokens, vocab_size) = if let Some((cached_toks, cached_vs)) = token_cache::load_cache(&config.data_path, config.use_bpe, tok_path) {
-        (cached_toks, cached_vs)
-    } else {
-        let raw = std::fs::read_to_string(&config.data_path).expect("Failed to read data file");
-        let (toks, vs) = if config.use_bpe {
-            let tokenizer = bpe::BpeTokenizer::from_file(&config.tokenizer_path);
-            let t = tokenizer.encode(&raw);
-            let v = tokenizer.vocab_size;
-            println!("  BPE tokens: {}, vocab: {}", t.len(), v);
-            (t, v)
-        } else {
-            let chars: Vec<char> = raw.chars().collect();
-            let mut vocab: Vec<char> = chars.clone();
-            vocab.sort();
-            vocab.dedup();
-            let v = vocab.len();
-            let char_to_idx: std::collections::HashMap<char, usize> = vocab.iter().enumerate().map(|(i, &c)| (c, i)).collect();
-            let t: Vec<usize> = chars.iter().map(|c| *char_to_idx.get(c).unwrap_or(&0)).collect();
-            println!("  Char-level tokens: {}, vocab: {}", t.len(), v);
-            (t, v)
-        };
-        token_cache::save_cache(&config.data_path, config.use_bpe, tok_path, &toks, vs);
-        (toks, vs)
-    };
+    let (tokens, vocab_size) = crate::common::data_loader::load_data(&config.data_path, config.use_bpe, tok_path);
     let split = (tokens.len() as f32 * 0.9) as usize;
     let train_data = &tokens[..split];
     println!("  Train tokens: {}", train_data.len());

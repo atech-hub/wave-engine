@@ -253,8 +253,8 @@ fn main() {
         let stencil = fft_ode::StencilFft::new(n_bands);
         crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
 
-        // Build char vocab
-        let text = std::fs::read_to_string(&data_path).expect("Failed to read data");
+        // Build char vocab (supports .txt, .jsonl, directories)
+        let text = common::data_loader::load_text_raw(&data_path);
         let mut chars: Vec<char> = text.chars().collect();
         chars.sort(); chars.dedup();
         let char_map: Vec<char> = chars[..chars.len().min(ck_vocab)].to_vec();
@@ -319,8 +319,8 @@ fn main() {
         let stencil = fft_ode::StencilFft::new(n_bands);
         crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
 
-        // Build char vocab from data file
-        let text = std::fs::read_to_string(&data_path).expect("Failed to read data file");
+        // Build char vocab from data file (supports .txt, .jsonl, directories)
+        let text = common::data_loader::load_text_raw(&data_path);
         let mut chars: Vec<char> = text.chars().collect();
         chars.sort(); chars.dedup();
         let char_map: Vec<char> = chars[..chars.len().min(ck_vocab)].to_vec();

@@ -27,6 +27,9 @@ serde_json = "1"
 # FFT for OFDM-inspired ODE acceleration
 rustfft = "6.2"
 
+# Memory-mapped large datasets
+memmap2 = "0.9"
+
 # Parallel attention heads
 rayon = "1.10"
 
