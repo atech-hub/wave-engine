@@ -205,7 +205,8 @@ pub mod engine {
         harmonic_ns: &[f32],
         out_proj_w: &Tensor,
         out_proj_b: &Tensor,
-    ) -> Result<Tensor> {
+        store_attn_weights: bool,     // true when --harmonics dyn
+    ) -> Result<(Tensor, Option<Vec<Vec<Vec<f32>>>>)> {
         let (n_pos, n_embd) = x.dims2()?;
         let n_head = harmonic_ns.len();
         let head_dim = n_embd / n_head;
@@ -213,6 +214,13 @@ pub mod engine {
         // Only ONE GPU→CPU transfer: the input activations (these change every call)
         let x_data = x.to_vec2::<f32>()?;
         let mut out_data = vec![0.0f32; n_pos * n_embd];
+
+        // Optional attention weight storage for harmonic backward
+        let mut all_att_weights: Option<Vec<Vec<Vec<f32>>>> = if store_attn_weights {
+            Some(vec![vec![vec![0.0; n_pos]; n_pos]; n_head])
+        } else {
+            None
+        };
 
         for head in 0..n_head {
             let offset = head * head_dim;
@@ -253,6 +261,14 @@ pub mod engine {
                 let mut exp_sum = 0.0f32;
                 for ki in 0..=qi { scores[ki] = (scores[ki] - max_s).exp(); exp_sum += scores[ki]; }
                 if exp_sum > 0.0 { for ki in 0..=qi { scores[ki] /= exp_sum; } }
+
+                // Store the softmax weights for backward
+                if let Some(ref mut aw) = all_att_weights {
+                    for ki in 0..=qi {
+                        aw[head][qi][ki] = scores[ki];
+                    }
+                }
+
                 for d in 0..head_dim {
                     let mut sum = 0.0f32;
                     for ki in 0..=qi { sum += scores[ki] * v_all[ki][d]; }
@@ -264,7 +280,97 @@ pub mod engine {
         // Back to tensor, then out_proj through Candle (GPU, frozen but on grad graph for residual)
         let out_tensor = Tensor::from_vec(out_data, (n_pos, n_embd), x.device())?;
         let projected = out_tensor.matmul(&out_proj_w.t()?)?.broadcast_add(out_proj_b)?;
-        Ok(projected)
+        Ok((projected, all_att_weights))
+    }
+
+    // ─── Harmonic backward (manual chain rule — attention runs on CPU, outside autograd) ───
+
+    /// Compute harmonic gradients for one block.
+    /// Called AFTER candle backward, using d_out from the grad accumulator.
+    /// d_out is [t][n_embd] — the gradient of the block's contribution tensor.
+    /// This equals d_attn_out because contribution = attn_out + ffn_out (sum splits gradient equally).
+    fn harmonic_backward(
+        block: &CandleBlock,
+        d_out: &[Vec<f32>],        // [t][n_embd] — gradient of contribution (= d_attn_out)
+        n_embd: usize,
+    ) -> Vec<f32> {                 // [n_head] — d_loss/d_harmonic_raw per head
+        let t = d_out.len();
+        let n_head = block.harmonic_ns.len();
+        let head_dim = n_embd / n_head;
+
+        fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
+        fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
+
+        let att_w = block.cached_att_weights.as_ref()
+            .expect("harmonic backward requires cached attention weights");
+        let input = block.cached_normed_cpu.as_ref()
+            .expect("harmonic backward requires cached normed input");
+
+        let mut d_harmonic_raws = vec![0.0f32; n_head];
+
+        for h in 0..n_head {
+            let harmonic_n = softplus(block.harmonic_ns[h]);
+            let offset = h * head_dim;
+
+            // Recompute phases (same as forward)
+            let pp_w = &block.phase_proj_ws_cpu[h];
+            let pp_b = &block.phase_proj_bs_cpu[h];
+            let phases: Vec<f32> = (0..t).map(|pos| {
+                let mut r = pp_b[0];
+                let mut s = pp_b[1];
+                for j in 0..n_embd { r += pp_w[0][j] * input[pos][j]; s += pp_w[1][j] * input[pos][j]; }
+                s.atan2(r)
+            }).collect();
+
+            // Recompute value projections (same as forward)
+            let vw = &block.v_proj_ws_cpu[h];
+            let vb = &block.v_proj_bs_cpu[h];
+            let v_all: Vec<Vec<f32>> = (0..t).map(|pos| {
+                let mut v = vec![0.0f32; head_dim];
+                for d in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for j in 0..head_dim { sum += vw[d][j] * input[pos][offset + j]; }
+                    v[d] = sum + vb[d];
+                }
+                v
+            }).collect();
+
+            // Accumulate d_h across all query positions
+            let mut d_h = 0.0f32;
+            for qi in 0..t {
+                // d_weight from d_output: d_w[qi][ki] = sum_d d_out[qi][offset+d] * v_all[ki][d]
+                let mut d_w_qi = vec![0.0f32; t];
+                for ki in 0..=qi {
+                    if att_w[h][qi][ki] > 0.0 {
+                        let mut dw = 0.0f32;
+                        for d in 0..head_dim {
+                            dw += d_out[qi][offset + d] * v_all[ki][d];
+                        }
+                        d_w_qi[ki] = dw;
+                    }
+                }
+
+                // Softmax backward
+                let weighted_sum: f32 = (0..=qi)
+                    .map(|ki| att_w[h][qi][ki] * d_w_qi[ki])
+                    .sum();
+
+                // Accumulate through cosine derivative
+                for ki in 0..=qi {
+                    if att_w[h][qi][ki] > 0.0 {
+                        let d_score = att_w[h][qi][ki] * (d_w_qi[ki] - weighted_sum);
+                        let delta = phases[qi] - phases[ki];
+                        let d_score_d_h = -(harmonic_n * delta).sin() * delta;
+                        d_h += d_score * d_score_d_h;
+                    }
+                }
+            }
+
+            // Chain through softplus: d_loss/d_harmonic_raw = d_h * sigmoid(harmonic_raw)
+            d_harmonic_raws[h] = d_h * sigmoid(block.harmonic_ns[h]);
+        }
+
+        d_harmonic_raws
     }
 
     // ─── Monitor data collected during forward ───
@@ -526,6 +632,12 @@ pub mod engine {
         v_proj_ws_cpu: Vec<Vec<Vec<f32>>>,       // [n_head][head_dim][head_dim]
         v_proj_bs_cpu: Vec<Vec<f32>>,            // [n_head][head_dim]
 
+        // Harmonics dyn — attention cache for manual backward
+        harmonic_dyn: bool,                                    // --harmonics dyn active
+        cached_att_weights: Option<Vec<Vec<Vec<f32>>>>,        // [n_head][t][t] post-softmax
+        cached_normed_cpu: Option<Vec<Vec<f32>>>,              // [t][n_embd] block input (normed)
+        cached_layer_output: Option<Tensor>,                   // layer output tensor (on grad graph)
+
         // FFN (trained via VarMap)
         mae_in_sq: Linear,
         mae_in_pr: Linear,
@@ -645,6 +757,10 @@ pub mod engine {
                     phase_proj_ws_cpu, phase_proj_bs_cpu, v_proj_ws_cpu, v_proj_bs_cpu,
                     harmonic_init: harmonic_ns.clone(),
                     harmonic_ns, attn_out_proj_w, attn_out_proj_b,
+                    harmonic_dyn: false,  // set by train_candle when --harmonics dyn
+                    cached_att_weights: None,
+                    cached_normed_cpu: None,
+                    cached_layer_output: None,
                     mae_in_sq, mae_in_pr, ode_params, gpu_ode_params, phase_correction,
                     mae_out_sq, mae_out_pr, out_proj,
                     layer_scale: None, // set by --layer-scale dyn
@@ -712,7 +828,7 @@ pub mod engine {
             }
             let mut hidden = Tensor::from_vec(hidden_vecs, (n_pos, n_embd), &self.device)?;
 
-            for (block_idx, block) in self.blocks.iter().enumerate() {
+            for (block_idx, block) in self.blocks.iter_mut().enumerate() {
                 let normed = layer_norm(&hidden, &block.ln_w, &block.ln_b)?;
                 if self.debug_nan {
                     if normed.to_vec2::<f32>()?.iter().any(|r| r.iter().any(|v| v.is_nan())) {
@@ -720,14 +836,21 @@ pub mod engine {
                     }
                 }
 
+                // Cache normed input on CPU when harmonics dyn (for manual backward)
+                if block.harmonic_dyn {
+                    block.cached_normed_cpu = Some(normed.to_vec2::<f32>()?);
+                }
+
                 // Attention (frozen, CPU scoring, GPU out_proj)
-                let attn_out = wave_attention(
+                let (attn_out, att_weights) = wave_attention(
                     &normed,
                     &block.phase_proj_ws_cpu, &block.phase_proj_bs_cpu,
                     &block.v_proj_ws_cpu, &block.v_proj_bs_cpu,
                     &block.harmonic_ns,
                     &block.attn_out_proj_w, &block.attn_out_proj_b,
+                    block.harmonic_dyn,
                 )?;
+                block.cached_att_weights = att_weights;
 
                 // FFN (trained) — soft-mask inactive bands (curriculum)
                 // Attention sees full normed (frozen, routes only).
@@ -812,6 +935,10 @@ pub mod engine {
 
                 // Parallel residual: hidden + scale * (attn_out + ffn_out)
                 let contribution = (&attn_out + &ffn_out)?;
+                // Cache contribution tensor for harmonic backward (gradient extraction)
+                if block.harmonic_dyn {
+                    block.cached_layer_output = Some(contribution.clone());
+                }
                 hidden = if let Some(ref scale) = block.layer_scale {
                     (&hidden + contribution.broadcast_mul(scale)?)?
                 } else {
@@ -1298,6 +1425,12 @@ pub mod engine {
             std::env::args().skip_while(|a| a != "--wd").nth(1).map_or(false, |s| s == "dyn");
         let use_layer_scale_dyn = std::env::args().any(|a| a == "--layer-scale") &&
             std::env::args().skip_while(|a| a != "--layer-scale").nth(1).map_or(false, |s| s == "dyn");
+        // Wire harmonic_dyn flag on blocks
+        if use_harmonics_dyn {
+            for block in &mut model.blocks {
+                block.harmonic_dyn = true;
+            }
+        }
         if spring_k > 0.0 {
             let mut dyn_flags = Vec::new();
             if use_rk4_dyn { dyn_flags.push("rk4-weights"); }
@@ -1457,6 +1590,47 @@ pub mod engine {
                         grad_flow = Some(compute_gradient_flow(&grads, &varmap, n_layers));
                     }
 
+                    // ── Harmonic backward (manual, outside autograd) ──
+                    // Extract d_contribution from grad graph, compute d_harmonic_raw per head,
+                    // apply gradient + spring to harmonic_raws, sync harmonic_ns.
+                    if use_harmonics_dyn {
+                        let eq_fn = |h: usize| -> f32 { ((h + 1) as f32 * 0.5f32).ln() };
+                        let spring_k_harm = 2.0f32; // very stiff — integer harmonics theoretically motivated
+
+                        for block in model.blocks.iter_mut() {
+                            if !block.harmonic_dyn { continue; }
+
+                            // Extract gradient of contribution tensor from GradStore
+                            let d_out_cpu = if let Some(ref layer_out) = block.cached_layer_output {
+                                grads.get(layer_out).map(|g| g.to_vec2::<f32>().ok()).flatten()
+                            } else {
+                                None
+                            };
+
+                            if let Some(d_out) = d_out_cpu {
+                                let d_hr = harmonic_backward(block, &d_out, n_embd);
+
+                                for h in 0..block.harmonic_ns.len() {
+                                    // Gradient step
+                                    block.harmonic_ns[h] -= (current_lr as f32) * d_hr[h];
+                                    // Spring pull toward equilibrium
+                                    let eq = eq_fn(h);
+                                    block.harmonic_ns[h] -= (current_lr as f32) * spring_k_harm * (block.harmonic_ns[h] - eq);
+                                }
+
+                                // Sync: harmonic_ns = softplus(harmonic_raws)
+                                // Since harmonic_ns stores the raw values (confusing name, but matches CPU tier),
+                                // and softplus is applied at use-time in wave_attention, no sync needed here.
+                                // The update above directly modifies the raw values.
+                            }
+
+                            // Clear caches to free memory
+                            block.cached_att_weights = None;
+                            block.cached_normed_cpu = None;
+                            block.cached_layer_output = None;
+                        }
+                    }
+
                     // Gradient clipping via LR scaling.
                     let mut gnorm_sq = 0.0f64;
                     for var in &varmap.all_vars() {
@@ -1529,12 +1703,9 @@ pub mod engine {
                     }
                 }
 
-                // Harmonics: on candle, attention runs on CPU so autograd can't trace
-                // through harmonic scoring. The CPU tier has manual backward (75 lines of
-                // chain rule through cos(h*delta), softmax, value projection).
-                // TODO: port the manual harmonic gradient from model_backward.rs to candle
-                // For now: --harmonics dyn is PARSED but harmonics stay frozen on candle.
-                // Use CPU/wgpu tier for --harmonics dyn experiments.
+                // Harmonics: gradient + spring already applied in the backward section above
+                // (after loss.backward(), before optimizer.step()).
+                // The spring here is redundant — harmonic spring is applied per-batch in the backward block.
 
                 // Per-group weight decay (when --wd dyn)
                 if use_wd_dyn {
@@ -1673,6 +1844,15 @@ pub mod engine {
                             let vals: Vec<String> = agc_headroom.iter().map(|v| format!("{:.2}", v)).collect();
                             s += &format!(r#","agc_headroom":[{}]"#, vals.join(","));
                         }
+                        if use_harmonics_dyn {
+                            fn softplus_t(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
+                            let mut parts = Vec::new();
+                            for (l, block) in model.blocks.iter().enumerate() {
+                                let vals: Vec<String> = block.harmonic_ns.iter().map(|&h| format!("{:.4}", softplus_t(h))).collect();
+                                parts.push(format!(r#"{{"L{}": [{}]}}"#, l, vals.join(",")));
+                            }
+                            s += &format!(r#","harmonics":[{}]"#, parts.join(","));
+                        }
                         s
                     };
 
@@ -1768,14 +1948,14 @@ pub mod engine {
                 let _ = varmap.save("candle_checkpoint_latest.safetensors");
                 std::fs::write("candle_checkpoint_latest.meta", &meta).ok();
 
-                let params = extract_wchk_params(&varmap, n_layers, n_embd, maestro_dim,
+                let params = extract_wchk_params(&varmap, &model, n_layers, n_embd, maestro_dim,
                     vocab_size, out_proj_groups, n_bands, phase_native,
-                    use_rk4_dyn, use_layer_scale_dyn, false);
+                    use_rk4_dyn, use_layer_scale_dyn, use_harmonics_dyn);
                 let dummy_adam = crate::train::Adam::new(lr as f32, params.len());
                 let mut ck_dims = crate::Dims::from_cli(n_bands, n_head, maestro_dim, 256, _rk4_steps)
                     .with_learnable_ode(true).with_corrector(true)
                     .with_rk4_weights(use_rk4_dyn).with_layer_scale(use_layer_scale_dyn);
-                ck_dims.use_dyn_harmonics = false;
+                ck_dims.use_dyn_harmonics = use_harmonics_dyn;
                 crate::wave_checkpoint::save_checkpoint(
                     &params, vocab_size, n_layers, out_proj_groups, iter + 1, lr as f32,
                     &dummy_adam, 0, "checkpoint.bin", ck_dims,
@@ -1876,7 +2056,7 @@ pub mod engine {
         Ok(())
     }
 
-    fn extract_wchk_params(varmap: &VarMap, n_layers: usize, n_embd: usize, maestro_dim: usize,
+    fn extract_wchk_params(varmap: &VarMap, model: &CandleWaveModel, n_layers: usize, n_embd: usize, maestro_dim: usize,
                             vocab_size: usize, out_proj_groups: usize, n_bands: usize,
                             phase_native: bool, use_rk4_dyn: bool, use_layer_scale: bool,
                             use_harmonics: bool) -> Vec<f32> {
@@ -1926,9 +2106,9 @@ pub mod engine {
                     params.extend(get_flat(&format!("{p}.ode.rk4_weights")));
                 }
             }
-            // Harmonics (if dynamic)
+            // Harmonics (if dynamic) — stored on CandleBlock, not in VarMap
             if use_harmonics {
-                // TODO: harmonics not yet in VarMap on candle
+                params.extend_from_slice(&model.blocks[i].harmonic_ns);
             }
         }
         // Layer scale
