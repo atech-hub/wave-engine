@@ -1,3 +1,9 @@
+pub mod candle_model;
+pub mod candle_forward;
+pub mod candle_attention;
+pub mod candle_train;
+pub mod candle_checkpoint;
+pub mod candle_monitors;
 pub mod engine;
 pub mod ode;
 pub mod block_diag;
