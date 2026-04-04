@@ -600,6 +600,7 @@ pub mod engine {
         output_corrector: Option<Tensor>,  // [1, n_bands] phase-native output corrector
         phase_native: bool,
         layer_agcs: Option<Vec<crate::common::agc::OdeAgc>>,  // per-layer AGC (when --agc-headroom dyn)
+        use_custom_op: bool,  // true = CustomOp ODE (no autograd graph, CPU backward)
 
         device: Device,
 
@@ -786,7 +787,7 @@ pub mod engine {
             };
 
             Ok(Self { wte, wpe, blocks, ln_f_w, ln_f_b, lm_head, output_corrector, phase_native,
-                layer_agcs: None, device: device.clone(),
+                layer_agcs: None, use_custom_op: false, device: device.clone(),
                 n_bands: n_bands_cfg, n_embd: n_embd_cfg, n_head: n_head_cfg, block_size: block_size_cfg, debug_nan: false })
         }
 
@@ -888,8 +889,29 @@ pub mod engine {
                     }
                 }
 
-                // ODE — GPU-native RK4, autograd-compatible
-                let ode_out = crate::gpu_ode::gpu_ode::kerr_ode_gpu(&precond, &block.gpu_ode_params)?;
+                // ODE — CustomOp (no autograd graph) or autograd (full graph)
+                let ode_out = if self.use_custom_op {
+                    let gamma_raw = block.gpu_ode_params.gamma_raw.flatten_all()?.to_vec1::<f32>()?;
+                    let omega = block.gpu_ode_params.omega.flatten_all()?.to_vec1::<f32>()?;
+                    let alpha_v = block.gpu_ode_params.alpha.flatten_all()?.to_vec1::<f32>()?[0];
+                    let beta_v = block.gpu_ode_params.beta.flatten_all()?.to_vec1::<f32>()?[0];
+                    let rk4_w = if let Some(ref w) = block.gpu_ode_params.rk4_w {
+                        let v = w.to_vec1::<f32>()?;
+                        [v[0], v[1], v[2], v[3]]
+                    } else {
+                        [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0]
+                    };
+                    let op = crate::candle_tier::custom_ode::custom_ode::KerrOdeCustomOp::new(
+                        gamma_raw, omega, alpha_v, beta_v, rk4_w,
+                        block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
+                    );
+                    // CustomOp runs on CPU — move tensor CPU→op→GPU
+                    let precond_cpu = precond.to_device(&candle_core::Device::Cpu)?;
+                    let ode_cpu = precond_cpu.apply_op1(op)?;
+                    ode_cpu.to_device(&self.device)?
+                } else {
+                    crate::gpu_ode::gpu_ode::kerr_ode_gpu(&precond, &block.gpu_ode_params)?
+                };
 
                 // Corrector plate: per-band phase rotation (autograd through sin/cos)
                 let effective_ode_out = {
@@ -1120,7 +1142,28 @@ pub mod engine {
                 // Capture precond norms before ODE
                 let precond_cpu = precond.to_vec2::<f32>()?;
 
-                let ode_out = crate::gpu_ode::gpu_ode::kerr_ode_gpu(&precond, &block.gpu_ode_params)?;
+                let ode_out = if self.use_custom_op {
+                    let gamma_raw = block.gpu_ode_params.gamma_raw.flatten_all()?.to_vec1::<f32>()?;
+                    let omega = block.gpu_ode_params.omega.flatten_all()?.to_vec1::<f32>()?;
+                    let alpha_v = block.gpu_ode_params.alpha.flatten_all()?.to_vec1::<f32>()?[0];
+                    let beta_v = block.gpu_ode_params.beta.flatten_all()?.to_vec1::<f32>()?[0];
+                    let rk4_w = if let Some(ref w) = block.gpu_ode_params.rk4_w {
+                        let v = w.to_vec1::<f32>()?;
+                        [v[0], v[1], v[2], v[3]]
+                    } else {
+                        [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0]
+                    };
+                    let op = crate::candle_tier::custom_ode::custom_ode::KerrOdeCustomOp::new(
+                        gamma_raw, omega, alpha_v, beta_v, rk4_w,
+                        block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
+                    );
+                    // CustomOp runs on CPU — move tensor CPU→op→GPU
+                    let precond_cpu = precond.to_device(&candle_core::Device::Cpu)?;
+                    let ode_cpu = precond_cpu.apply_op1(op)?;
+                    ode_cpu.to_device(&self.device)?
+                } else {
+                    crate::gpu_ode::gpu_ode::kerr_ode_gpu(&precond, &block.gpu_ode_params)?
+                };
 
                 // Capture ode_out norms after ODE
                 let ode_out_cpu = ode_out.to_vec2::<f32>()?;
@@ -1304,6 +1347,7 @@ pub mod engine {
             std::env::args().skip_while(|a| a != "--wd").nth(1).map_or(false, |s| s == "dyn");
         let use_agc_headroom_dyn = std::env::args().any(|a| a == "--agc-headroom") &&
             std::env::args().skip_while(|a| a != "--agc-headroom").nth(1).map_or(false, |s| s == "dyn");
+        let use_custom_op = std::env::args().any(|a| a == "--custom-op");
 
         // Model
         let mut varmap = VarMap::new();
@@ -1311,6 +1355,11 @@ pub mod engine {
             n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups, alpha, beta)?;
         model.debug_nan = debug_nan;
         model.phase_native = phase_native;
+        model.use_custom_op = use_custom_op;
+        if use_custom_op {
+            crate::candle_tier::custom_ode::custom_ode::init_param_grad_storage(n_layers);
+            println!("  CustomOp: ODE backward via CPU (no autograd graph)");
+        }
         // Wire dynamic params
         if use_rk4_dyn {
             for i in 0..model.blocks.len() {
@@ -1637,6 +1686,50 @@ pub mod engine {
             }
 
             total_loss /= batch_size as f32;
+
+            // CustomOp: apply ODE param gradients manually (they bypass autograd)
+            if use_custom_op {
+                let data = varmap.data().lock().unwrap();
+                for layer in 0..n_layers {
+                    if let Some(og) = crate::candle_tier::custom_ode::custom_ode::take_param_grads(layer) {
+                        // Apply gradient to gamma_raw
+                        let key = format!("block.{layer}.ode.gamma_raw");
+                        if let Some(var) = data.get(&key) {
+                            let current = var.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                            let updated: Vec<f32> = current.iter().zip(&og.d_gamma_raw)
+                                .map(|(&c, &g)| c - current_lr as f32 * g)
+                                .collect();
+                            let _ = var.set(&Tensor::from_vec(updated, var.shape(), var.device()).unwrap());
+                        }
+                        // Apply gradient to alpha
+                        let key = format!("block.{layer}.ode.alpha");
+                        if let Some(var) = data.get(&key) {
+                            let c = var.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0];
+                            let updated = (c - current_lr as f32 * og.d_alpha).clamp(0.01, 0.5);
+                            let _ = var.set(&Tensor::from_slice(&[updated], (1, 1), var.device()).unwrap());
+                        }
+                        // Apply gradient to beta
+                        let key = format!("block.{layer}.ode.beta");
+                        if let Some(var) = data.get(&key) {
+                            let c = var.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0];
+                            let updated = (c - current_lr as f32 * og.d_beta).clamp(0.01, 1.0);
+                            let _ = var.set(&Tensor::from_slice(&[updated], (1, 1), var.device()).unwrap());
+                        }
+                        // Apply gradient to rk4_weights (if dynamic)
+                        if use_rk4_dyn {
+                            let key = format!("block.{layer}.ode.rk4_weights");
+                            if let Some(var) = data.get(&key) {
+                                let current = var.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                let updated: Vec<f32> = current.iter().zip(&og.d_rk4_weights)
+                                    .map(|(&c, &g)| c - current_lr as f32 * g)
+                                    .collect();
+                                let _ = var.set(&Tensor::from_vec(updated, var.shape(), var.device()).unwrap());
+                            }
+                        }
+                    }
+                }
+                drop(data);
+            }
 
             // Spring regulation on dynamic params (after optimizer step, like CPU tier)
             // param -= lr * k * (param - equilibrium)
