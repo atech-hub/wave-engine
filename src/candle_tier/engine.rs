@@ -1083,18 +1083,71 @@ pub mod engine {
                 .map(|(free, total)| (total - free) / (1024 * 1024))
                 .unwrap_or(0);
 
-            // JSONL telemetry — with AGC diagnostics every 100 iters
+            // JSONL telemetry — with AGC diagnostics every 100 iters + monitors at health interval
+            let health_interval: usize = parse_flag_c("--health-interval", 0);
+            let measure_monitors = health_interval > 0 && iter % health_interval == 0;
+
             if let Some(ref mut writer) = log_writer {
                 use std::io::Write;
                 if iter % 100 == 0 {
-                    // AGC + ODE stats from shared FFN module
+                    // AGC + ODE stats
                     let clamp_count = crate::ffn_backend::ODE_CLAMP_COUNT.load(std::sync::atomic::Ordering::Relaxed);
                     let max_mag = f32::from_bits(crate::ffn_backend::ODE_MAX_MAG.load(std::sync::atomic::Ordering::Relaxed));
                     let agc = crate::ffn_backend::agc_stats();
+
+                    // ODE coupling values from VarMap
+                    let ode_str = {
+                        let data = varmap.data().lock().unwrap();
+                        let mut parts = Vec::new();
+                        for l in 0..n_layers {
+                            let a = data.get(&format!("block.{l}.ode.alpha")).map(|v| v.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0]).unwrap_or(alpha);
+                            let b = data.get(&format!("block.{l}.ode.beta")).map(|v| v.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0]).unwrap_or(beta);
+                            let g = data.get(&format!("block.{l}.ode.gamma_raw")).map(|v| {
+                                let vals = v.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                let sp = |x: f32| -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } };
+                                vals.iter().map(|&x| sp(x)).sum::<f32>() / vals.len() as f32
+                            }).unwrap_or(0.1);
+                            parts.push(format!(r#"{{"a":{:.4},"b":{:.4},"g":{:.4}}}"#, a, b, g));
+                        }
+                        format!(r#","ode_params":[{}]"#, parts.join(","))
+                    };
+
+                    // Dynamic param values
+                    let dyn_str = {
+                        let mut s = String::new();
+                        if use_layer_scale_dyn {
+                            let data = varmap.data().lock().unwrap();
+                            let vals: Vec<String> = (0..n_layers).map(|l| {
+                                data.get(&format!("block.{l}.layer_scale")).map(|v| format!("{:.4}", v.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0])).unwrap_or("1.0000".to_string())
+                            }).collect();
+                            s += &format!(r#","layer_scale":[{}]"#, vals.join(","));
+                        }
+                        if use_rk4_dyn {
+                            let data = varmap.data().lock().unwrap();
+                            let mut parts = Vec::new();
+                            for l in 0..n_layers {
+                                if let Some(v) = data.get(&format!("block.{l}.ode.rk4_weights")) {
+                                    let w = v.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                    parts.push(format!(r#"{{"L{}": [{:.4},{:.4},{:.4},{:.4}]}}"#, l, w[0], w[1], w[2], w[3]));
+                                }
+                            }
+                            if !parts.is_empty() { s += &format!(r#","rk4_weights":[{}]"#, parts.join(",")); }
+                        }
+                        if use_wd_dyn {
+                            let vals: Vec<String> = wd_scale.iter().map(|v| format!("{:.4}", v)).collect();
+                            s += &format!(r#","wd_scale":[{}]"#, vals.join(","));
+                        }
+                        if use_agc_headroom_dyn {
+                            let vals: Vec<String> = agc_headroom.iter().map(|v| format!("{:.2}", v)).collect();
+                            s += &format!(r#","agc_headroom":[{}]"#, vals.join(","));
+                        }
+                        s
+                    };
+
                     let _ = writeln!(writer,
-                        "{{\"iter\":{},\"loss\":{:.4},\"lr\":{:.6},\"time_ms\":{},\"vram_mb\":{},\"nan_skips\":{},\"ode_clamps\":{},\"ode_max_mag\":{:.2},\"agc_threshold\":{:.3},\"agc_mean\":{:.3},\"agc_std\":{:.3}}}",
+                        "{{\"iter\":{},\"loss\":{:.4},\"lr\":{:.6},\"time_ms\":{},\"vram_mb\":{},\"nan_skips\":{},\"ode_clamps\":{},\"ode_max_mag\":{:.2},\"agc_threshold\":{:.3},\"agc_mean\":{:.3},\"agc_std\":{:.3}{}{}}}",
                         iter, total_loss, current_lr, iter_time.as_millis(), vram_used_mb, nan_skip_count,
-                        clamp_count, max_mag, agc.threshold, agc.ema_mean, agc.ema_std
+                        clamp_count, max_mag, agc.threshold, agc.ema_mean, agc.ema_std, ode_str, dyn_str
                     );
                 } else {
                     let _ = writeln!(writer,
@@ -1102,6 +1155,31 @@ pub mod engine {
                         iter, total_loss, current_lr, iter_time.as_millis(), vram_used_mb, nan_skip_count
                     );
                 }
+
+                // Monitor suite at health intervals
+                if measure_monitors {
+                    // Throughput
+                    let tok_s = (batch_size * seq_len) as f32 / iter_time.as_secs_f32().max(0.001);
+                    let iter_s = 1.0 / iter_time.as_secs_f32().max(0.001);
+                    let _ = writeln!(writer,
+                        r#"{{"iter":{},"type":"monitor","throughput":{{"tok_s":{:.0},"iter_s":{:.1},"fwd_ms":{},"vram_mb":{}}}}}"#,
+                        iter, tok_s, iter_s, iter_time.as_millis(), vram_used_mb
+                    );
+
+                    // Embedding space (static — same analysis as CPU)
+                    let embed_stats = crate::common::embedding_monitor::analyze_embeddings(&crate::WavePacketModel {
+                        wte: model.wte.to_vec2::<f32>().unwrap_or_default(),
+                        wpe: vec![], blocks: vec![], ln_f: crate::model::LayerNormWeights { weight: vec![], bias: vec![] },
+                        lm_head: vec![], lm_down: vec![], lm_up: vec![], lm_rank: 0, vocab_size,
+                        tied_temperature: 1.0, wd_state: None, learnable_ode: false,
+                        use_rk4_weights: false, use_dyn_harmonics: false, layer_scale: vec![], use_layer_scale: false,
+                        lr_scale: vec![], use_lr_scale: false, wd_scale: vec![], agc_headroom: vec![],
+                        phase_native: false, output_corrector: vec![],
+                    });
+                    let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#,
+                        iter, crate::common::embedding_monitor::to_json(&embed_stats));
+                }
+
                 let _ = writer.flush();
             }
 
