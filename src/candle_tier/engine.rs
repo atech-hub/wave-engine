@@ -216,7 +216,8 @@ pub mod engine {
 
         for head in 0..n_head {
             let offset = head * head_dim;
-            let harmonic_n = harmonic_ns[head];
+            fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
+            let harmonic_n = softplus(harmonic_ns[head]);
 
             // Phase projection — from CPU cache, zero GPU transfers
             let pp_w = &pp_ws_cpu[head];
@@ -303,7 +304,8 @@ pub mod engine {
         phase_proj_bs: Vec<Tensor>,
         v_proj_ws: Vec<Tensor>,
         v_proj_bs: Vec<Tensor>,
-        harmonic_ns: Vec<f32>,
+        harmonic_ns: Vec<f32>,   // harmonic_raw values (softplus before use in scoring)
+        harmonic_init: Vec<f32>, // initial values (for spring equilibrium)
         attn_out_proj_w: Tensor,
         attn_out_proj_b: Tensor,
 
@@ -429,6 +431,7 @@ pub mod engine {
                     ln_w, ln_b,
                     phase_proj_ws, phase_proj_bs, v_proj_ws, v_proj_bs,
                     phase_proj_ws_cpu, phase_proj_bs_cpu, v_proj_ws_cpu, v_proj_bs_cpu,
+                    harmonic_init: harmonic_ns.clone(),
                     harmonic_ns, attn_out_proj_w, attn_out_proj_b,
                     mae_in_sq, mae_in_pr, ode_params, gpu_ode_params, phase_correction,
                     mae_out_sq, mae_out_pr, out_proj,
@@ -953,8 +956,14 @@ pub mod engine {
                     }
                 }
 
+                // Harmonics: on candle, attention runs on CPU so autograd can't trace
+                // through harmonic scoring. The CPU tier has manual backward (75 lines of
+                // chain rule through cos(h*delta), softmax, value projection).
+                // TODO: port the manual harmonic gradient from model_backward.rs to candle
+                // For now: --harmonics dyn is PARSED but harmonics stay frozen on candle.
+                // Use CPU/wgpu tier for --harmonics dyn experiments.
+
                 // Layer scale spring: eq=1.0, k=1.0 — not yet in candle model
-                // Harmonics spring: eq=initial, k=2.0 — not yet in candle model
 
                 drop(data);
             }
