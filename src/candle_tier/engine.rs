@@ -633,7 +633,7 @@ pub mod engine {
         data_path: &str, n_iters: usize,
         n_bands: usize, n_head: usize, n_layers: usize,
         maestro_dim: usize, _rk4_steps: usize, out_proj_groups: usize,
-        debug_nan: bool, alpha: f32, beta: f32,
+        debug_nan: bool, alpha: f32, beta: f32, phase_native: bool,
     ) -> Result<()> {
         // Runtime config — lowercase variables used throughout
         let n_embd = n_bands * 2;
@@ -687,6 +687,15 @@ pub mod engine {
         let mut model = CandleWaveModel::new(&varmap, vocab_size, &device,
             n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups, alpha, beta)?;
         model.debug_nan = debug_nan;
+        model.phase_native = phase_native;
+        if phase_native {
+            // Create output corrector in VarMap
+            let vs = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            model.output_corrector = Some(vs.get_with_hints(
+                (1, n_bands), "output_corrector", candle_nn::Init::Const(0.0),
+            )?);
+            println!("  Phase-native: dot product against embeddings (zero decoder params)");
+        }
         if debug_nan { println!("  [debug-nan] Per-layer NaN detection ENABLED (~6x slower)"); }
         let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
         println!("  Trainable params: {n_params}");
@@ -989,7 +998,7 @@ pub mod engine {
 // Stub when candle feature is not enabled
 #[cfg(not(feature = "candle-backend"))]
 pub mod engine {
-    pub fn train_candle(_data_path: &str, _n_iters: usize, _n_bands: usize, _n_head: usize, _n_layers: usize, _maestro_dim: usize, _rk4_steps: usize, _out_proj_groups: usize, _debug_nan: bool, _alpha: f32, _beta: f32) -> std::result::Result<(), String> {
+    pub fn train_candle(_data_path: &str, _n_iters: usize, _n_bands: usize, _n_head: usize, _n_layers: usize, _maestro_dim: usize, _rk4_steps: usize, _out_proj_groups: usize, _debug_nan: bool, _alpha: f32, _beta: f32, _phase_native: bool) -> std::result::Result<(), String> {
         Err("Candle backend not enabled. Build with: cargo run --release --features candle-backend".to_string())
     }
 }
