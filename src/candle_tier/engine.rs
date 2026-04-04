@@ -267,6 +267,216 @@ pub mod engine {
         Ok(projected)
     }
 
+    // ─── Monitor data collected during forward ───
+
+    /// Per-layer flow statistics (norms, ratios, cosine similarity).
+    struct CandleLayerFlow {
+        layer: usize,
+        input_norm: f32,
+        attn_out_norm: f32,
+        ffn_out_norm: f32,
+        output_norm: f32,
+        attn_ratio: f32,
+        ffn_ratio: f32,
+        residual_ratio: f32,
+        cosine_in_out: f32,
+    }
+
+    /// Per-head attention statistics.
+    struct CandleAttnHead {
+        layer: usize,
+        head: usize,
+        harmonic: f32,
+        entropy: f32,
+        max_weight: f32,
+    }
+
+    /// Per-layer ODE dynamics statistics.
+    struct CandleOdeDynamics {
+        layer: usize,
+        energy_in: f32,
+        energy_out: f32,
+        energy_ratio: f32,
+        phase_velocity: f32,
+        damping: f32,
+        band_energy_std: f32,
+    }
+
+    /// Monitor data collected during one forward pass.
+    #[derive(Default)]
+    struct CandleMonitorData {
+        layer_flow: Vec<CandleLayerFlow>,
+        attn_heads: Vec<CandleAttnHead>,
+        ode_dynamics: Vec<CandleOdeDynamics>,
+    }
+
+    impl CandleMonitorData {
+        fn layer_flow_json(&self) -> String {
+            if self.layer_flow.is_empty() { return String::new(); }
+            let entries: Vec<String> = self.layer_flow.iter().map(|s| {
+                format!(
+                    r#"{{"layer":{},"in_norm":{:.3},"attn_norm":{:.3},"ffn_norm":{:.3},"out_norm":{:.3},"attn_ratio":{:.3},"ffn_ratio":{:.3},"resid_ratio":{:.3},"cos_in_out":{:.4}}}"#,
+                    s.layer, s.input_norm, s.attn_out_norm, s.ffn_out_norm, s.output_norm,
+                    s.attn_ratio, s.ffn_ratio, s.residual_ratio, s.cosine_in_out,
+                )
+            }).collect();
+            format!(r#""layer_flow":[{}]"#, entries.join(","))
+        }
+
+        fn attn_heads_json(&self) -> String {
+            if self.attn_heads.is_empty() { return String::new(); }
+            let entries: Vec<String> = self.attn_heads.iter().map(|s| {
+                format!(
+                    r#"{{"layer":{},"head":{},"harmonic":{:.3},"entropy":{:.3},"max_w":{:.4}}}"#,
+                    s.layer, s.head, s.harmonic, s.entropy, s.max_weight,
+                )
+            }).collect();
+            format!(r#""attn_heads":[{}]"#, entries.join(","))
+        }
+
+        fn ode_dynamics_json(&self) -> String {
+            if self.ode_dynamics.is_empty() { return String::new(); }
+            let entries: Vec<String> = self.ode_dynamics.iter().map(|s| {
+                format!(
+                    r#"{{"layer":{},"phase_vel":{:.4},"energy_in":{:.2},"energy_out":{:.2},"energy_ratio":{:.4},"band_std":{:.4},"damping":{:.4}}}"#,
+                    s.layer, s.phase_velocity, s.energy_in, s.energy_out,
+                    s.energy_ratio, s.band_energy_std, s.damping,
+                )
+            }).collect();
+            format!(r#""ode_dynamics":[{}]"#, entries.join(","))
+        }
+    }
+
+    /// Output distribution statistics (computed from logits + targets).
+    struct CandleOutputDist {
+        avg_entropy: f32,
+        avg_margin: f32,
+        avg_correct_rank: f32,
+        worst_margin: f32,
+        worst_pos: usize,
+        mode_collapse: bool,
+    }
+
+    fn compute_output_dist(logits: &Tensor, targets: &[usize]) -> CandleOutputDist {
+        let logits_cpu = match logits.to_vec2::<f32>() {
+            Ok(v) => v,
+            Err(_) => return CandleOutputDist {
+                avg_entropy: 0.0, avg_margin: 0.0, avg_correct_rank: 0.0,
+                worst_margin: 0.0, worst_pos: 0, mode_collapse: false,
+            },
+        };
+        let stats = crate::common::output_monitor::analyze_output(&logits_cpu, targets);
+        CandleOutputDist {
+            avg_entropy: stats.avg_entropy,
+            avg_margin: stats.avg_margin,
+            avg_correct_rank: stats.avg_correct_rank,
+            worst_margin: stats.worst_margin,
+            worst_pos: stats.worst_prompt_pos,
+            mode_collapse: stats.mode_collapse,
+        }
+    }
+
+    fn output_dist_json(s: &CandleOutputDist) -> String {
+        format!(
+            r#""output_dist":{{"avg_entropy":{:.3},"avg_margin":{:.4},"avg_correct_rank":{:.1},"worst_margin":{:.4},"worst_pos":{},"mode_collapse":{}}}"#,
+            s.avg_entropy, s.avg_margin, s.avg_correct_rank,
+            s.worst_margin, s.worst_pos, s.mode_collapse,
+        )
+    }
+
+    /// Per-layer gradient flow statistics.
+    struct CandleGradientFlow {
+        layer: usize,
+        ln_norm: f32,
+        maestro_in_norm: f32,
+        ode_norm: f32,
+        maestro_out_norm: f32,
+        out_proj_norm: f32,
+    }
+
+    fn compute_gradient_flow(
+        grads: &candle_core::backprop::GradStore,
+        varmap: &VarMap,
+        n_layers: usize,
+    ) -> Vec<CandleGradientFlow> {
+        let data = varmap.data().lock().unwrap();
+        let mut stats = Vec::with_capacity(n_layers);
+
+        for layer in 0..n_layers {
+            let prefix = format!("block.{layer}.");
+
+            let grad_norm_for = |suffix: &str| -> f32 {
+                let key = format!("{prefix}{suffix}");
+                if let Some(var) = data.get(&key) {
+                    if let Some(g) = grads.get(var) {
+                        let flat: Vec<f32> = g.flatten_all().unwrap().to_vec1::<f32>().unwrap_or_default();
+                        return flat.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    }
+                }
+                0.0
+            };
+
+            // LN: combine attn LN weight + bias
+            let ln_w = grad_norm_for("ln_w");
+            let ln_b = grad_norm_for("ln_b");
+            let ln_norm = (ln_w * ln_w + ln_b * ln_b).sqrt();
+
+            // Maestro in: squeeze + process
+            let mi_sw = grad_norm_for("mae_in_sq.weight");
+            let mi_sb = grad_norm_for("mae_in_sq.bias");
+            let mi_pw = grad_norm_for("mae_in_pr.weight");
+            let mi_pb = grad_norm_for("mae_in_pr.bias");
+            let maestro_in_norm = (mi_sw*mi_sw + mi_sb*mi_sb + mi_pw*mi_pw + mi_pb*mi_pb).sqrt();
+
+            // Maestro out
+            let mo_sw = grad_norm_for("mae_out_sq.weight");
+            let mo_sb = grad_norm_for("mae_out_sq.bias");
+            let mo_pw = grad_norm_for("mae_out_pr.weight");
+            let mo_pb = grad_norm_for("mae_out_pr.bias");
+            let maestro_out_norm = (mo_sw*mo_sw + mo_sb*mo_sb + mo_pw*mo_pw + mo_pb*mo_pb).sqrt();
+
+            // ODE params: alpha, beta, gamma_raw, phase_correction
+            let ode_a = grad_norm_for("ode.alpha");
+            let ode_b = grad_norm_for("ode.beta");
+            let ode_g = grad_norm_for("ode.gamma_raw");
+            let ode_pc = grad_norm_for("phase_correction");
+            let ode_rk4 = grad_norm_for("ode.rk4_weights");
+            let ode_norm = (ode_a*ode_a + ode_b*ode_b + ode_g*ode_g + ode_pc*ode_pc + ode_rk4*ode_rk4).sqrt();
+
+            // Out proj (block-diagonal groups)
+            let mut op_sq = 0.0f32;
+            for g in 0..16 { // enough groups for any config
+                let w = grad_norm_for(&format!("out_proj.g{g}.weight"));
+                let b = grad_norm_for(&format!("out_proj.g{g}.bias"));
+                op_sq += w * w + b * b;
+            }
+            let out_proj_norm = op_sq.sqrt();
+
+            stats.push(CandleGradientFlow {
+                layer,
+                ln_norm,
+                maestro_in_norm,
+                ode_norm,
+                maestro_out_norm,
+                out_proj_norm,
+            });
+        }
+
+        stats
+    }
+
+    fn gradient_flow_json(stats: &[CandleGradientFlow]) -> String {
+        if stats.is_empty() { return String::new(); }
+        let entries: Vec<String> = stats.iter().map(|s| {
+            format!(
+                r#"{{"layer":{},"ln":{:.4},"maestro_in":{:.4},"ode":{:.4},"maestro_out":{:.4},"out_proj":{:.4}}}"#,
+                s.layer, s.ln_norm, s.maestro_in_norm, s.ode_norm,
+                s.maestro_out_norm, s.out_proj_norm,
+            )
+        }).collect();
+        format!(r#""grad_flow":[{}]"#, entries.join(","))
+    }
+
     // ─── Model ───
 
     pub struct CandleWaveModel {
@@ -639,6 +849,293 @@ pub mod engine {
 
             Ok(logits)
         }
+
+        /// Forward pass with monitor data collection.
+        /// Same logic as forward_with_curriculum, but captures per-layer norms,
+        /// attention stats, and ODE dynamics. Only called at health intervals.
+        fn forward_with_monitors(
+            &mut self, token_ids: &[usize], band_masks: &[f32],
+        ) -> Result<(Tensor, CandleMonitorData)> {
+            let n_bands = self.n_bands;
+            let n_embd = self.n_embd;
+            let n_head = self.n_head;
+            let _block_size = self.block_size;
+            let n_pos = token_ids.len();
+            let mut monitor = CandleMonitorData::default();
+
+            // Build GPU-resident mask from per-band values
+            let ffn_mask = if band_masks.iter().any(|&v| v < 1.0) {
+                let mut mask_data = vec![0.0f32; n_embd];
+                for k in 0..n_bands {
+                    mask_data[k * 2] = band_masks[k];
+                    mask_data[k * 2 + 1] = band_masks[k];
+                }
+                Some(Tensor::from_vec(mask_data, (1, n_embd), &self.device)?)
+            } else {
+                None
+            };
+
+            // Embedding
+            let mut hidden_vecs = vec![0.0f32; n_pos * n_embd];
+            let wte_data = self.wte.to_vec2::<f32>()?;
+            let wpe_data = self.wpe.to_vec2::<f32>()?;
+            for (pos, &tok) in token_ids.iter().enumerate() {
+                for i in 0..n_embd {
+                    hidden_vecs[pos * n_embd + i] = wte_data[tok][i] + wpe_data[pos][i];
+                }
+            }
+            let mut hidden = Tensor::from_vec(hidden_vecs, (n_pos, n_embd), &self.device)?;
+
+            for (block_idx, block) in self.blocks.iter().enumerate() {
+                let normed = layer_norm(&hidden, &block.ln_w, &block.ln_b)?;
+
+                // ── Attention (with per-head monitoring) ──
+                // Run wave_attention on CPU, also extract per-head entropy/max_weight
+                let x_data = normed.to_vec2::<f32>()?;
+                let head_dim = n_embd / n_head;
+                let mut attn_out_data = vec![0.0f32; n_pos * n_embd];
+
+                for head in 0..n_head {
+                    let offset = head * head_dim;
+                    fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
+                    let harmonic_n = softplus(block.harmonic_ns[head]);
+
+                    let pp_w = &block.phase_proj_ws_cpu[head];
+                    let pp_b = &block.phase_proj_bs_cpu[head];
+                    let phases: Vec<f32> = (0..n_pos).map(|pos| {
+                        let mut r = pp_b[0];
+                        let mut s = pp_b[1];
+                        for j in 0..n_embd { r += pp_w[0][j] * x_data[pos][j]; s += pp_w[1][j] * x_data[pos][j]; }
+                        s.atan2(r)
+                    }).collect();
+
+                    let vw = &block.v_proj_ws_cpu[head];
+                    let vb = &block.v_proj_bs_cpu[head];
+                    let v_all: Vec<Vec<f32>> = (0..n_pos).map(|pos| {
+                        let mut v = vec![0.0f32; head_dim];
+                        for d in 0..head_dim {
+                            let mut sum = 0.0f32;
+                            for j in 0..head_dim { sum += vw[d][j] * x_data[pos][offset + j]; }
+                            v[d] = sum + vb[d];
+                        }
+                        v
+                    }).collect();
+
+                    // Track attention stats from the last query position
+                    let last_qi = n_pos.saturating_sub(1);
+                    let mut head_entropy = 0.0f32;
+                    let mut head_max_weight = 0.0f32;
+
+                    for qi in 0..n_pos {
+                        let mut scores = vec![f32::NEG_INFINITY; n_pos];
+                        for ki in 0..=qi {
+                            let delta = phases[qi] - phases[ki];
+                            scores[ki] = (harmonic_n * delta).cos();
+                        }
+                        let max_s = scores[..=qi].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let mut exp_sum = 0.0f32;
+                        for ki in 0..=qi { scores[ki] = (scores[ki] - max_s).exp(); exp_sum += scores[ki]; }
+                        if exp_sum > 0.0 { for ki in 0..=qi { scores[ki] /= exp_sum; } }
+
+                        // Capture stats for last position
+                        if qi == last_qi {
+                            for ki in 0..=qi {
+                                let w = scores[ki];
+                                if w > head_max_weight { head_max_weight = w; }
+                                if w > 0.0 { head_entropy -= w * w.ln(); }
+                            }
+                        }
+
+                        for d in 0..head_dim {
+                            let mut sum = 0.0f32;
+                            for ki in 0..=qi { sum += scores[ki] * v_all[ki][d]; }
+                            attn_out_data[qi * n_embd + offset + d] = sum;
+                        }
+                    }
+
+                    monitor.attn_heads.push(CandleAttnHead {
+                        layer: block_idx,
+                        head,
+                        harmonic: harmonic_n,
+                        entropy: head_entropy,
+                        max_weight: head_max_weight,
+                    });
+                }
+
+                let attn_out_tensor = Tensor::from_vec(attn_out_data, (n_pos, n_embd), &self.device)?;
+                let attn_out = attn_out_tensor.matmul(&block.attn_out_proj_w.t()?)?.broadcast_add(&block.attn_out_proj_b)?;
+
+                // ── FFN path ──
+                let ffn_input = match &ffn_mask {
+                    Some(mask) => normed.broadcast_mul(mask)?,
+                    None => normed.clone(),
+                };
+
+                let mae_in = block.mae_in_sq.forward(&ffn_input)?;
+                let mae_in = mae_in.gelu()?;
+                let mae_in = block.mae_in_pr.forward(&mae_in)?;
+                let precond = (&ffn_input + &mae_in)?;
+
+                // AGC
+                let precond = {
+                    let mut pv: Vec<Vec<f32>> = precond.to_vec2()?;
+                    let nb = pv[0].len() / 2;
+                    if let Some(ref mut agcs) = self.layer_agcs {
+                        agcs[block_idx].process(&mut pv, nb);
+                    } else {
+                        let mut agc = crate::ffn_backend::AGC.get().unwrap().lock().unwrap();
+                        agc.process(&mut pv, nb);
+                    }
+                    candle_core::Tensor::new(pv, precond.device())?
+                };
+
+                // ── ODE with monitoring ──
+                // Capture precond norms before ODE
+                let precond_cpu = precond.to_vec2::<f32>()?;
+
+                let ode_out = crate::gpu_ode::gpu_ode::kerr_ode_gpu(&precond, &block.gpu_ode_params)?;
+
+                // Capture ode_out norms after ODE
+                let ode_out_cpu = ode_out.to_vec2::<f32>()?;
+
+                // ODE dynamics: use first position
+                if !precond_cpu.is_empty() && !ode_out_cpu.is_empty() {
+                    let pre = &precond_cpu[0];
+                    let out = &ode_out_cpu[0];
+                    let nb = n_bands.min(pre.len() / 2).min(out.len() / 2);
+
+                    let mut phase_vel_sum = 0.0f32;
+                    let mut energy_in = 0.0f32;
+                    let mut energy_out = 0.0f32;
+                    let mut band_energies = Vec::with_capacity(nb);
+
+                    for k in 0..nb {
+                        let r_in = pre[2 * k];
+                        let s_in = pre[2 * k + 1];
+                        let r_out = out[2 * k];
+                        let s_out = out[2 * k + 1];
+
+                        let phase_in = s_in.atan2(r_in);
+                        let phase_out = s_out.atan2(r_out);
+                        let mut d_phase = phase_out - phase_in;
+                        if d_phase > std::f32::consts::PI { d_phase -= 2.0 * std::f32::consts::PI; }
+                        if d_phase < -std::f32::consts::PI { d_phase += 2.0 * std::f32::consts::PI; }
+                        phase_vel_sum += d_phase.abs();
+
+                        energy_in += r_in * r_in + s_in * s_in;
+                        let e_out = r_out * r_out + s_out * s_out;
+                        energy_out += e_out;
+                        band_energies.push(e_out);
+                    }
+
+                    let phase_velocity = if nb > 0 { phase_vel_sum / nb as f32 } else { 0.0 };
+                    let energy_ratio = if energy_in > 1e-12 { energy_out / energy_in } else { 1.0 };
+                    let damping = 1.0 - energy_ratio;
+                    let band_energy_std = if nb > 1 {
+                        let mean_e = energy_out / nb as f32;
+                        let var: f32 = band_energies.iter().map(|&e| (e - mean_e) * (e - mean_e)).sum::<f32>() / nb as f32;
+                        var.sqrt()
+                    } else { 0.0 };
+
+                    monitor.ode_dynamics.push(CandleOdeDynamics {
+                        layer: block_idx, energy_in, energy_out, energy_ratio,
+                        phase_velocity, damping, band_energy_std,
+                    });
+                }
+
+                // Corrector plate
+                let effective_ode_out = {
+                    let n_b = self.n_bands;
+                    let reshaped = ode_out.reshape((n_pos, n_b, 2))?;
+                    let r = reshaped.narrow(2, 0, 1)?.squeeze(2)?;
+                    let s = reshaped.narrow(2, 1, 1)?.squeeze(2)?;
+                    let cos_c = block.phase_correction.cos()?;
+                    let sin_c = block.phase_correction.sin()?;
+                    let r_rot = (r.broadcast_mul(&cos_c)? - s.broadcast_mul(&sin_c)?)?;
+                    let s_rot = (r.broadcast_mul(&sin_c)? + s.broadcast_mul(&cos_c)?)?;
+                    let r_exp = r_rot.unsqueeze(2)?;
+                    let s_exp = s_rot.unsqueeze(2)?;
+                    Tensor::cat(&[&r_exp, &s_exp], 2)?.reshape((n_pos, n_embd))?
+                };
+
+                let mae_out = block.mae_out_sq.forward(&effective_ode_out)?;
+                let mae_out = mae_out.gelu()?;
+                let mae_out = block.mae_out_pr.forward(&mae_out)?;
+                let regulated = (&effective_ode_out + &mae_out)?;
+                let ffn_out = block.out_proj.forward(&regulated)?;
+
+                // ── Layer flow monitoring ──
+                // Use last position norms on CPU
+                let hidden_cpu = hidden.to_vec2::<f32>()?;
+                let attn_out_cpu = attn_out.to_vec2::<f32>()?;
+                let ffn_out_cpu = ffn_out.to_vec2::<f32>()?;
+                let last = n_pos.saturating_sub(1);
+
+                let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
+                let dot_f = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(&x, &y)| x * y).sum::<f32>() };
+
+                let in_vec = &hidden_cpu[last];
+                let attn_vec = &attn_out_cpu[last];
+                let ffn_vec = &ffn_out_cpu[last];
+
+                let input_norm = l2(in_vec);
+                let attn_out_norm = l2(attn_vec);
+                let ffn_out_norm = l2(ffn_vec);
+
+                // Reconstruct output: input + attn + ffn (before layer_scale)
+                let out_vec: Vec<f32> = (0..n_embd).map(|j| in_vec[j] + attn_vec[j] + ffn_vec[j]).collect();
+                let output_norm = l2(&out_vec);
+                let inv_out = if output_norm > 1e-12 { 1.0 / output_norm } else { 0.0 };
+                let cosine_in_out = if input_norm > 1e-12 && output_norm > 1e-12 {
+                    dot_f(in_vec, &out_vec) / (input_norm * output_norm)
+                } else { 0.0 };
+
+                monitor.layer_flow.push(CandleLayerFlow {
+                    layer: block_idx,
+                    input_norm,
+                    attn_out_norm,
+                    ffn_out_norm,
+                    output_norm,
+                    attn_ratio: attn_out_norm * inv_out,
+                    ffn_ratio: ffn_out_norm * inv_out,
+                    residual_ratio: input_norm * inv_out,
+                    cosine_in_out,
+                });
+
+                // Residual connection
+                let contribution = (&attn_out + &ffn_out)?;
+                hidden = if let Some(ref scale) = block.layer_scale {
+                    (&hidden + contribution.broadcast_mul(scale)?)?
+                } else {
+                    (&hidden + &contribution)?
+                };
+            }
+
+            // Final LN + logits (same as forward_with_curriculum)
+            let normed = layer_norm(&hidden, &self.ln_f_w, &self.ln_f_b)?;
+            let logits = if self.phase_native {
+                if let Some(ref oc) = self.output_corrector {
+                    let n_b = self.n_bands;
+                    let reshaped = normed.reshape((n_pos, n_b, 2))?;
+                    let r = reshaped.narrow(2, 0, 1)?.squeeze(2)?;
+                    let s = reshaped.narrow(2, 1, 1)?.squeeze(2)?;
+                    let cos_c = oc.cos()?;
+                    let sin_c = oc.sin()?;
+                    let r_rot = (r.broadcast_mul(&cos_c)? - s.broadcast_mul(&sin_c)?)?;
+                    let s_rot = (r.broadcast_mul(&sin_c)? + s.broadcast_mul(&cos_c)?)?;
+                    let r_exp = r_rot.unsqueeze(2)?;
+                    let s_exp = s_rot.unsqueeze(2)?;
+                    let corrected = Tensor::cat(&[&r_exp, &s_exp], 2)?.reshape((n_pos, self.n_embd))?;
+                    corrected.matmul(&self.wte.t()?)?
+                } else {
+                    normed.matmul(&self.wte.t()?)?
+                }
+            } else {
+                normed.matmul(&self.lm_head.t()?)?
+            };
+
+            Ok((logits, monitor))
+        }
     }
 
     // ─── Training loop ───
@@ -890,65 +1387,86 @@ pub mod engine {
         };
 
         let train_start = Instant::now();
+        let health_interval: usize = parse_flag_c("--health-interval", 0);
 
         for iter in start_iter..total_iters {
             let band_masks = curriculum.band_masks(iter, total_iters, n_bands);
             let iter_start = Instant::now();
             let mut total_loss = 0.0f32;
+            let measure_monitors = health_interval > 0 && iter % health_interval == 0;
 
             let current_lr = cosine_lr(iter);
             optimizer.set_learning_rate(current_lr);
+
+            // Monitor data: captured on last batch of health-interval iterations
+            let mut fwd_monitor: Option<CandleMonitorData> = None;
+            let mut output_dist: Option<CandleOutputDist> = None;
+            let mut grad_flow: Option<Vec<CandleGradientFlow>> = None;
 
             for _b in 0..batch_size {
                 let start = (rng.next_u64() as usize) % (train_data.len() - seq_len - 1);
                 let input = &train_data[start..start + seq_len];
                 let target = &train_data[start + 1..start + seq_len + 1];
+                let is_monitor_batch = measure_monitors && _b == batch_size - 1;
 
-                // Explicit scope: all tensors dropped at block exit
-                let loss_val = {
-                    let logits = model.forward_with_curriculum(input, &band_masks)?;
-                    let target_tensor = Tensor::from_vec(
-                        target.to_vec().iter().map(|&t| t as u32).collect::<Vec<u32>>(),
-                        (seq_len,), &device,
-                    )?;
-                    let loss = candle_nn::loss::cross_entropy(&logits, &target_tensor)?;
-                    let lv = loss.to_scalar::<f32>()?;
-
-                    if lv.is_nan() || lv.is_infinite() {
-                        nan_skip_count += 1;
-                        eprintln!("  [NaN skip] iter {iter} batch {_b} (total skips: {nan_skip_count})");
-                        lv
-                    } else {
-                        let grads = loss.backward()?;
-                        // Gradient clipping via LR scaling.
-                        // Pull grad values to CPU for norm computation (no GPU intermediate tensors).
-                        let mut gnorm_sq = 0.0f64;
-                        for var in &varmap.all_vars() {
-                            if let Some(grad) = grads.get(var) {
-                                // to_vec1 works for 1D, use flatten for higher dims
-                                let g: Vec<f32> = grad.flatten_all()?.to_vec1::<f32>()?;
-                                for &v in &g { gnorm_sq += (v as f64) * (v as f64); }
-                            }
-                        }
-                        let gnorm = gnorm_sq.sqrt();
-                        if gnorm > 1.0 {
-                            optimizer.set_learning_rate(current_lr / gnorm);
-                            optimizer.step(&grads)?;
-                            optimizer.set_learning_rate(current_lr);
-                        } else {
-                            optimizer.step(&grads)?;
-                        }
-                        drop(grads);
-                        // Force CUDA to reclaim memory from optimizer intermediates.
-                        // Without this, CUDA's allocator caches freed blocks indefinitely,
-                        // growing ~30MB/iter until OOM. One line, zero leak.
-                        device.synchronize()?;
-                        lv
-                    }
+                // Use monitor-instrumented forward on last batch of health intervals
+                let (logits, monitor_opt) = if is_monitor_batch {
+                    let (l, m) = model.forward_with_monitors(input, &band_masks)?;
+                    (l, Some(m))
+                } else {
+                    (model.forward_with_curriculum(input, &band_masks)?, None)
                 };
+
+                // Output distribution monitor (from logits + targets, before loss)
+                if is_monitor_batch {
+                    output_dist = Some(compute_output_dist(&logits, target));
+                }
+
+                let target_tensor = Tensor::from_vec(
+                    target.to_vec().iter().map(|&t| t as u32).collect::<Vec<u32>>(),
+                    (seq_len,), &device,
+                )?;
+                let loss = candle_nn::loss::cross_entropy(&logits, &target_tensor)?;
+                let loss_val = loss.to_scalar::<f32>()?;
+
+                if loss_val.is_nan() || loss_val.is_infinite() {
+                    nan_skip_count += 1;
+                    eprintln!("  [NaN skip] iter {iter} batch {_b} (total skips: {nan_skip_count})");
+                } else {
+                    let grads = loss.backward()?;
+
+                    // Gradient flow monitor (from grads, before optimizer step)
+                    if is_monitor_batch {
+                        grad_flow = Some(compute_gradient_flow(&grads, &varmap, n_layers));
+                    }
+
+                    // Gradient clipping via LR scaling.
+                    let mut gnorm_sq = 0.0f64;
+                    for var in &varmap.all_vars() {
+                        if let Some(grad) = grads.get(var) {
+                            let g: Vec<f32> = grad.flatten_all()?.to_vec1::<f32>()?;
+                            for &v in &g { gnorm_sq += (v as f64) * (v as f64); }
+                        }
+                    }
+                    let gnorm = gnorm_sq.sqrt();
+                    if gnorm > 1.0 {
+                        optimizer.set_learning_rate(current_lr / gnorm);
+                        optimizer.step(&grads)?;
+                        optimizer.set_learning_rate(current_lr);
+                    } else {
+                        optimizer.step(&grads)?;
+                    }
+                    drop(grads);
+                    device.synchronize()?;
+                }
 
                 if !loss_val.is_nan() {
                     total_loss += loss_val;
+                }
+
+                // Stash forward monitor data
+                if let Some(m) = monitor_opt {
+                    fwd_monitor = Some(m);
                 }
             }
 
@@ -1084,9 +1602,6 @@ pub mod engine {
                 .unwrap_or(0);
 
             // JSONL telemetry — with AGC diagnostics every 100 iters + monitors at health interval
-            let health_interval: usize = parse_flag_c("--health-interval", 0);
-            let measure_monitors = health_interval > 0 && iter % health_interval == 0;
-
             if let Some(ref mut writer) = log_writer {
                 use std::io::Write;
                 if iter % 100 == 0 {
@@ -1178,6 +1693,40 @@ pub mod engine {
                     });
                     let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#,
                         iter, crate::common::embedding_monitor::to_json(&embed_stats));
+
+                    // Output distribution (#5)
+                    if let Some(ref od) = output_dist {
+                        let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#,
+                            iter, output_dist_json(od));
+                    }
+
+                    // Layer flow (#2)
+                    if let Some(ref fm) = fwd_monitor {
+                        let lf_json = fm.layer_flow_json();
+                        if !lf_json.is_empty() {
+                            let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, lf_json);
+                        }
+
+                        // Attention heads (#1)
+                        let ah_json = fm.attn_heads_json();
+                        if !ah_json.is_empty() {
+                            let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, ah_json);
+                        }
+
+                        // ODE dynamics (#6)
+                        let od_json = fm.ode_dynamics_json();
+                        if !od_json.is_empty() {
+                            let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, od_json);
+                        }
+                    }
+
+                    // Gradient flow (#3)
+                    if let Some(ref gf) = grad_flow {
+                        let gf_json = gradient_flow_json(gf);
+                        if !gf_json.is_empty() {
+                            let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, gf_json);
+                        }
+                    }
                 }
 
                 let _ = writer.flush();
