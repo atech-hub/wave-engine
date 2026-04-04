@@ -13,7 +13,7 @@ use crate::common::dims::PROFILE;
 use crate::Dims;
 use crate::WavePacketModel;
 use crate::cpu::forward::{BlockCache, ForwardCache};
-use crate::cpu::backward::layer_norm_backward;
+use crate::common::backward::layer_norm_backward;
 use rayon::prelude::*;
 use crate::common::math::cross_entropy_backward;
 
