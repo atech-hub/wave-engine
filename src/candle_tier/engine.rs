@@ -324,6 +324,7 @@ pub mod engine {
         mae_out_sq: Linear,
         mae_out_pr: Linear,
         out_proj: crate::block_diagonal::block_diag::BlockDiagonalLinear,
+        layer_scale: Option<Tensor>,  // [1] scalar — residual contribution multiplier
     }
 
     impl CandleWaveModel {
@@ -435,6 +436,7 @@ pub mod engine {
                     harmonic_ns, attn_out_proj_w, attn_out_proj_b,
                     mae_in_sq, mae_in_pr, ode_params, gpu_ode_params, phase_correction,
                     mae_out_sq, mae_out_pr, out_proj,
+                    layer_scale: None, // set by --layer-scale dyn
                 });
             }
 
@@ -594,8 +596,13 @@ pub mod engine {
                     }
                 }
 
-                // Parallel residual
-                hidden = (&hidden + &attn_out + &ffn_out)?;
+                // Parallel residual: hidden + scale * (attn_out + ffn_out)
+                let contribution = (&attn_out + &ffn_out)?;
+                hidden = if let Some(ref scale) = block.layer_scale {
+                    (&hidden + contribution.broadcast_mul(scale)?)?
+                } else {
+                    (&hidden + &contribution)?
+                };
             }
 
             // Final LN
@@ -688,6 +695,8 @@ pub mod engine {
         // Parse dynamic param flags early (needed for model construction)
         let use_rk4_dyn = std::env::args().any(|a| a == "--rk4-weights") &&
             std::env::args().skip_while(|a| a != "--rk4-weights").nth(1).map_or(false, |s| s == "dyn");
+        let use_layer_scale_dyn = std::env::args().any(|a| a == "--layer-scale") &&
+            std::env::args().skip_while(|a| a != "--layer-scale").nth(1).map_or(false, |s| s == "dyn");
 
         // Model
         let mut varmap = VarMap::new();
@@ -700,6 +709,16 @@ pub mod engine {
             for i in 0..model.blocks.len() {
                 let key = format!("block.{i}.ode");
                 model.blocks[i].gpu_ode_params.set_rk4_learnable(&varmap, &key, &device)?;
+            }
+        }
+        if use_layer_scale_dyn {
+            for i in 0..model.blocks.len() {
+                let key = format!("block.{i}.layer_scale");
+                // Init at 1.0 (no scaling = default behavior)
+                let _t = varmap.get((1,), &key, candle_nn::Init::Const(1.0), DType::F32, &device)?;
+                // Re-get for the model to use in forward
+                let t = varmap.get((1,), &key, candle_nn::Init::Const(1.0), DType::F32, &device)?;
+                model.blocks[i].layer_scale = Some(t);
             }
         }
         if phase_native {
@@ -963,7 +982,21 @@ pub mod engine {
                 // For now: --harmonics dyn is PARSED but harmonics stay frozen on candle.
                 // Use CPU/wgpu tier for --harmonics dyn experiments.
 
-                // Layer scale spring: eq=1.0, k=1.0 — not yet in candle model
+                // Layer scale spring: eq=1.0, k=1.0 (moderate)
+                if use_layer_scale_dyn {
+                    let k_ls = clr * spring_k * 1.0;
+                    for layer in 0..n_layers {
+                        let key = format!("block.{layer}.layer_scale");
+                        if let Some(var) = data.get(&key) {
+                            let vals: Vec<f32> = var.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                            let new_vals: Vec<f32> = vals.iter()
+                                .map(|&v| (v - (k_ls as f32) * (v - 1.0)).max(0.0)) // soft floor at 0
+                                .collect();
+                            let new_tensor = Tensor::from_vec(new_vals, var.shape(), var.device()).unwrap();
+                            var.set(&new_tensor).unwrap();
+                        }
+                    }
+                }
 
                 drop(data);
             }
