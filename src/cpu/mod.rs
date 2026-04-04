@@ -1,4 +1,7 @@
 pub mod train;
+pub mod curriculum;
+pub mod train_loop;
+pub mod train_health;
 pub mod backward;
 pub mod forward;
 pub mod model_backward;
