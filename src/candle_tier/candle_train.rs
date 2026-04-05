@@ -59,9 +59,9 @@ pub mod train {
         // Model
         let mut varmap = VarMap::new();
         let mut model = CandleWaveModel::new(&varmap, vocab_size, &device,
-            n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups, alpha, beta)?;
+            n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups, alpha, beta,
+            phase_native)?;
         model.debug_nan = debug_nan;
-        model.phase_native = phase_native;
         model.use_custom_op = use_custom_op;
         if use_custom_op {
             crate::candle_tier::custom_ode::custom_ode::init_param_grad_storage(n_layers);
@@ -85,11 +85,6 @@ pub mod train {
             }
         }
         if phase_native {
-            // Create output corrector in VarMap
-            let vs = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
-            model.output_corrector = Some(vs.get_with_hints(
-                (1, n_bands), "output_corrector", candle_nn::Init::Const(0.0),
-            )?);
             println!("  Phase-native: dot product against embeddings (zero decoder params)");
         }
         if debug_nan { println!("  [debug-nan] Per-layer NaN detection ENABLED (~6x slower)"); }
@@ -148,6 +143,10 @@ pub mod train {
         let seq_len: usize = parse_flag_c("--seq", 256);
         let lr: f64 = parse_flag_c("--lr", if n_bands > 256 { 1e-4 } else { 3e-4 });
         let spring_k: f64 = parse_flag_c("--spring", 0.1);
+        let gpu_duty: usize = parse_flag_c("--gpu-duty", 100).clamp(1, 100);
+        if gpu_duty < 100 {
+            println!("  GPU duty cycle: {}% (sleep between iterations to reduce temperature)", gpu_duty);
+        }
         let use_rk4_dyn = std::env::args().any(|a| a == "--rk4-weights") &&
             std::env::args().skip_while(|a| a != "--rk4-weights").nth(1).map_or(false, |s| s == "dyn");
         let use_harmonics_dyn = std::env::args().any(|a| a == "--harmonics") &&
@@ -314,7 +313,7 @@ pub mod train {
                     nan_skip_count += 1;
                     eprintln!("  [NaN skip] iter {iter} batch {_b} (total skips: {nan_skip_count})");
                 } else {
-                    let grads = loss.backward()?;
+                    let mut grads = loss.backward()?;
 
                     // Gradient flow monitor (from grads, before optimizer step)
                     if is_monitor_batch {
@@ -362,7 +361,10 @@ pub mod train {
                         }
                     }
 
-                    // Gradient clipping via LR scaling.
+                    // Gradient clipping: scale gradients directly (matches CPU tier).
+                    // CPU clips grads BEFORE Adam, so Adam's m/v accumulators see
+                    // clipped values. LR scaling is NOT equivalent — it feeds full
+                    // unclipped grads to Adam, poisoning the velocity accumulator.
                     let mut gnorm_sq = 0.0f64;
                     for var in &varmap.all_vars() {
                         if let Some(grad) = grads.get(var) {
@@ -372,12 +374,17 @@ pub mod train {
                     }
                     let gnorm = gnorm_sq.sqrt();
                     if gnorm > 1.0 {
-                        optimizer.set_learning_rate(current_lr / gnorm);
-                        optimizer.step(&grads)?;
-                        optimizer.set_learning_rate(current_lr);
-                    } else {
-                        optimizer.step(&grads)?;
+                        // Scale gradients in the GradStore (clip to max_norm=1.0)
+                        let scale = 1.0 / gnorm;
+                        let all_vars = varmap.all_vars();
+                        for var in &all_vars {
+                            if let Some(grad) = grads.get(var) {
+                                let scaled = (grad * scale)?;
+                                grads.insert(var, scaled);
+                            }
+                        }
                     }
+                    optimizer.step(&grads)?;
                     drop(grads);
                     device.synchronize()?;
                 }
@@ -705,6 +712,14 @@ pub mod train {
 
             if iter % 50 == 0 || iter == total_iters - 1 {
                 println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  vram={}MB", iter, total_loss, iter_time, current_lr, vram_used_mb);
+            }
+
+            // GPU duty cycle throttle: sleep between iterations to reduce temperature.
+            // --gpu-duty 50 = work one batch, sleep same duration (GPU drops to ~50%).
+            if gpu_duty < 100 && gpu_duty > 0 {
+                let work_ms = iter_time.as_millis() as u64;
+                let sleep_ms = work_ms * (100 - gpu_duty as u64) / gpu_duty as u64;
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
             }
 
             // Periodic checkpoint: save every 500 iters (leak is fixed, 100 was debug)

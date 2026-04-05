@@ -93,7 +93,8 @@ pub mod model {
     impl CandleWaveModel {
         pub fn new(varmap: &VarMap, vocab_size: usize, device: &Device,
                    n_bands: usize, n_head: usize, n_layers: usize, maestro_dim: usize,
-                   rk4_steps: usize, out_proj_groups: usize, alpha: f32, beta: f32) -> Result<Self> {
+                   rk4_steps: usize, out_proj_groups: usize, alpha: f32, beta: f32,
+                   phase_native: bool) -> Result<Self> {
             let n_embd = n_bands * 2;
             let block_size = 256; // positional table size
             // Save config for methods
@@ -210,8 +211,7 @@ pub mod model {
             // Final LN + LM head (trained) or output corrector (phase-native)
             let ln_f_w = vs.get_with_hints((n_embd,), "ln_f_w", candle_nn::Init::Const(1.0))?;
             let ln_f_b = vs.get_with_hints((n_embd,), "ln_f_b", candle_nn::Init::Const(0.0))?;
-            // TODO: make phase_native configurable via CLI flag
-            let phase_native = false; // will be set by caller
+            // phase_native passed from caller — controls lm_head vs output_corrector
             let lm_head = if !phase_native {
                 vs.get_with_hints((vocab_size, n_embd), "lm_head",
                     candle_nn::Init::Randn { mean: 0.0, stdev: 1.0 / (n_embd as f64).sqrt() })?
