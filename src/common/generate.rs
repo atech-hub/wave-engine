@@ -13,6 +13,7 @@ pub struct GenerateConfig {
     pub n_bands: usize,
     pub n_head: usize,
     pub out_proj_groups: usize,
+    pub maestro_dim: usize,
     pub use_bpe: bool,
     pub tokenizer_path: String,
     pub alpha: f32,
@@ -54,7 +55,7 @@ pub fn run_generate(config: GenerateConfig) {
     let effective_vocab = vocab_size.max(ck_vocab);
 
     // Build model with correct dims
-    let dims = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+    let dims = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
         .with_learnable_ode(false)
         .with_corrector(true);
     let mut mdl = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims, config.alpha, config.beta);
@@ -66,7 +67,7 @@ pub fn run_generate(config: GenerateConfig) {
         let has_ls   = ck_flags & (1 << 1) != 0;
         let has_rk4  = ck_flags & (1 << 2) != 0;
         let has_harm = ck_flags & (1 << 3) != 0;
-        let d = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+        let d = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
             .with_corrector(has_ode).with_learnable_ode(has_ode)
             .with_layer_scale(has_ls).with_rk4_weights(has_rk4).with_dyn_harmonics(has_harm);
         // Try phase-native first, then standard
@@ -106,7 +107,7 @@ pub fn run_generate(config: GenerateConfig) {
 
     // Generate all Dims variants systematically (most features → fewest).
     // Each combination of phase_native × layer_scale × rk4_weights × harmonics.
-    let base = || Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+    let base = || Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
         .with_corrector(true).with_learnable_ode(true);
     let feature_combos: Vec<(bool, bool, bool, &str)> = vec![
         // (layer_scale, rk4, harmonics, label)
@@ -145,7 +146,7 @@ pub fn run_generate(config: GenerateConfig) {
     }
     // Ext + layer_scale
     if !loaded {
-        let d = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+        let d = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
             .with_corrector(true).with_layer_scale(true);
         let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, d, config.alpha, config.beta);
         if params.len() == count_trainable_ex(&m, false) {
@@ -156,7 +157,7 @@ pub fn run_generate(config: GenerateConfig) {
         }
     }
     // Ext (ODE + corrector)
-    let dims_ext = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+    let dims_ext = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
         .with_corrector(true);
     let mut model_ext = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_ext, config.alpha, config.beta);
     let ext_count = count_trainable_ex(&model_ext, false);
@@ -168,7 +169,7 @@ pub fn run_generate(config: GenerateConfig) {
     }
     // Base (no ODE params)
     if !loaded {
-        let dims_base = Dims::from_cli(config.n_bands, config.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+        let dims_base = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
             .with_learnable_ode(false).with_corrector(false);
         mdl = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_base, config.alpha, config.beta);
         unflatten_params(&mut mdl, &params);

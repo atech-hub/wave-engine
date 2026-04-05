@@ -377,6 +377,7 @@ fn main() {
             n_bands: parse_flag("--n-bands", N_BANDS),
             n_head: parse_flag("--n-head", N_HEAD),
             out_proj_groups: parse_flag("--out-proj-groups", 6),
+            maestro_dim: parse_flag("--maestro-dim", MAESTRO_DIM),
             use_bpe: std::env::args().any(|a| a == "--bpe"),
             tokenizer_path: parse_flag("--tokenizer", "data/tokenizer.json".to_string()),
             alpha: parse_flag("--alpha", 0.1),
