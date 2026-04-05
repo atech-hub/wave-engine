@@ -179,9 +179,14 @@ pub mod monitors {
             let ode_rk4 = grad_norm_for("ode.rk4_weights");
             let ode_norm = (ode_a*ode_a + ode_b*ode_b + ode_g*ode_g + ode_pc*ode_pc + ode_rk4*ode_rk4).sqrt();
 
-            // Out proj (block-diagonal groups)
+            // Out proj — dense (out_proj.weight) or block-diagonal (out_proj.g0.weight, ...)
             let mut op_sq = 0.0f32;
-            for g in 0..16 { // enough groups for any config
+            // Try dense key first
+            let w_dense = grad_norm_for("out_proj.weight");
+            let b_dense = grad_norm_for("out_proj.bias");
+            op_sq += w_dense * w_dense + b_dense * b_dense;
+            // Then block-diagonal groups
+            for g in 0..16 {
                 let w = grad_norm_for(&format!("out_proj.g{g}.weight"));
                 let b = grad_norm_for(&format!("out_proj.g{g}.bias"));
                 op_sq += w * w + b * b;
