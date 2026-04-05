@@ -246,9 +246,15 @@ pub mod train {
         println!("{:>6} {:>10} {:>10}", "Iter", "Loss", "Time");
         println!("{}", "-".repeat(35));
 
-        // JSONL telemetry — tier-specific filename to prevent overwrites
-        let log_name = "training_log_candle.jsonl";
-        let log_file = std::fs::File::create(log_name).ok();
+        // JSONL telemetry — use --log-name if provided, else derive from checkpoint name
+        let log_name: String = std::env::args().skip_while(|a| a != "--log-name").nth(1)
+            .unwrap_or_else(|| {
+                let ckpt = std::env::args().skip_while(|a| a != "--checkpoint-name").nth(1)
+                    .unwrap_or_else(|| "checkpoint.bin".to_string());
+                let stem = ckpt.strip_suffix(".bin").unwrap_or(&ckpt);
+                format!("training_log_{}.jsonl", stem)
+            });
+        let log_file = std::fs::File::create(&log_name).ok();
         let mut log_writer = log_file.map(|f| std::io::BufWriter::new(f));
         println!("  Telemetry: {log_name}");
         let mut nan_skip_count = 0usize;
