@@ -136,8 +136,29 @@ pub mod forward {
                     }
                 }
 
-                // ODE — CustomOp (no autograd graph) or autograd (full graph)
-                let ode_out = if self.use_custom_op {
+                // ODE — CUDA kernel (GPU native) > CustomOp (CPU fwd+bwd) > autograd (full graph)
+                let ode_out = if self.use_cuda_kernel {
+                    let gamma_raw = block.gpu_ode_params.gamma_raw.flatten_all()?.to_vec1::<f32>()?;
+                    let omega = block.gpu_ode_params.omega.flatten_all()?.to_vec1::<f32>()?;
+                    let alpha_v = block.gpu_ode_params.alpha.flatten_all()?.to_vec1::<f32>()?[0];
+                    let beta_v = block.gpu_ode_params.beta.flatten_all()?.to_vec1::<f32>()?[0];
+                    let rk4_w = if let Some(ref w) = block.gpu_ode_params.rk4_w {
+                        let v = w.to_vec1::<f32>()?;
+                        [v[0], v[1], v[2], v[3]]
+                    } else {
+                        [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0]
+                    };
+                    let param_grads = self.ode_param_grads.as_ref()
+                        .expect("CUDA kernel requires ode_param_grads on model").clone();
+                    let op = crate::candle_tier::cuda_ode::cuda_ode::KerrOdeCudaOp::new(
+                        gamma_raw, omega, alpha_v, beta_v, rk4_w,
+                        block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
+                        f32::MAX, // AGC disabled — differentiable AGC already applied above
+                        param_grads,
+                    );
+                    // CUDA kernel has cuda_fwd — tensor stays on GPU, no CPU transfer
+                    precond.apply_op1(op)?
+                } else if self.use_custom_op {
                     let gamma_raw = block.gpu_ode_params.gamma_raw.flatten_all()?.to_vec1::<f32>()?;
                     let omega = block.gpu_ode_params.omega.flatten_all()?.to_vec1::<f32>()?;
                     let alpha_v = block.gpu_ode_params.alpha.flatten_all()?.to_vec1::<f32>()?[0];
@@ -411,7 +432,27 @@ pub mod forward {
                 // Capture precond norms before ODE
                 let precond_cpu = precond.to_vec2::<f32>()?;
 
-                let ode_out = if self.use_custom_op {
+                let ode_out = if self.use_cuda_kernel {
+                    let gamma_raw = block.gpu_ode_params.gamma_raw.flatten_all()?.to_vec1::<f32>()?;
+                    let omega = block.gpu_ode_params.omega.flatten_all()?.to_vec1::<f32>()?;
+                    let alpha_v = block.gpu_ode_params.alpha.flatten_all()?.to_vec1::<f32>()?[0];
+                    let beta_v = block.gpu_ode_params.beta.flatten_all()?.to_vec1::<f32>()?[0];
+                    let rk4_w = if let Some(ref w) = block.gpu_ode_params.rk4_w {
+                        let v = w.to_vec1::<f32>()?;
+                        [v[0], v[1], v[2], v[3]]
+                    } else {
+                        [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0]
+                    };
+                    let param_grads = self.ode_param_grads.as_ref()
+                        .expect("CUDA kernel requires ode_param_grads on model").clone();
+                    let op = crate::candle_tier::cuda_ode::cuda_ode::KerrOdeCudaOp::new(
+                        gamma_raw, omega, alpha_v, beta_v, rk4_w,
+                        block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
+                        f32::MAX, // AGC disabled — differentiable AGC already applied above
+                        param_grads,
+                    );
+                    precond.apply_op1(op)?
+                } else if self.use_custom_op {
                     let gamma_raw = block.gpu_ode_params.gamma_raw.flatten_all()?.to_vec1::<f32>()?;
                     let omega = block.gpu_ode_params.omega.flatten_all()?.to_vec1::<f32>()?;
                     let alpha_v = block.gpu_ode_params.alpha.flatten_all()?.to_vec1::<f32>()?[0];
@@ -429,7 +470,6 @@ pub mod forward {
                         block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
                         param_grads,
                     );
-                    // CustomOp runs on CPU — move tensor CPU→op→GPU
                     let precond_cpu = precond.to_device(&candle_core::Device::Cpu)?;
                     let ode_cpu = precond_cpu.apply_op1(op)?;
                     ode_cpu.to_device(&self.device)?

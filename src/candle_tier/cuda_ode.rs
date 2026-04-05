@@ -106,24 +106,10 @@ extern "C" __global__ void kerr_ode_fwd(
         })
     }
 
-    /// ODE param grad accumulator — shared via Arc<Mutex>.
-    pub struct OdeParamGradsAccum {
-        pub d_gamma_raw: Vec<f32>,
-        pub d_alpha: f32,
-        pub d_beta: f32,
-        pub d_rk4_weights: [f32; 4],
-    }
-
-    pub type SharedParamGrads = Arc<Mutex<Vec<Option<OdeParamGradsAccum>>>>;
-
-    pub fn create_param_grad_storage(n_layers: usize) -> SharedParamGrads {
-        Arc::new(Mutex::new((0..n_layers).map(|_| None).collect()))
-    }
-
-    pub fn take_param_grads(storage: &SharedParamGrads, layer: usize) -> Option<OdeParamGradsAccum> {
-        let mut v = storage.lock().unwrap();
-        if layer < v.len() { v[layer].take() } else { None }
-    }
+    // Re-use types from custom_ode (same SharedParamGrads, same training loop)
+    pub use crate::candle_tier::custom_ode::custom_ode::{
+        OdeParamGradsAccum, SharedParamGrads,
+    };
 
     /// Forward cache — states stored on CPU for backward.
     struct OdeCudaCache {
@@ -259,19 +245,15 @@ extern "C" __global__ void kerr_ode_fwd(
             }
 
             // Copy state cache from GPU to CPU (needed for backward)
-            let cache_cpu: Vec<f32> = dev.clone_dtoh(&d_cache)?;
+            // Copy input to CPU once (for backward cache reconstruction)
+            let input_cpu: Vec<f32> = dev.clone_dtoh(input_slice)?;
 
-            // Reconstruct per-position OdeForwardCache from the flat cache
+            // Reconstruct per-position OdeForwardCache by re-running forward on CPU
+            // (cheaper than transferring all k-values from GPU)
             let weights = self.make_weights();
             let mut caches = Vec::with_capacity(n_pos);
             for pos in 0..n_pos {
-                // The CUDA kernel stores [r,s] at each step start
-                // Reconstruct OdeForwardCache by re-running forward on CPU
-                // (cheaper than transferring all k-values from GPU)
                 let start = layout.start_offset() + pos * n_embd;
-                // We need the original input for the CPU backward
-                // Extract from the input storage
-                let input_cpu: Vec<f32> = dev.clone_dtoh(input_slice)?;
                 let x = &input_cpu[start..start + n_embd];
                 let (_, cache) = crate::common::ode_backward::ode_forward_with_cache(x, &weights);
                 caches.push(cache);

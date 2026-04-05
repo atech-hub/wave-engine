@@ -54,7 +54,8 @@ pub mod train {
             std::env::args().skip_while(|a| a != "--wd").nth(1).map_or(false, |s| s == "dyn");
         let use_agc_headroom_dyn = std::env::args().any(|a| a == "--agc-headroom") &&
             std::env::args().skip_while(|a| a != "--agc-headroom").nth(1).map_or(false, |s| s == "dyn");
-        let use_custom_op = std::env::args().any(|a| a == "--custom-op");
+        let use_cuda_kernel = std::env::args().any(|a| a == "--cuda-kernel");
+        let use_custom_op = use_cuda_kernel || std::env::args().any(|a| a == "--custom-op");
 
         // Model
         let mut varmap = VarMap::new();
@@ -63,9 +64,14 @@ pub mod train {
             phase_native)?;
         model.debug_nan = debug_nan;
         model.use_custom_op = use_custom_op;
+        model.use_cuda_kernel = use_cuda_kernel;
         if use_custom_op {
             model.ode_param_grads = Some(crate::candle_tier::custom_ode::custom_ode::create_param_grad_storage(n_layers));
-            println!("  CustomOp: ODE backward via CPU (no autograd graph)");
+            if use_cuda_kernel {
+                println!("  CUDA kernel: fused AGC+RK4 on GPU, backward via CPU");
+            } else {
+                println!("  CustomOp: ODE backward via CPU (no autograd graph)");
+            }
         }
         // Wire dynamic params
         if use_rk4_dyn {
