@@ -404,9 +404,11 @@ pub mod train {
             // CustomOp: apply ODE param gradients manually (they bypass autograd)
             if use_custom_op {
                 let data = varmap.data().lock().unwrap();
+                let mut ode_grads_applied = 0usize;
                 for layer in 0..n_layers {
                     let grads_store = model.ode_param_grads.as_ref().unwrap();
                     if let Some(og) = crate::candle_tier::custom_ode::custom_ode::take_param_grads(grads_store, layer) {
+                        ode_grads_applied += 1;
                         // Apply gradient to gamma_raw
                         let key = format!("block.{layer}.ode.gamma_raw");
                         if let Some(var) = data.get(&key) {
@@ -444,6 +446,14 @@ pub mod train {
                     }
                 }
                 drop(data);
+                // Health check: log if CustomOp backward produced gradients
+                if iter < 10 || (iter % 500 == 0) {
+                    if ode_grads_applied == 0 {
+                        eprintln!("  [CustomOp health {}] WARNING: 0/{} layers got ODE gradients", iter, n_layers);
+                    } else if iter < 10 {
+                        eprintln!("  [CustomOp health {}] ODE gradients applied: {}/{} layers", iter, ode_grads_applied, n_layers);
+                    }
+                }
             }
 
             // Spring regulation on dynamic params (after optimizer step, like CPU tier)
