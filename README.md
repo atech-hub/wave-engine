@@ -221,7 +221,7 @@ The fastest way to experiment with the wave architecture:
 
 ### Phase-native training (recommended)
 
-Phase-native mode uses dot product against frozen embeddings instead of a learned lm_head. Zero decoder parameters. This produced 55/55 on arithmetic and 46/51 on word classification:
+Phase-native mode uses dot product against frozen embeddings instead of a learned lm_head. Zero decoder parameters — the model's parameter count doesn't scale with vocabulary size. Works with any tokenization (character-level, BPE, or any future scheme). You feed it data, the ODE computes, the dot product translates. 55/55 on arithmetic, 46/51 on word classification:
 
 ```bash
 ./target/release/wave-engine data/arithmetic_augmented.txt --layers 4 --n-bands 84 --n-head 4 \
