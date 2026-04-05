@@ -70,6 +70,10 @@ pub fn print_help() {
     println!("ACCELERATION:");
     println!("    --gpu             Enable wgpu GPU (Vulkan/Metal/DX12)");
     println!("    --candle          Use Candle CUDA backend (requires --features candle-backend)");
+    println!("    --custom-op       Use CustomOp ODE (no autograd graph, faster at 384-dim+)");
+    println!("    --gpu-duty N      GPU duty cycle 1-100% (Candle only)          [default: 100]");
+    println!("                      50 = work one batch, sleep same duration (~50% GPU usage)");
+    println!("                      For hot climates, laptops, shared machines");
     println!();
     println!("PERFORMANCE:");
     println!("    --threads N       Rayon thread pool size (default: half available cores)");
