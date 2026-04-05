@@ -87,17 +87,44 @@ pub mod forward {
                 let mae_in = block.mae_in_pr.forward(&mae_in)?;
                 let precond = (&ffn_input + &mae_in)?;
 
-                // AGC knee compression — per-layer or global
+                // AGC knee compression — differentiable (preserves autograd chain)
+                // Extract magnitude for EMA update (detached from graph)
+                // but apply clamping through tensor ops (on the graph)
                 let precond = {
-                    let mut pv: Vec<Vec<f32>> = precond.to_vec2()?;
-                    let nb = pv[0].len() / 2;
-                    if let Some(ref mut agcs) = self.layer_agcs {
-                        agcs[block_idx].process(&mut pv, nb);
+                    let n_b = self.n_bands;
+                    let n_e = self.n_embd;
+
+                    // Update AGC EMA state from detached magnitudes (no grad needed for EMA)
+                    let pv_detach: Vec<Vec<f32>> = precond.detach().to_vec2()?;
+                    let mags: Vec<f32> = pv_detach.iter().flat_map(|pos| {
+                        (0..n_b).map(move |k| (pos[k*2]*pos[k*2] + pos[k*2+1]*pos[k*2+1]).sqrt())
+                    }).collect();
+                    let threshold = if let Some(ref mut agcs) = self.layer_agcs {
+                        agcs[block_idx].observe(&mags);
+                        agcs[block_idx].stats().threshold
                     } else {
                         let mut agc = crate::ffn_backend::AGC.get().unwrap().lock().unwrap();
-                        agc.process(&mut pv, nb);
-                    }
-                    candle_core::Tensor::new(pv, precond.device())?
+                        agc.observe(&mags);
+                        agc.stats().threshold
+                    };
+
+                    // Apply clamping through differentiable tensor ops (on the autograd graph)
+                    let reshaped = precond.reshape((n_pos, n_b, 2))?;
+                    let r = reshaped.narrow(2, 0, 1)?.squeeze(2)?;
+                    let s = reshaped.narrow(2, 1, 1)?.squeeze(2)?;
+                    let mag_sq = (&r * &r)?.add(&(&s * &s)?)?;
+                    let mag = (mag_sq + 1e-12 as f64)?.sqrt()?;
+                    // scale = min(1.0, threshold / mag) — knee compression as differentiable min
+                    let thresh_tensor = (mag.zeros_like()? + threshold as f64)?;
+                    let raw_scale = (thresh_tensor / &mag)?;
+                    let ones = raw_scale.ones_like()?;
+                    let scale = raw_scale.minimum(&ones)?;
+                    // Apply scale to r, s (gradient flows through scale computation)
+                    let r_scaled = (r * &scale)?;
+                    let s_scaled = (s * &scale)?;
+                    let r_exp = r_scaled.unsqueeze(2)?;
+                    let s_exp = s_scaled.unsqueeze(2)?;
+                    Tensor::cat(&[&r_exp, &s_exp], 2)?.reshape((n_pos, n_e))?
                 };
 
                 if self.debug_nan {
@@ -121,9 +148,12 @@ pub mod forward {
                     } else {
                         [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0]
                     };
+                    let param_grads = self.ode_param_grads.as_ref()
+                        .expect("CustomOp requires ode_param_grads on model").clone();
                     let op = crate::candle_tier::custom_ode::custom_ode::KerrOdeCustomOp::new(
                         gamma_raw, omega, alpha_v, beta_v, rk4_w,
                         block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
+                        param_grads,
                     );
                     // CustomOp runs on CPU — move tensor CPU→op→GPU
                     let precond_cpu = precond.to_device(&candle_core::Device::Cpu)?;
@@ -345,16 +375,36 @@ pub mod forward {
                 let precond = (&ffn_input + &mae_in)?;
 
                 // AGC
+                // AGC — differentiable (same as main forward)
                 let precond = {
-                    let mut pv: Vec<Vec<f32>> = precond.to_vec2()?;
-                    let nb = pv[0].len() / 2;
-                    if let Some(ref mut agcs) = self.layer_agcs {
-                        agcs[block_idx].process(&mut pv, nb);
+                    let n_b = self.n_bands;
+                    let n_e = self.n_embd;
+                    let pv_detach: Vec<Vec<f32>> = precond.detach().to_vec2()?;
+                    let mags: Vec<f32> = pv_detach.iter().flat_map(|pos| {
+                        (0..n_b).map(move |k| (pos[k*2]*pos[k*2] + pos[k*2+1]*pos[k*2+1]).sqrt())
+                    }).collect();
+                    let threshold = if let Some(ref mut agcs) = self.layer_agcs {
+                        agcs[block_idx].observe(&mags);
+                        agcs[block_idx].stats().threshold
                     } else {
                         let mut agc = crate::ffn_backend::AGC.get().unwrap().lock().unwrap();
-                        agc.process(&mut pv, nb);
-                    }
-                    candle_core::Tensor::new(pv, precond.device())?
+                        agc.observe(&mags);
+                        agc.stats().threshold
+                    };
+                    let reshaped = precond.reshape((n_pos, n_b, 2))?;
+                    let r = reshaped.narrow(2, 0, 1)?.squeeze(2)?;
+                    let s = reshaped.narrow(2, 1, 1)?.squeeze(2)?;
+                    let mag_sq = (&r * &r)?.add(&(&s * &s)?)?;
+                    let mag = (mag_sq + 1e-12 as f64)?.sqrt()?;
+                    let thresh_tensor = (mag.zeros_like()? + threshold as f64)?;
+                    let raw_scale = (thresh_tensor / &mag)?;
+                    let ones = raw_scale.ones_like()?;
+                    let scale = raw_scale.minimum(&ones)?;
+                    let r_scaled = (r * &scale)?;
+                    let s_scaled = (s * &scale)?;
+                    let r_exp = r_scaled.unsqueeze(2)?;
+                    let s_exp = s_scaled.unsqueeze(2)?;
+                    Tensor::cat(&[&r_exp, &s_exp], 2)?.reshape((n_pos, n_e))?
                 };
 
                 // ── ODE with monitoring ──
@@ -372,9 +422,12 @@ pub mod forward {
                     } else {
                         [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0]
                     };
+                    let param_grads = self.ode_param_grads.as_ref()
+                        .expect("CustomOp requires ode_param_grads on model").clone();
                     let op = crate::candle_tier::custom_ode::custom_ode::KerrOdeCustomOp::new(
                         gamma_raw, omega, alpha_v, beta_v, rk4_w,
                         block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
+                        param_grads,
                     );
                     // CustomOp runs on CPU — move tensor CPU→op→GPU
                     let precond_cpu = precond.to_device(&candle_core::Device::Cpu)?;

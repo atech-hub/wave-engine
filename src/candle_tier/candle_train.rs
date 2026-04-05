@@ -64,7 +64,7 @@ pub mod train {
         model.debug_nan = debug_nan;
         model.use_custom_op = use_custom_op;
         if use_custom_op {
-            crate::candle_tier::custom_ode::custom_ode::init_param_grad_storage(n_layers);
+            model.ode_param_grads = Some(crate::candle_tier::custom_ode::custom_ode::create_param_grad_storage(n_layers));
             println!("  CustomOp: ODE backward via CPU (no autograd graph)");
         }
         // Wire dynamic params
@@ -405,7 +405,8 @@ pub mod train {
             if use_custom_op {
                 let data = varmap.data().lock().unwrap();
                 for layer in 0..n_layers {
-                    if let Some(og) = crate::candle_tier::custom_ode::custom_ode::take_param_grads(layer) {
+                    let grads_store = model.ode_param_grads.as_ref().unwrap();
+                    if let Some(og) = crate::candle_tier::custom_ode::custom_ode::take_param_grads(grads_store, layer) {
                         // Apply gradient to gamma_raw
                         let key = format!("block.{layer}.ode.gamma_raw");
                         if let Some(var) = data.get(&key) {

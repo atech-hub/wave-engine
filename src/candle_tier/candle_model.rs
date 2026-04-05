@@ -40,6 +40,7 @@ pub mod model {
         pub phase_native: bool,
         pub layer_agcs: Option<Vec<crate::common::agc::OdeAgc>>,  // per-layer AGC (when --agc-headroom dyn)
         pub use_custom_op: bool,  // true = CustomOp ODE (no autograd graph, CPU backward)
+        pub ode_param_grads: Option<crate::candle_tier::custom_ode::custom_ode::SharedParamGrads>,
 
         pub device: Device,
 
@@ -226,7 +227,7 @@ pub mod model {
             };
 
             Ok(Self { wte, wpe, blocks, ln_f_w, ln_f_b, lm_head, output_corrector, phase_native,
-                layer_agcs: None, use_custom_op: false, device: device.clone(),
+                layer_agcs: None, use_custom_op: false, ode_param_grads: None, device: device.clone(),
                 n_bands: n_bands_cfg, n_embd: n_embd_cfg, n_head: n_head_cfg, block_size: block_size_cfg, debug_nan: false })
         }
     }

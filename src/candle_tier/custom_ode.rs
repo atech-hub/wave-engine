@@ -19,28 +19,19 @@ pub mod custom_ode {
         pub d_rk4_weights: [f32; 4],
     }
 
-    // Thread-local storage for passing ODE param gradients from CustomOp backward
-    // to the training loop (where they're applied to VarMap variables).
-    thread_local! {
-        pub static ODE_PARAM_GRADS: std::cell::RefCell<Vec<Option<OdeParamGradsAccum>>> =
-            std::cell::RefCell::new(Vec::new());
-    }
+    /// Shared gradient storage — passed between CustomOp and training loop via Arc<Mutex>.
+    /// Replaces thread_local! which broke when backward ran on a different thread.
+    pub type SharedParamGrads = Arc<Mutex<Vec<Option<OdeParamGradsAccum>>>>;
 
-    /// Initialize the thread-local gradient storage for N layers.
-    pub fn init_param_grad_storage(n_layers: usize) {
-        ODE_PARAM_GRADS.with(|cell| {
-            let mut v = cell.borrow_mut();
-            v.clear();
-            for _ in 0..n_layers { v.push(None); }
-        });
+    /// Create shared gradient storage for N layers.
+    pub fn create_param_grad_storage(n_layers: usize) -> SharedParamGrads {
+        Arc::new(Mutex::new((0..n_layers).map(|_| None).collect()))
     }
 
     /// Take the accumulated gradients for a layer (clears the slot).
-    pub fn take_param_grads(layer: usize) -> Option<OdeParamGradsAccum> {
-        ODE_PARAM_GRADS.with(|cell| {
-            let mut v = cell.borrow_mut();
-            if layer < v.len() { v[layer].take() } else { None }
-        })
+    pub fn take_param_grads(storage: &SharedParamGrads, layer: usize) -> Option<OdeParamGradsAccum> {
+        let mut v = storage.lock().unwrap();
+        if layer < v.len() { v[layer].take() } else { None }
     }
 
     /// Cached forward intermediates — shared between forward and backward via Arc<Mutex>.
@@ -60,6 +51,7 @@ pub mod custom_ode {
         n_bands: usize,
         layer_idx: usize,
         cache: Arc<Mutex<Option<OdeCache>>>,
+        param_grads: SharedParamGrads,
     }
 
     impl KerrOdeCustomOp {
@@ -67,11 +59,13 @@ pub mod custom_ode {
             gamma_raw: Vec<f32>, omega: Vec<f32>,
             alpha: f32, beta: f32, rk4_weights: [f32; 4],
             rk4_steps: usize, n_bands: usize, layer_idx: usize,
+            param_grads: SharedParamGrads,
         ) -> Self {
             Self {
                 gamma_raw, omega, alpha, beta, rk4_weights,
                 rk4_steps, n_bands, layer_idx,
                 cache: Arc::new(Mutex::new(None)),
+                param_grads,
             }
         }
 
@@ -154,9 +148,9 @@ pub mod custom_ode {
                 for w in 0..4 { total_d_rk4_weights[w] += pg.d_rk4_weights[w]; }
             }
 
-            // Store param gradients for the training loop to pick up
-            ODE_PARAM_GRADS.with(|cell| {
-                let mut v = cell.borrow_mut();
+            // Store param gradients in shared storage (Arc<Mutex>, thread-safe)
+            {
+                let mut v = self.param_grads.lock().unwrap();
                 if self.layer_idx < v.len() {
                     v[self.layer_idx] = Some(OdeParamGradsAccum {
                         d_gamma_raw: total_d_gamma_raw,
@@ -165,7 +159,7 @@ pub mod custom_ode {
                         d_rk4_weights: total_d_rk4_weights,
                     });
                 }
-            });
+            }
 
             let d_input_tensor = Tensor::from_vec(d_inputs, output_grad.shape(), output_grad.device())?;
             Ok(Some(d_input_tensor))
