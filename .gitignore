@@ -77,3 +77,11 @@ data/grammar/
 # Lab experiments (internal benchmarks)
 /lab/
 specs/
+
+# Training logs and data artifacts
+*.jsonl
+*.tokens
+build_candle.bat
+analysis/
+results/
+data/corpus_expansion/
