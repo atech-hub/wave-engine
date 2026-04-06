@@ -92,6 +92,18 @@ pub fn run_training(config: TrainConfig) {
 
     // Phase-native mode: ODE learns to output in embedding space, no lm_head
     model.phase_native = config.phase_native;
+    model.delta_decode = config.delta_decode;
+    model.detect_mode = match config.phase_detect.as_str() {
+        "q" => crate::common::phase_loss::DetectMode::Q,
+        "iq" => {
+            model.iq_weights = Some([1.0, 0.0]); // init: pure I-channel, learns Q
+            crate::common::phase_loss::DetectMode::IQ
+        }
+        _ => crate::common::phase_loss::DetectMode::I,
+    };
+    if model.detect_mode != crate::common::phase_loss::DetectMode::I {
+        println!("  Phase detection: {:?}", model.detect_mode);
+    }
 
     // Apply fixed values from CLI for dynamic params
     if let DynParam::Fixed(ref vals) = config.layer_scale {
@@ -356,7 +368,18 @@ pub fn run_training(config: TrainConfig) {
                         None
                     };
 
-                    let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref);
+                    // I/Q channel monitor — measures where the ODE signal lives
+                    let iq_analysis = if is_health && model_ref.phase_native {
+                        Some(crate::common::iq_monitor::analyze_iq_batch(
+                            &cache.post_ln_f, &model_ref.wte, target,
+                            dims.n_bands, &model_ref.output_corrector, &model_ref.output_scale, 10,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    let delta_tokens = if model_ref.delta_decode { Some(input) } else { None };
+                    let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref, delta_tokens);
                     // Gradient flow analysis on first batch element at health intervals
                     let grad_flow = if is_health {
                         Some(crate::common::gradient_monitor::analyze_gradients(&grads, dims))
@@ -364,7 +387,7 @@ pub fn run_training(config: TrainConfig) {
                         None
                     };
                     (loss, flatten_grads_ex(&grads, dims.tied), BatchHealthData {
-                        distortion, grad_flow, attn_stats, flow_stats, output_stats, ode_dynamics,
+                        distortion, grad_flow, attn_stats, flow_stats, output_stats, ode_dynamics, iq_analysis,
                     })
                 })
             }).collect();
@@ -443,6 +466,12 @@ pub fn run_training(config: TrainConfig) {
                         damping_effective: s.damping_effective,
                     }).collect());
                 }
+            }
+            // I/Q channel monitor
+            if let Some(ref iq) = health.iq_analysis {
+                eprintln!("  [I/Q] I_disc={:.3} Q_disc={:.3} IQ_ratio={:.3} phase_std={:.3} I_rank={} Q_rank={}",
+                    iq.i_discrim, iq.q_discrim, iq.iq_ratio, iq.phase_std, iq.i_correct_rank, iq.q_correct_rank);
+                break; // only print once per health interval
             }
         }
         total_loss /= batch_size as f32;

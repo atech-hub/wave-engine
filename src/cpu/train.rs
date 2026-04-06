@@ -93,6 +93,8 @@ pub struct TrainConfig {
     pub layer_scale: DynParam, // --layer-scale dyn | --layer-scale 1.0,0.8,1.0,1.0
     pub lr_scale: DynParam,    // --lr-scale dyn | --lr-scale 1.0,1.5,1.5,0.5,1.0
     pub phase_native: bool,
+    pub delta_decode: bool,   // --delta-decode: subtract input embedding before dot product
+    pub phase_detect: String, // --phase-detect q|iq|i (default: i = standard dot product)
     pub pythagorean: bool,    // --phase-native: use phase coherence loss, no lm_head
     pub phase_temp: f32,       // temperature for phase-native softmax (default 1.0)
     pub spring_k: f32, // spring constant for dynamic params (0.0 = no spring, 0.1 = moderate)

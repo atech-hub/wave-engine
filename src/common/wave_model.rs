@@ -32,7 +32,11 @@ pub struct WavePacketModel {
     pub wd_scale: Vec<f32>, // per-group WD multiplier [n_layers + 1] (1.0 = base WD, training only)
     pub agc_headroom: Vec<f32>, // per-layer AGC headroom (3.0 = 3-sigma default, training only)
     pub phase_native: bool, // true = use phase coherence loss instead of lm_head
+    pub delta_decode: bool,  // true = subtract input embedding before dot product (strip residual echo)
+    pub detect_mode: crate::common::phase_loss::DetectMode, // I, Q, or IQ detection
+    pub iq_weights: Option<[f32; 2]>, // [w_I, w_Q] for IQ mode (init [1.0, 0.0])
     pub output_corrector: Vec<f32>, // [n_bands] per-band phase rotation before phase comparison
+    pub output_scale: Vec<f32>,     // [n_bands] per-band amplitude scale (init 1.0, phase-native adapter)
 }
 
 pub fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
@@ -158,7 +162,11 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
         wd_scale: vec![1.0; n_layers + 1], // +1 for lm_head group
         agc_headroom: vec![3.0; n_layers], // 3-sigma default per layer
         phase_native: false,
+        delta_decode: false,
+        detect_mode: crate::common::phase_loss::DetectMode::I,
+        iq_weights: None,
         output_corrector: vec![0.0; d.n_bands], // 84 phase rotations, zero = transparent
+        output_scale: vec![1.0; d.n_bands],     // per-band amplitude scale, identity = transparent
     }
 }
 
@@ -197,7 +205,8 @@ pub fn count_trainable_ex(model: &WavePacketModel, tied: bool) -> usize {
     n += n_embd * 2;
     if model.phase_native {
         n += model.output_corrector.len(); // output corrector for phase-native decode
-        // No lm_head params — phase coherence replaces the decoder
+        n += model.output_scale.len();     // per-band amplitude adapter
+        if model.iq_weights.is_some() { n += 2; } // I/Q detection weights
     } else if let Some(ref wds) = model.wd_state {
         n += wave_decode::param_count(wds);
     } else if model.lm_rank > 0 {
@@ -253,7 +262,8 @@ pub fn flatten_params_ex(model: &WavePacketModel, tied: bool) -> Vec<f32> {
     p.extend_from_slice(&model.ln_f.bias);
     if model.phase_native {
         p.extend_from_slice(&model.output_corrector);
-        // No lm_head in param vector — phase coherence replaces the decoder
+        p.extend_from_slice(&model.output_scale);
+        if let Some(ref w) = model.iq_weights { p.extend_from_slice(w); }
     } else if let Some(ref wds) = model.wd_state {
         p.extend_from_slice(&wave_decode::flatten_params(wds));
     } else if model.lm_rank > 0 {
@@ -322,7 +332,11 @@ pub fn unflatten_params_ex(model: &mut WavePacketModel, params: &[f32], tied: bo
     if model.phase_native {
         let nc = model.output_corrector.len();
         model.output_corrector.copy_from_slice(&params[idx..idx+nc]); idx += nc;
-        // No lm_head to unflatten
+        let ns = model.output_scale.len();
+        model.output_scale.copy_from_slice(&params[idx..idx+ns]); idx += ns;
+        if model.iq_weights.is_some() {
+            model.iq_weights = Some([params[idx], params[idx+1]]); idx += 2;
+        }
     } else if let Some(ref mut wds) = model.wd_state {
         let wn = wave_decode::param_count(wds);
         wave_decode::unflatten_params(wds, &params[idx..idx + wn]);

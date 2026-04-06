@@ -51,13 +51,15 @@ pub struct Gradients {
     pub tied_temperature: f32,
     // Layer scale gradients
     pub layer_scale: Vec<f32>,
-    // Output corrector gradients (phase-native only)
+    // Output corrector + adapter gradients (phase-native only)
     pub d_output_corrector: Vec<f32>,
+    pub d_output_scale: Vec<f32>,
+    pub d_iq_weights: [f32; 2],
     // Wave transduction gradients (self-contained)
     pub wd_grads: Option<crate::common::wave_decode::WaveDecodeGrads>,
 }
 
-pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], d: Dims, gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>, ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>, full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>) -> (f32, Gradients) {
+pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], d: Dims, gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>, ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>, full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>, input_tokens: Option<&[usize]>) -> (f32, Gradients) {
     let t = cache.logits.len();
     let vocab_size = model.vocab_size;
 
@@ -93,6 +95,8 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         lm_up: if d.lm_rank > 0 { vec![vec![0.0; d.lm_rank]; vocab_size] } else { vec![] },
         layer_scale: if d.use_layer_scale { vec![0.0; n_blocks] } else { vec![] },
         d_output_corrector: vec![],
+        d_output_scale: vec![],
+        d_iq_weights: [0.0; 2],
         tied_temperature: 0.0,
         wd_grads: None, // populated by wave_decode::backward when active
     };
@@ -106,18 +110,31 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
         // No lm_head involved. The ODE learns to output in embedding space.
         let temp = if d.phase_temp > 0.0 { d.phase_temp } else { 1.0 };
         let mut d_output_corrector = vec![0.0f32; d.n_bands];
+        let mut d_output_scale = vec![0.0f32; d.n_bands];
+        let mut d_iq_weights = [0.0f32; 2];
         for pos in 0..t {
-            let (loss, d_h, d_oc) = crate::common::phase_loss::phase_native_loss(
+            // Delta decode: pass current token's embedding to subtract the residual echo
+            let inp_emb = input_tokens.map(|toks| model.wte[toks[pos]].as_slice());
+            let (loss, d_h, d_oc, d_os, d_iq) = crate::common::phase_loss::phase_native_loss(
                 &cache.post_ln_f[pos], &model.wte, targets[pos], d.n_bands, temp,
-                &model.output_corrector,
+                &model.output_corrector, &model.output_scale, inp_emb,
+                model.detect_mode, model.iq_weights.as_ref(),
             );
+            // Accumulate IQ weight gradients
+            if let Some(diq) = d_iq {
+                d_iq_weights[0] += diq[0] / t as f32;
+                d_iq_weights[1] += diq[1] / t as f32;
+            }
             total_loss += loss;
             for j in 0..n_embd { d_hidden[pos][j] = d_h[j] / t as f32; }
             for k in 0..d.n_bands { d_output_corrector[k] += d_oc[k] / t as f32; }
+            for k in 0..d.n_bands { d_output_scale[k] += d_os[k] / t as f32; }
         }
         total_loss /= t as f32;
-        // Store output corrector gradient for flatten_grads
+        // Store output corrector + adapter gradients for flatten_grads
         grads.d_output_corrector = d_output_corrector;
+        grads.d_output_scale = d_output_scale;
+        grads.d_iq_weights = d_iq_weights;
     } else {
     // Standard loss + d_logits through lm_head
     let mut d_logits: Vec<Vec<f32>> = Vec::with_capacity(t);
@@ -618,6 +635,10 @@ pub fn flatten_grads_ex(grads: &Gradients, tied: bool) -> Vec<f32> {
     g.extend_from_slice(&grads.ln_f_b);
     if !grads.d_output_corrector.is_empty() {
         g.extend_from_slice(&grads.d_output_corrector);
+        g.extend_from_slice(&grads.d_output_scale);
+        if grads.d_iq_weights[0] != 0.0 || grads.d_iq_weights[1] != 0.0 {
+            g.extend_from_slice(&grads.d_iq_weights);
+        }
     }
     if let Some(ref wg) = grads.wd_grads {
         g.extend_from_slice(&crate::common::wave_decode::flatten_grads(wg));
