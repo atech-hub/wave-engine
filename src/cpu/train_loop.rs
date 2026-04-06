@@ -69,6 +69,15 @@ pub fn run_training(config: TrainConfig) {
         println!("Initializing model (seed=42)...");
         model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()), config.alpha, config.beta);
         model.phase_native = config.phase_native; // Must set before count_trainable
+        // Set detect mode + IQ weights BEFORE count_trainable (IQ adds 2 params)
+        model.detect_mode = match config.phase_detect.as_str() {
+            "q" => crate::common::phase_loss::DetectMode::Q,
+            "iq" => {
+                model.iq_weights = Some([1.0, 0.0]);
+                crate::common::phase_loss::DetectMode::IQ
+            }
+            _ => crate::common::phase_loss::DetectMode::I,
+        };
         start_iter = 0;
         let n_t = count_trainable_ex(&model, config.tied);
         optimizer = Adam::new(config.lr, n_t);
@@ -467,10 +476,11 @@ pub fn run_training(config: TrainConfig) {
                     }).collect());
                 }
             }
-            // I/Q channel monitor
+            // I/Q channel monitor + w_I/w_Q logging
             if let Some(ref iq) = health.iq_analysis {
-                eprintln!("  [I/Q] I_disc={:.3} Q_disc={:.3} IQ_ratio={:.3} phase_std={:.3} I_rank={} Q_rank={}",
-                    iq.i_discrim, iq.q_discrim, iq.iq_ratio, iq.phase_std, iq.i_correct_rank, iq.q_correct_rank);
+                let wiq = model.iq_weights.map_or(String::new(), |w| format!(" w_I={:.4} w_Q={:.4}", w[0], w[1]));
+                eprintln!("  [I/Q] I_disc={:.3} Q_disc={:.3} IQ_ratio={:.3} phase_std={:.3} I_rank={} Q_rank={}{}",
+                    iq.i_discrim, iq.q_discrim, iq.iq_ratio, iq.phase_std, iq.i_correct_rank, iq.q_correct_rank, wiq);
                 break; // only print once per health interval
             }
         }
@@ -530,6 +540,13 @@ pub fn run_training(config: TrainConfig) {
 
         // LR scale: per-group gradient scaling before optimizer step.
         train_health::apply_lr_scale(&mut model, &config, dims, &mut total_grads, current_lr);
+
+        // IQ weight LR damping: 2 params need 100x lower LR to prevent oscillation
+        if model.iq_weights.is_some() && total_grads.len() >= 2 {
+            let n = total_grads.len();
+            total_grads[n - 2] *= 0.01;
+            total_grads[n - 1] *= 0.01;
+        }
 
         let mut params = flatten_params_ex(&model, config.tied);
         if config.wd.is_active() {
