@@ -295,12 +295,19 @@ pub fn run_training(config: TrainConfig) {
         };
         optimizer.lr = current_lr;
 
+        // RNG desync at health intervals — break the deterministic batch alignment
+        // that caused low-loss spikes at exact 500-multiples (measurement artifact)
+        let is_health_iter = config.health_interval > 0 && iter % config.health_interval == 0;
+        if is_health_iter && iter > 0 {
+            for _ in 0..(iter % 7 + 1) { rng.next_u64(); }
+        }
+
         let starts: Vec<usize> = (0..batch_size)
             .map(|_| (rng.next_u64() as usize) % (train_data.len() - seq_len - 1))
             .collect();
 
         // Should we measure batch distortion this iteration?
-        let measure_batch_distortion = config.health_interval > 0 && iter % config.health_interval == 0;
+        let measure_batch_distortion = is_health_iter;
 
         let t_fwd = monitor.start();
         let batch_results: Vec<(f32, Vec<f32>, BatchHealthData)> = std::thread::scope(|s| {
@@ -477,12 +484,11 @@ pub fn run_training(config: TrainConfig) {
                     }).collect());
                 }
             }
-            // I/Q channel monitor + w_I/w_Q + corrector angle logging
+            // I/Q channel monitor + w_I/w_Q + corrector angle logging (print once, NO break)
             if let Some(ref iq) = health.iq_analysis {
                 let wiq = model.iq_weights.map_or(String::new(), |w| format!(" w_I={:.4} w_Q={:.4}", w[0], w[1]));
                 eprintln!("  [I/Q] I_disc={:.3} Q_disc={:.3} IQ_ratio={:.3} phase_std={:.3} I_rank={} Q_rank={}{}",
                     iq.i_discrim, iq.q_discrim, iq.iq_ratio, iq.phase_std, iq.i_correct_rank, iq.q_correct_rank, wiq);
-                // Log corrector angle summary (mean, std, max) — tells us how much phase correction the model learned
                 if !model.output_corrector.is_empty() {
                     let n = model.output_corrector.len() as f32;
                     let mean = model.output_corrector.iter().sum::<f32>() / n;
@@ -490,7 +496,6 @@ pub fn run_training(config: TrainConfig) {
                     let max_abs = model.output_corrector.iter().map(|a| a.abs()).fold(0.0f32, f32::max);
                     eprintln!("  [corrector] mean={:.4} std={:.4} max_abs={:.4} (radians)", mean, std, max_abs);
                 }
-                // Log output_scale summary (prism layer)
                 if model.output_scale.iter().any(|&s| (s - 1.0).abs() > 0.001) {
                     let n = model.output_scale.len() as f32;
                     let mean = model.output_scale.iter().sum::<f32>() / n;
@@ -498,7 +503,7 @@ pub fn run_training(config: TrainConfig) {
                     let max_s = model.output_scale.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     eprintln!("  [prism] mean={:.4} min={:.4} max={:.4}", mean, min_s, max_s);
                 }
-                break; // only print once per health interval
+                // NOTE: Do NOT break here — the loop must finish to accumulate all batch losses
             }
         }
         total_loss /= batch_size as f32;
