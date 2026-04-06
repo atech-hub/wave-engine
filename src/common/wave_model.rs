@@ -37,6 +37,7 @@ pub struct WavePacketModel {
     pub iq_weights: Option<[f32; 2]>, // [w_I, w_Q] for IQ mode (init [1.0, 0.0])
     pub output_corrector: Vec<f32>, // [n_bands] per-band phase rotation before phase comparison
     pub output_scale: Vec<f32>,     // [n_bands] per-band amplitude scale (init 1.0, phase-native adapter)
+    pub wave_translator: Vec<[f32; 4]>, // [n_bands] per-band 2x2 transform [a,b,c,d], init identity
 }
 
 pub fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
@@ -167,6 +168,17 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
         iq_weights: None,
         output_corrector: vec![0.0; d.n_bands], // 84 phase rotations, zero = transparent
         output_scale: vec![1.0; d.n_bands],     // per-band amplitude scale, identity = transparent
+        // Wave translator: bifurcation init — one deformation parameter, frequency-proportional
+        // Like the logistic map: not identity (r<3, frozen), not random (r>3.57, chaos).
+        // Deformation=0.1 crosses the first bifurcation — enough asymmetry for co-evolution.
+        // Higher bands get more deformation (Kerr produces more phase shift at higher harmonics).
+        wave_translator: {
+            let deformation = 0.1;
+            (0..d.n_bands).map(|k| {
+                let freq = (k as f32 + 1.0) / d.n_bands as f32;
+                [1.0, -deformation * freq, deformation * freq, 1.0]
+            }).collect()
+        },
     }
 }
 
@@ -206,6 +218,7 @@ pub fn count_trainable_ex(model: &WavePacketModel, tied: bool) -> usize {
     if model.phase_native {
         n += model.output_corrector.len(); // output corrector for phase-native decode
         n += model.output_scale.len();     // per-band amplitude adapter
+        n += model.wave_translator.len() * 4; // per-band 2x2 transform
         if model.iq_weights.is_some() { n += 2; } // I/Q detection weights
     } else if let Some(ref wds) = model.wd_state {
         n += wave_decode::param_count(wds);
@@ -263,6 +276,7 @@ pub fn flatten_params_ex(model: &WavePacketModel, tied: bool) -> Vec<f32> {
     if model.phase_native {
         p.extend_from_slice(&model.output_corrector);
         p.extend_from_slice(&model.output_scale);
+        for t in &model.wave_translator { p.extend_from_slice(t); }
         if let Some(ref w) = model.iq_weights { p.extend_from_slice(w); }
     } else if let Some(ref wds) = model.wd_state {
         p.extend_from_slice(&wave_decode::flatten_params(wds));
@@ -334,6 +348,10 @@ pub fn unflatten_params_ex(model: &mut WavePacketModel, params: &[f32], tied: bo
         model.output_corrector.copy_from_slice(&params[idx..idx+nc]); idx += nc;
         let ns = model.output_scale.len();
         model.output_scale.copy_from_slice(&params[idx..idx+ns]); idx += ns;
+        for k in 0..model.wave_translator.len() {
+            model.wave_translator[k] = [params[idx], params[idx+1], params[idx+2], params[idx+3]];
+            idx += 4;
+        }
         if model.iq_weights.is_some() {
             model.iq_weights = Some([params[idx], params[idx+1]]); idx += 2;
         }

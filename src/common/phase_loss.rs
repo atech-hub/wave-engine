@@ -27,10 +27,11 @@ pub fn phase_native_loss(
     temperature: f32,
     output_corrector: &[f32], // [n_bands] — per-band phase rotation angles
     output_scale: &[f32],     // [n_bands] — per-band amplitude scale (init 1.0)
+    wave_translator: &[[f32; 4]], // [n_bands] per-band 2x2 [a,b,c,d], identity init
     input_embedding: Option<&[f32]>,  // delta decode: current token's embedding to subtract
     detect_mode: DetectMode,          // I, Q, or IQ detection
     iq_weights: Option<&[f32; 2]>,    // [w_I, w_Q] for IQ mode
-) -> (f32, Vec<f32>, Vec<f32>, Vec<f32>, Option<[f32; 2]>) {  // (loss, d_hidden, d_corrector, d_output_scale, d_iq_weights)
+) -> (f32, Vec<f32>, Vec<f32>, Vec<f32>, Vec<[f32; 4]>, Option<[f32; 2]>) {  // + d_wave_translator
     let vocab_size = embeddings.len();
     let n_embd = n_bands * 2;
 
@@ -51,8 +52,18 @@ pub fn phase_native_loss(
         corrected[k * 2 + 1] *= output_scale[k];
     }
 
+    // Wave translator: per-band 2×2 transform (the actual decoder)
+    // Gives the ODE complete freedom — translates its output back to embedding space
+    let pre_translator = corrected.clone();
+    for k in 0..n_bands {
+        let r = corrected[k * 2];
+        let s = corrected[k * 2 + 1];
+        let [a, b, c, d] = wave_translator[k];
+        corrected[k * 2]     = a * r + b * s;
+        corrected[k * 2 + 1] = c * r + d * s;
+    }
+
     // Delta decode: subtract input token's embedding to strip the residual echo.
-    // The dot product then measures only the model's computation, not the carrier wave.
     let decode_signal = if let Some(inp_emb) = input_embedding {
         let mut delta = vec![0.0f32; n_embd];
         for j in 0..n_embd {
@@ -151,16 +162,30 @@ pub fn phase_native_loss(
     // d_decode is w.r.t. decode_signal; for delta decode, d_corrected = d_decode (linear)
     let d_corrected = d_decode;
 
-    // Chain through output_scale: d_corrected is w.r.t. scaled corrected
-    // d_pre_scale[j] = d_corrected[j] * output_scale[k] (where k = j/2)
-    // d_output_scale[k] = d_corrected[k*2] * pre_scale[k*2] + d_corrected[k*2+1] * pre_scale[k*2+1]
+    // Chain through wave translator: d_corrected → d_translator + d_pre_translator
+    let mut d_wave_translator = vec![[0.0f32; 4]; n_bands];
+    let mut d_post_scale = vec![0.0f32; n_embd]; // gradient w.r.t. pre-translator (post-scale) values
+    for k in 0..n_bands {
+        let dc_r = d_corrected[k * 2];
+        let dc_s = d_corrected[k * 2 + 1];
+        let r_pre = pre_translator[k * 2];
+        let s_pre = pre_translator[k * 2 + 1];
+        let [a, _, c, _] = wave_translator[k];
+        // d_translator params
+        d_wave_translator[k] = [dc_r * r_pre, dc_r * s_pre, dc_s * r_pre, dc_s * s_pre];
+        // d_pre_translator (chain back to scale/corrector)
+        d_post_scale[k * 2]     = dc_r * a + dc_s * c;
+        d_post_scale[k * 2 + 1] = dc_r * wave_translator[k][1] + dc_s * wave_translator[k][3];
+    }
+
+    // Chain through output_scale
     let mut d_output_scale = vec![0.0f32; n_bands];
     let mut d_pre_scale = vec![0.0f32; n_embd];
     for k in 0..n_bands {
-        d_output_scale[k] = d_corrected[k * 2] * pre_scale[k * 2]
-                          + d_corrected[k * 2 + 1] * pre_scale[k * 2 + 1];
-        d_pre_scale[k * 2]     = d_corrected[k * 2]     * output_scale[k];
-        d_pre_scale[k * 2 + 1] = d_corrected[k * 2 + 1] * output_scale[k];
+        d_output_scale[k] = d_post_scale[k * 2] * pre_scale[k * 2]
+                          + d_post_scale[k * 2 + 1] * pre_scale[k * 2 + 1];
+        d_pre_scale[k * 2]     = d_post_scale[k * 2]     * output_scale[k];
+        d_pre_scale[k * 2 + 1] = d_post_scale[k * 2 + 1] * output_scale[k];
     }
 
     // Chain through output corrector rotation to get d_hidden and d_corrector
@@ -182,7 +207,7 @@ pub fn phase_native_loss(
                        + dc_s * ( r * cos_c - s * sin_c);
     }
 
-    (loss, d_hidden, d_corrector, d_output_scale, d_iq)
+    (loss, d_hidden, d_corrector, d_output_scale, d_wave_translator, d_iq)
 }
 
 #[cfg(test)]
@@ -203,7 +228,7 @@ mod tests {
         let temp = 1.0;
 
         let corrector = vec![0.1, -0.2, 0.05, 0.3]; // 4 phase rotations
-        let (loss, grad, d_corr, _d_scale, _d_iq) = phase_native_loss(&hidden, &embeddings, target, n_bands, temp, &corrector, &vec![1.0; n_bands], None, DetectMode::I, None);
+        let (loss, grad, d_corr, _d_scale, _d_wt, _d_iq) = phase_native_loss(&hidden, &embeddings, target, n_bands, temp, &corrector, &vec![1.0; n_bands], &vec![[1.0, 0.0, 0.0, 1.0]; n_bands], None, DetectMode::I, None);
         assert!(loss > 0.0, "Loss should be positive");
 
         // Finite difference check
@@ -213,8 +238,8 @@ mod tests {
             let mut h_minus = hidden.clone();
             h_plus[i] += eps;
             h_minus[i] -= eps;
-            let (l_plus, _, _, _, _) = phase_native_loss(&h_plus, &embeddings, target, n_bands, temp, &corrector, &vec![1.0; n_bands], None, DetectMode::I, None);
-            let (l_minus, _, _, _, _) = phase_native_loss(&h_minus, &embeddings, target, n_bands, temp, &corrector, &vec![1.0; n_bands], None, DetectMode::I, None);
+            let (l_plus, _, _, _, _, _) = phase_native_loss(&h_plus, &embeddings, target, n_bands, temp, &corrector, &vec![1.0; n_bands], &vec![[1.0, 0.0, 0.0, 1.0]; n_bands], None, DetectMode::I, None);
+            let (l_minus, _, _, _, _, _) = phase_native_loss(&h_minus, &embeddings, target, n_bands, temp, &corrector, &vec![1.0; n_bands], &vec![[1.0, 0.0, 0.0, 1.0]; n_bands], None, DetectMode::I, None);
             let fd = (l_plus - l_minus) / (2.0 * eps);
             let rel_err = if grad[i].abs() > 1e-6 {
                 (fd - grad[i]).abs() / grad[i].abs()
@@ -231,8 +256,8 @@ mod tests {
             let mut c_minus = corrector.clone();
             c_plus[i] += eps;
             c_minus[i] -= eps;
-            let (l_plus, _, _, _, _) = phase_native_loss(&hidden, &embeddings, target, n_bands, temp, &c_plus, &vec![1.0; n_bands], None, DetectMode::I, None);
-            let (l_minus, _, _, _, _) = phase_native_loss(&hidden, &embeddings, target, n_bands, temp, &c_minus, &vec![1.0; n_bands], None, DetectMode::I, None);
+            let (l_plus, _, _, _, _, _) = phase_native_loss(&hidden, &embeddings, target, n_bands, temp, &c_plus, &vec![1.0; n_bands], &vec![[1.0, 0.0, 0.0, 1.0]; n_bands], None, DetectMode::I, None);
+            let (l_minus, _, _, _, _, _) = phase_native_loss(&hidden, &embeddings, target, n_bands, temp, &c_minus, &vec![1.0; n_bands], &vec![[1.0, 0.0, 0.0, 1.0]; n_bands], None, DetectMode::I, None);
             let fd = (l_plus - l_minus) / (2.0 * eps);
             let rel_err = if d_corr[i].abs() > 1e-6 {
                 (fd - d_corr[i]).abs() / d_corr[i].abs()

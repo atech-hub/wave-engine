@@ -148,6 +148,14 @@ pub fn forward_with_cache(
                 corrected[k * 2]     *= model.output_scale[k];
                 corrected[k * 2 + 1] *= model.output_scale[k];
             }
+            // Wave translator: per-band 2×2 transform
+            for k in 0..n_bands {
+                let r = corrected[k * 2];
+                let s = corrected[k * 2 + 1];
+                let [a, b, c, d] = model.wave_translator[k];
+                corrected[k * 2]     = a * r + b * s;
+                corrected[k * 2 + 1] = c * r + d * s;
+            }
             // Coherent detection: I/Q scoring
             let scale = 1.0 / ((n_bands * 2) as f32).sqrt();
             let detect = model.detect_mode;

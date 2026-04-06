@@ -268,6 +268,7 @@ pub fn run_training(config: TrainConfig) {
     println!("{}", "-".repeat(30));
 
     let train_start = std::time::Instant::now();
+    let mut recent_losses: Vec<f32> = Vec::with_capacity(100); // rolling window for true loss
 
     let warmup_iters = 100usize;
     let min_lr_ratio = 0.1f32; // decay to 10% of base LR
@@ -592,8 +593,15 @@ pub fn run_training(config: TrainConfig) {
             &model, &config, &total_grads, grad_norm, n_trainable, dims,
         );
 
+        // Track rolling loss (uncontaminated by health-interval batch alignment)
+        recent_losses.push(total_loss);
+        if recent_losses.len() > 100 { recent_losses.remove(0); }
+
         if iter % 10 == 0 || iter == total_iters - 1 {
-            println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  gnorm={:.2}", iter, total_loss, iter_start.elapsed(), current_lr, grad_norm);
+            let avg_loss = if recent_losses.len() >= 10 {
+                recent_losses.iter().sum::<f32>() / recent_losses.len() as f32
+            } else { total_loss };
+            println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  gnorm={:.2}  avg100={:.4}", iter, total_loss, iter_start.elapsed(), current_lr, grad_norm, avg_loss);
             if monitor.enabled() {
                 monitor.report(if iter == 0 { 1 } else { 50.min(iter) });
                 monitor.reset();

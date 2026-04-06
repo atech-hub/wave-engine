@@ -202,8 +202,12 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
         let n_with_lm = n + lm_head_params;
         let n_with_oc = n + ck_bands; // output corrector only
         let n_with_oc_scale = n + ck_bands * 2; // corrector + output_scale
-        let n_with_oc_scale_iq = n + ck_bands * 2 + 2; // corrector + output_scale + iq_weights
-        if data_bytes == n_with_oc_scale_iq * 12 { n_with_oc_scale_iq }
+        let n_with_oc_scale_trans = n + ck_bands * 2 + ck_bands * 4; // + wave_translator
+        let n_with_oc_scale_trans_iq = n + ck_bands * 2 + ck_bands * 4 + 2; // + iq_weights
+        let n_with_oc_scale_iq = n + ck_bands * 2 + 2; // corrector + output_scale + iq_weights (old, no translator)
+        if data_bytes == n_with_oc_scale_trans_iq * 12 { n_with_oc_scale_trans_iq }
+        else if data_bytes == n_with_oc_scale_trans * 12 { n_with_oc_scale_trans }
+        else if data_bytes == n_with_oc_scale_iq * 12 { n_with_oc_scale_iq }
         else if data_bytes == n_with_oc_scale * 12 { n_with_oc_scale }
         else if data_bytes == n_with_oc * 12 { n_with_oc }
         else { n_with_lm }

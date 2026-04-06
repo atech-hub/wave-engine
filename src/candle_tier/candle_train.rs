@@ -728,7 +728,7 @@ pub mod train {
                         phase_native: false, delta_decode: false,
                         detect_mode: crate::common::phase_loss::DetectMode::I,
                         iq_weights: None,
-                        output_corrector: vec![], output_scale: vec![],
+                        output_corrector: vec![], output_scale: vec![], wave_translator: vec![],
                     });
                     let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#,
                         iter, crate::common::embedding_monitor::to_json(&embed_stats));
