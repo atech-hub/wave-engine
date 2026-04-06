@@ -78,6 +78,8 @@ pub fn run_training(config: TrainConfig) {
     let n_trainable = count_trainable_ex(&model, config.tied);
     if config.tied {
         println!("  Trainable parameters: {n_trainable} (TIED — lm_head=wte, all gradient to ODE)");
+    } else if model.phase_native {
+        println!("  Trainable parameters: {n_trainable} (phase-native — zero decoder, dot product against embeddings)");
     } else {
         println!("  Trainable parameters: {n_trainable} (attention frozen, FFN+LN+lm_head trainable)");
     }
