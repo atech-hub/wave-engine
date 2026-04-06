@@ -245,6 +245,7 @@ pub fn run_training(config: TrainConfig) {
     println!("{}", "-".repeat(30));
 
     let train_start = std::time::Instant::now();
+    let mut recent_losses: Vec<f32> = Vec::with_capacity(100);
 
     let warmup_iters = 100usize;
     let min_lr_ratio = 0.1f32; // decay to 10% of base LR
@@ -354,6 +355,16 @@ pub fn run_training(config: TrainConfig) {
                         None
                     };
 
+                    // I/Q channel monitor — observation only, no learnable params
+                    let iq_analysis = if is_health {
+                        Some(crate::common::iq_monitor::analyze_iq_batch(
+                            &cache.post_ln_f, &model_ref.wte, target,
+                            dims.n_bands, &model_ref.output_corrector, &vec![1.0; dims.n_bands], 10,
+                        ))
+                    } else {
+                        None
+                    };
+
                     let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref);
                     // Gradient flow analysis on first batch element at health intervals
                     let grad_flow = if is_health {
@@ -362,7 +373,7 @@ pub fn run_training(config: TrainConfig) {
                         None
                     };
                     (loss, flatten_grads_ex(&grads, dims.tied), BatchHealthData {
-                        distortion, grad_flow, attn_stats, flow_stats, output_stats, ode_dynamics,
+                        distortion, grad_flow, attn_stats, flow_stats, output_stats, ode_dynamics, iq_analysis,
                     })
                 })
             }).collect();
@@ -440,6 +451,18 @@ pub fn run_training(config: TrainConfig) {
                         energy_ratio: s.energy_ratio, band_energy_std: s.band_energy_std,
                         damping_effective: s.damping_effective,
                     }).collect());
+                }
+            }
+            // I/Q + corrector logging (after loop — no break, no contamination)
+            if let Some(ref iq) = health.iq_analysis {
+                eprintln!("  [I/Q] I_disc={:.3} Q_disc={:.3} IQ_ratio={:.3} phase_std={:.3} I_rank={} Q_rank={}",
+                    iq.i_discrim, iq.q_discrim, iq.iq_ratio, iq.phase_std, iq.i_correct_rank, iq.q_correct_rank);
+                if !model.output_corrector.is_empty() {
+                    let n = model.output_corrector.len() as f32;
+                    let mean = model.output_corrector.iter().sum::<f32>() / n;
+                    let std = (model.output_corrector.iter().map(|&a| (a - mean) * (a - mean)).sum::<f32>() / n).sqrt();
+                    let max_abs = model.output_corrector.iter().map(|a| a.abs()).fold(0.0f32, f32::max);
+                    eprintln!("  [corrector] mean={:.4} std={:.4} max_abs={:.4} (radians)", mean, std, max_abs);
                 }
             }
         }
@@ -528,8 +551,15 @@ pub fn run_training(config: TrainConfig) {
             &model, &config, &total_grads, grad_norm, n_trainable, dims,
         );
 
+        // Rolling avg100 for honest loss reporting
+        recent_losses.push(total_loss);
+        if recent_losses.len() > 100 { recent_losses.remove(0); }
+
         if iter % 10 == 0 || iter == total_iters - 1 {
-            println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  gnorm={:.2}", iter, total_loss, iter_start.elapsed(), current_lr, grad_norm);
+            let avg100 = if recent_losses.len() >= 10 {
+                recent_losses.iter().sum::<f32>() / recent_losses.len() as f32
+            } else { total_loss };
+            println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  gnorm={:.2}  avg100={:.4}", iter, total_loss, iter_start.elapsed(), current_lr, grad_norm, avg100);
             if monitor.enabled() {
                 monitor.report(if iter == 0 { 1 } else { 50.min(iter) });
                 monitor.reset();
