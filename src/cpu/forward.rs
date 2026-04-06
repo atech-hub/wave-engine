@@ -143,12 +143,35 @@ pub fn forward_with_cache(
                 corrected[k * 2]     = r * cos_c - s * sin_c;
                 corrected[k * 2 + 1] = r * sin_c + s * cos_c;
             }
-            // Scaled dot product against frozen embeddings (1/sqrt(n_embd))
+            // Apply output_scale (prism layer)
+            for k in 0..n_bands {
+                corrected[k * 2]     *= model.output_scale[k];
+                corrected[k * 2 + 1] *= model.output_scale[k];
+            }
+            // Coherent detection: I/Q scoring
             let scale = 1.0 / ((n_bands * 2) as f32).sqrt();
+            let detect = model.detect_mode;
+            let iq_w = model.iq_weights;
             (0..model.vocab_size).map(|v| {
                 let emb = &model.wte[v];
-                let mut score = 0.0f32;
-                for j in 0..(n_bands * 2) { score += corrected[j] * emb[j]; }
+                let mut i_sum = 0.0f32;
+                let mut q_sum = 0.0f32;
+                for k in 0..n_bands {
+                    let r_out = corrected[k * 2];
+                    let s_out = corrected[k * 2 + 1];
+                    let r_emb = emb[k * 2];
+                    let s_emb = emb[k * 2 + 1];
+                    i_sum += r_out * r_emb + s_out * s_emb;
+                    q_sum += s_out * r_emb - r_out * s_emb;
+                }
+                let score = match detect {
+                    crate::common::phase_loss::DetectMode::I => i_sum,
+                    crate::common::phase_loss::DetectMode::Q => q_sum,
+                    crate::common::phase_loss::DetectMode::IQ => {
+                        let w = iq_w.unwrap_or([1.0, 0.0]);
+                        w[0] * i_sum + w[1] * q_sum
+                    }
+                };
                 score * scale
             }).collect()
         }).collect()

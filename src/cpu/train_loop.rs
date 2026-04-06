@@ -378,7 +378,7 @@ pub fn run_training(config: TrainConfig) {
                     };
 
                     // I/Q channel monitor — measures where the ODE signal lives
-                    let iq_analysis = if is_health && model_ref.phase_native {
+                    let iq_analysis = if is_health {
                         Some(crate::common::iq_monitor::analyze_iq_batch(
                             &cache.post_ln_f, &model_ref.wte, target,
                             dims.n_bands, &model_ref.output_corrector, &model_ref.output_scale, 10,

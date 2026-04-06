@@ -200,8 +200,12 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
         let file_len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
         let data_bytes = file_len.saturating_sub(header_size_v3);
         let n_with_lm = n + lm_head_params;
-        let n_with_oc = n + ck_bands; // output corrector instead of lm_head
-        if data_bytes == n_with_oc * 12 { n_with_oc }
+        let n_with_oc = n + ck_bands; // output corrector only
+        let n_with_oc_scale = n + ck_bands * 2; // corrector + output_scale
+        let n_with_oc_scale_iq = n + ck_bands * 2 + 2; // corrector + output_scale + iq_weights
+        if data_bytes == n_with_oc_scale_iq * 12 { n_with_oc_scale_iq }
+        else if data_bytes == n_with_oc_scale * 12 { n_with_oc_scale }
+        else if data_bytes == n_with_oc * 12 { n_with_oc }
         else { n_with_lm }
     } else {
         // v1/v2: fall back to file-size detection across all variants

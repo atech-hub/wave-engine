@@ -70,7 +70,18 @@ pub fn run_generate(config: GenerateConfig) {
         let d = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
             .with_corrector(has_ode).with_learnable_ode(has_ode)
             .with_layer_scale(has_ls).with_rk4_weights(has_rk4).with_dyn_harmonics(has_harm);
-        // Try phase-native first, then standard
+        // Try phase-native + IQ first, then phase-native, then standard
+        let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, d, config.alpha, config.beta);
+        m.phase_native = true;
+        m.iq_weights = Some([1.0, 0.0]); // try with IQ params
+        if params.len() == count_trainable_ex(&m, false) {
+            unflatten_params_ex(&mut m, &params, false);
+            m.detect_mode = crate::common::phase_loss::DetectMode::IQ;
+            eprintln!("  Loaded {} params (phase-native+IQ, flags=0x{:02x}) from {}", params.len(), ck_flags, config.resume_path);
+            mdl = m;
+            loaded = true;
+        }
+        if !loaded {
         let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, d, config.alpha, config.beta);
         m.phase_native = true;
         if params.len() == count_trainable_ex(&m, false) {
@@ -90,6 +101,7 @@ pub fn run_generate(config: GenerateConfig) {
                 loaded = true;
             }
         }
+        } // close if !loaded
     }
 
     // Helper: try a specific Dims configuration
@@ -177,6 +189,11 @@ pub fn run_generate(config: GenerateConfig) {
     }
     mdl.learnable_ode = false;
     mdl.phase_native = config.phase_native;
+    // Enable IQ detection if checkpoint has iq_weights
+    if mdl.iq_weights.is_some() {
+        mdl.detect_mode = crate::common::phase_loss::DetectMode::IQ;
+        eprintln!("  IQ detection: w_I={:.4} w_Q={:.4}", mdl.iq_weights.unwrap()[0], mdl.iq_weights.unwrap()[1]);
+    }
 
     eprintln!("  Model: {}L, {}bands, {}dim, {}vocab, iter {}{}",
         config.n_layers, config.n_bands, n_embd, effective_vocab, ck_iter,
