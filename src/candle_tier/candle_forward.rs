@@ -597,6 +597,13 @@ pub mod forward {
 
             // Final LN + logits (same as forward_with_curriculum)
             let normed = layer_norm(&hidden, &self.ln_f_w, &self.ln_f_b)?;
+
+            // Store post-LN hidden for I/Q analysis (phase-native only)
+            if self.phase_native {
+                let normed_cpu = normed.to_vec2::<f32>()?;
+                monitor.post_ln_f = Some(normed_cpu);
+            }
+
             let logits = if self.phase_native {
                 let scale = 1.0 / (self.n_embd as f64).sqrt();
                 if let Some(ref oc) = self.output_corrector {

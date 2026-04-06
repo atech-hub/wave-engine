@@ -318,6 +318,22 @@ pub mod train {
                     output_dist = Some(compute_output_dist(&logits, target));
                 }
 
+                // I/Q channel monitor (from forward_with_monitors post_ln_f)
+                if let Some(ref m) = monitor_opt {
+                    if let Some(ref post_ln) = m.post_ln_f {
+                        let wte_cpu: Vec<Vec<f32>> = model.wte.to_vec2::<f32>()?;
+                        let oc_cpu: Vec<f32> = if let Some(ref oc) = model.output_corrector {
+                            oc.to_vec1::<f32>()?
+                        } else { vec![0.0; n_bands] };
+                        let os_cpu = vec![1.0f32; n_bands]; // output_scale not in candle model yet
+                        let iq = crate::common::iq_monitor::analyze_iq_batch(
+                            post_ln, &wte_cpu, target, n_bands, &oc_cpu, &os_cpu, 10,
+                        );
+                        eprintln!("  [I/Q] I_disc={:.3} Q_disc={:.3} IQ_ratio={:.3} phase_std={:.3} I_rank={} Q_rank={}",
+                            iq.i_discrim, iq.q_discrim, iq.iq_ratio, iq.phase_std, iq.i_correct_rank, iq.q_correct_rank);
+                    }
+                }
+
                 let target_tensor = Tensor::from_vec(
                     target.to_vec().iter().map(|&t| t as u32).collect::<Vec<u32>>(),
                     (seq_len,), &device,
@@ -709,7 +725,10 @@ pub mod train {
                         tied_temperature: 1.0, wd_state: None, learnable_ode: false,
                         use_rk4_weights: false, use_dyn_harmonics: false, layer_scale: vec![], use_layer_scale: false,
                         lr_scale: vec![], use_lr_scale: false, wd_scale: vec![], agc_headroom: vec![],
-                        phase_native: false, output_corrector: vec![],
+                        phase_native: false, delta_decode: false,
+                        detect_mode: crate::common::phase_loss::DetectMode::I,
+                        iq_weights: None,
+                        output_corrector: vec![], output_scale: vec![],
                     });
                     let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#,
                         iter, crate::common::embedding_monitor::to_json(&embed_stats));
