@@ -321,6 +321,21 @@ pub mod train {
                 let loss = candle_nn::loss::cross_entropy(&logits, &target_tensor)?;
                 let loss_val = loss.to_scalar::<f32>()?;
 
+                // Preflight: initial loss sanity check (first batch of first iter)
+                if iter == start_iter && _b == 0 {
+                    let expected_random = (vocab_size as f32).ln();
+                    if loss_val > expected_random * 5.0 {
+                        eprintln!("  [preflight] ABORT: Initial loss {:.1} is {:.0}x above random ({:.1})",
+                            loss_val, loss_val / expected_random, expected_random);
+                        eprintln!("  Phase-native logits may need scaling by 1/sqrt(n_embd).");
+                        eprintln!("  This indicates a logit magnitude problem — training will not converge.");
+                        return Err(candle_core::Error::Msg(format!(
+                            "Initial loss {:.1} is {:.0}x above random — aborting to prevent wasted compute",
+                            loss_val, loss_val / expected_random
+                        )));
+                    }
+                }
+
                 if loss_val.is_nan() || loss_val.is_infinite() {
                     nan_skip_count += 1;
                     eprintln!("  [NaN skip] iter {iter} batch {_b} (total skips: {nan_skip_count})");

@@ -31,8 +31,9 @@ pub fn phase_native_loss(
         corrected[k * 2 + 1] = r * sin_c + s * cos_c;
     }
 
-    // Dot product against embeddings — same metric as lm_head but against fixed embeddings.
-    // Magnitude matters: the ODE gets gradient through both phase AND magnitude.
+    // Scaled dot product against embeddings (1/sqrt(n_embd) prevents logit explosion at high dims).
+    // Same principle as Vaswani et al. scaled dot-product attention.
+    let scale = 1.0 / (n_embd as f32).sqrt();
     let mut coherences = vec![0.0f32; vocab_size];
     for v in 0..vocab_size {
         let emb = &embeddings[v];
@@ -40,7 +41,7 @@ pub fn phase_native_loss(
         for j in 0..n_embd {
             score += corrected[j] * emb[j];
         }
-        coherences[v] = score / temperature;
+        coherences[v] = score * scale / temperature;
     }
 
     // Softmax over coherences → probabilities
@@ -52,11 +53,11 @@ pub fn phase_native_loss(
     // Cross-entropy loss
     let loss = -probs[target].max(1e-10).ln();
 
-    // Gradient: d_loss/d_corrected — dot product gradient is simple: d_score/d_corrected[j] = emb[j]
-    // d_loss/d_score[v] = probs[v] - (v == target)
+    // Gradient: d_loss/d_corrected — chain through scale and temperature
+    // d_loss/d_score[v] = (probs[v] - (v == target)) * scale / temperature
     let mut d_corrected = vec![0.0f32; n_embd];
     for v in 0..vocab_size {
-        let weight = (probs[v] - if v == target { 1.0 } else { 0.0 }) / temperature;
+        let weight = (probs[v] - if v == target { 1.0 } else { 0.0 }) * scale / temperature;
         let emb = &embeddings[v];
         for j in 0..n_embd {
             d_corrected[j] += weight * emb[j];

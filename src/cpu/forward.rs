@@ -143,12 +143,13 @@ pub fn forward_with_cache(
                 corrected[k * 2]     = r * cos_c - s * sin_c;
                 corrected[k * 2 + 1] = r * sin_c + s * cos_c;
             }
-            // Dot product against frozen embeddings
+            // Scaled dot product against frozen embeddings (1/sqrt(n_embd))
+            let scale = 1.0 / ((n_bands * 2) as f32).sqrt();
             (0..model.vocab_size).map(|v| {
                 let emb = &model.wte[v];
                 let mut score = 0.0f32;
                 for j in 0..(n_bands * 2) { score += corrected[j] * emb[j]; }
-                score
+                score * scale
             }).collect()
         }).collect()
     } else if let Some(ref wds) = model.wd_state {
