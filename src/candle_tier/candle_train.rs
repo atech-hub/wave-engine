@@ -265,6 +265,10 @@ pub mod train {
         println!("  Telemetry: {log_name}");
         let mut nan_skip_count = 0usize;
 
+        // Stall detection: track loss at checkpoints for ratio-based abort
+        let mut loss_at_500: Option<f32> = None;
+        let mut loss_at_2000: Option<f32> = None;
+
         // Cosine LR schedule with warmup
         let warmup_iters = 100usize;
         let min_lr_ratio = 0.1;
@@ -750,6 +754,35 @@ pub mod train {
 
             if iter % 50 == 0 || iter == total_iters - 1 {
                 println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  vram={}MB", iter, total_loss, iter_time, current_lr, vram_used_mb);
+            }
+
+            // Stall detection: capture loss at milestone iters, check ratios
+            if iter == start_iter + 500 { loss_at_500 = Some(total_loss); }
+            if iter == start_iter + 2000 {
+                loss_at_2000 = Some(total_loss);
+                if let Some(l500) = loss_at_500 {
+                    let ratio = total_loss / l500;
+                    if ratio > 0.97 {
+                        eprintln!("  [stall] WARNING at iter {}: loss_2000/loss_500 = {:.3} (>{:.2}). Loss barely moving.",
+                            iter, ratio, 0.97);
+                        eprintln!("  [stall] loss@500={:.4}, loss@2000={:.4}. Consider: wrong LR, broken gradients, or architectural issue.",
+                            l500, total_loss);
+                    }
+                }
+            }
+            if iter == start_iter + 5000 {
+                if let Some(l2000) = loss_at_2000 {
+                    let ratio = total_loss / l2000;
+                    if ratio > 0.98 {
+                        eprintln!("  [stall] ABORT at iter {}: loss_5000/loss_2000 = {:.3} (>{:.2}). Training stalled for 3000 iters.",
+                            iter, ratio, 0.98);
+                        eprintln!("  [stall] loss@2000={:.4}, loss@5000={:.4}. Aborting to prevent wasted compute.",
+                            l2000, total_loss);
+                        return Err(candle_core::Error::Msg(format!(
+                            "Training stalled: loss_5000/loss_2000 = {:.3} > 0.98 — aborting", ratio
+                        )));
+                    }
+                }
             }
 
             // GPU duty cycle throttle: sleep between iterations to reduce temperature.
