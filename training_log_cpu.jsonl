@@ -1,0 +1,2 @@
+{"iter":0,"loss":4.9245,"lr":0.000001,"time_ms":126,"nan_skips":0,"model_gn":0.9248,"head_gn":0.3804,"head_pct":38.0,"layer_gn":[0.512,0.468,0.456,0.407],"ode_clamps":4674,"ode_max_mag":3.81,"agc_threshold":1.321,"agc_mean":1.244,"agc_std":0.591,"ode_params":[{"a":0.1000,"b":0.2000,"g":0.1000},{"a":0.1000,"b":0.2000,"g":0.1000},{"a":0.1000,"b":0.2000,"g":0.1000},{"a":0.1000,"b":0.2000,"g":0.1000}]}
+{"type":"summary","best_loss":4.9245,"best_iter":0,"final_avg":4.9245,"nan_skips":0,"total_iters":1,"time_secs":0,"ms_per_iter":126}

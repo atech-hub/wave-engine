@@ -44,7 +44,6 @@ pub mod monitors {
         pub layer_flow: Vec<CandleLayerFlow>,
         pub attn_heads: Vec<CandleAttnHead>,
         pub ode_dynamics: Vec<CandleOdeDynamics>,
-        pub post_ln_f: Option<Vec<Vec<f32>>>,  // [n_pos][n_embd] for I/Q analysis
     }
 
     impl CandleMonitorData {

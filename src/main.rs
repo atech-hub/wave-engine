@@ -494,9 +494,6 @@ fn main() {
         layer_scale: parse_dyn_param("--layer-scale"),
         lr_scale: parse_dyn_param("--lr-scale"),
         phase_native: std::env::args().any(|a| a == "--phase-native"),
-        delta_decode: std::env::args().any(|a| a == "--delta-decode"),
-        phase_detect: std::env::args().skip_while(|a| a != "--phase-detect").nth(1)
-            .unwrap_or_default(),
         phase_temp: parse_flag("--phase-temp", 1.0),
         pythagorean: std::env::args().any(|a| a == "--pythagorean"),
         spring_k: parse_flag("--spring", 0.1),

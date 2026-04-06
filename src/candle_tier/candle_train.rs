@@ -265,10 +265,6 @@ pub mod train {
         println!("  Telemetry: {log_name}");
         let mut nan_skip_count = 0usize;
 
-        // Stall detection: track loss at checkpoints for ratio-based abort
-        let mut loss_at_500: Option<f32> = None;
-        let mut loss_at_2000: Option<f32> = None;
-
         // Cosine LR schedule with warmup
         let warmup_iters = 100usize;
         let min_lr_ratio = 0.1;
@@ -318,43 +314,12 @@ pub mod train {
                     output_dist = Some(compute_output_dist(&logits, target));
                 }
 
-                // I/Q channel monitor (from forward_with_monitors post_ln_f)
-                if let Some(ref m) = monitor_opt {
-                    if let Some(ref post_ln) = m.post_ln_f {
-                        let wte_cpu: Vec<Vec<f32>> = model.wte.to_vec2::<f32>()?;
-                        let oc_cpu: Vec<f32> = if let Some(ref oc) = model.output_corrector {
-                            oc.to_vec1::<f32>()?
-                        } else { vec![0.0; n_bands] };
-                        let os_cpu = vec![1.0f32; n_bands]; // output_scale not in candle model yet
-                        let iq = crate::common::iq_monitor::analyze_iq_batch(
-                            post_ln, &wte_cpu, target, n_bands, &oc_cpu, &os_cpu, 10,
-                        );
-                        eprintln!("  [I/Q] I_disc={:.3} Q_disc={:.3} IQ_ratio={:.3} phase_std={:.3} I_rank={} Q_rank={}",
-                            iq.i_discrim, iq.q_discrim, iq.iq_ratio, iq.phase_std, iq.i_correct_rank, iq.q_correct_rank);
-                    }
-                }
-
                 let target_tensor = Tensor::from_vec(
                     target.to_vec().iter().map(|&t| t as u32).collect::<Vec<u32>>(),
                     (seq_len,), &device,
                 )?;
                 let loss = candle_nn::loss::cross_entropy(&logits, &target_tensor)?;
                 let loss_val = loss.to_scalar::<f32>()?;
-
-                // Preflight: initial loss sanity check (first batch of first iter)
-                if iter == start_iter && _b == 0 {
-                    let expected_random = (vocab_size as f32).ln();
-                    if loss_val > expected_random * 5.0 {
-                        eprintln!("  [preflight] ABORT: Initial loss {:.1} is {:.0}x above random ({:.1})",
-                            loss_val, loss_val / expected_random, expected_random);
-                        eprintln!("  Phase-native logits may need scaling by 1/sqrt(n_embd).");
-                        eprintln!("  This indicates a logit magnitude problem — training will not converge.");
-                        return Err(candle_core::Error::Msg(format!(
-                            "Initial loss {:.1} is {:.0}x above random — aborting to prevent wasted compute",
-                            loss_val, loss_val / expected_random
-                        )));
-                    }
-                }
 
                 if loss_val.is_nan() || loss_val.is_infinite() {
                     nan_skip_count += 1;
@@ -725,10 +690,7 @@ pub mod train {
                         tied_temperature: 1.0, wd_state: None, learnable_ode: false,
                         use_rk4_weights: false, use_dyn_harmonics: false, layer_scale: vec![], use_layer_scale: false,
                         lr_scale: vec![], use_lr_scale: false, wd_scale: vec![], agc_headroom: vec![],
-                        phase_native: false, delta_decode: false,
-                        detect_mode: crate::common::phase_loss::DetectMode::I,
-                        iq_weights: None,
-                        output_corrector: vec![], output_scale: vec![], wave_translator: vec![],
+                        phase_native: false, output_corrector: vec![],
                     });
                     let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#,
                         iter, crate::common::embedding_monitor::to_json(&embed_stats));
@@ -773,35 +735,6 @@ pub mod train {
 
             if iter % 50 == 0 || iter == total_iters - 1 {
                 println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  vram={}MB", iter, total_loss, iter_time, current_lr, vram_used_mb);
-            }
-
-            // Stall detection: capture loss at milestone iters, check ratios
-            if iter == start_iter + 500 { loss_at_500 = Some(total_loss); }
-            if iter == start_iter + 2000 {
-                loss_at_2000 = Some(total_loss);
-                if let Some(l500) = loss_at_500 {
-                    let ratio = total_loss / l500;
-                    if ratio > 0.97 {
-                        eprintln!("  [stall] WARNING at iter {}: loss_2000/loss_500 = {:.3} (>{:.2}). Loss barely moving.",
-                            iter, ratio, 0.97);
-                        eprintln!("  [stall] loss@500={:.4}, loss@2000={:.4}. Consider: wrong LR, broken gradients, or architectural issue.",
-                            l500, total_loss);
-                    }
-                }
-            }
-            if iter == start_iter + 5000 {
-                if let Some(l2000) = loss_at_2000 {
-                    let ratio = total_loss / l2000;
-                    if ratio > 0.98 {
-                        eprintln!("  [stall] ABORT at iter {}: loss_5000/loss_2000 = {:.3} (>{:.2}). Training stalled for 3000 iters.",
-                            iter, ratio, 0.98);
-                        eprintln!("  [stall] loss@2000={:.4}, loss@5000={:.4}. Aborting to prevent wasted compute.",
-                            l2000, total_loss);
-                        return Err(candle_core::Error::Msg(format!(
-                            "Training stalled: loss_5000/loss_2000 = {:.3} > 0.98 — aborting", ratio
-                        )));
-                    }
-                }
             }
 
             // GPU duty cycle throttle: sleep between iterations to reduce temperature.

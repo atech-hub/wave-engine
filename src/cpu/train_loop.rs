@@ -69,15 +69,6 @@ pub fn run_training(config: TrainConfig) {
         println!("Initializing model (seed=42)...");
         model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()), config.alpha, config.beta);
         model.phase_native = config.phase_native; // Must set before count_trainable
-        // Set detect mode + IQ weights BEFORE count_trainable (IQ adds 2 params)
-        model.detect_mode = match config.phase_detect.as_str() {
-            "q" => crate::common::phase_loss::DetectMode::Q,
-            "iq" => {
-                model.iq_weights = Some([1.0, 0.0]);
-                crate::common::phase_loss::DetectMode::IQ
-            }
-            _ => crate::common::phase_loss::DetectMode::I,
-        };
         start_iter = 0;
         let n_t = count_trainable_ex(&model, config.tied);
         optimizer = Adam::new(config.lr, n_t);
@@ -87,8 +78,6 @@ pub fn run_training(config: TrainConfig) {
     let n_trainable = count_trainable_ex(&model, config.tied);
     if config.tied {
         println!("  Trainable parameters: {n_trainable} (TIED — lm_head=wte, all gradient to ODE)");
-    } else if model.phase_native {
-        println!("  Trainable parameters: {n_trainable} (phase-native — zero decoder, dot product against embeddings)");
     } else {
         println!("  Trainable parameters: {n_trainable} (attention frozen, FFN+LN+lm_head trainable)");
     }
@@ -101,18 +90,6 @@ pub fn run_training(config: TrainConfig) {
 
     // Phase-native mode: ODE learns to output in embedding space, no lm_head
     model.phase_native = config.phase_native;
-    model.delta_decode = config.delta_decode;
-    model.detect_mode = match config.phase_detect.as_str() {
-        "q" => crate::common::phase_loss::DetectMode::Q,
-        "iq" => {
-            model.iq_weights = Some([1.0, 0.0]); // init: pure I-channel, learns Q
-            crate::common::phase_loss::DetectMode::IQ
-        }
-        _ => crate::common::phase_loss::DetectMode::I,
-    };
-    if model.detect_mode != crate::common::phase_loss::DetectMode::I {
-        println!("  Phase detection: {:?}", model.detect_mode);
-    }
 
     // Apply fixed values from CLI for dynamic params
     if let DynParam::Fixed(ref vals) = config.layer_scale {
@@ -268,7 +245,6 @@ pub fn run_training(config: TrainConfig) {
     println!("{}", "-".repeat(30));
 
     let train_start = std::time::Instant::now();
-    let mut recent_losses: Vec<f32> = Vec::with_capacity(100); // rolling window for true loss
 
     let warmup_iters = 100usize;
     let min_lr_ratio = 0.1f32; // decay to 10% of base LR
@@ -295,19 +271,12 @@ pub fn run_training(config: TrainConfig) {
         };
         optimizer.lr = current_lr;
 
-        // RNG desync at health intervals — break the deterministic batch alignment
-        // that caused low-loss spikes at exact 500-multiples (measurement artifact)
-        let is_health_iter = config.health_interval > 0 && iter % config.health_interval == 0;
-        if is_health_iter && iter > 0 {
-            for _ in 0..(iter % 7 + 1) { rng.next_u64(); }
-        }
-
         let starts: Vec<usize> = (0..batch_size)
             .map(|_| (rng.next_u64() as usize) % (train_data.len() - seq_len - 1))
             .collect();
 
         // Should we measure batch distortion this iteration?
-        let measure_batch_distortion = is_health_iter;
+        let measure_batch_distortion = config.health_interval > 0 && iter % config.health_interval == 0;
 
         let t_fwd = monitor.start();
         let batch_results: Vec<(f32, Vec<f32>, BatchHealthData)> = std::thread::scope(|s| {
@@ -385,18 +354,7 @@ pub fn run_training(config: TrainConfig) {
                         None
                     };
 
-                    // I/Q channel monitor — measures where the ODE signal lives
-                    let iq_analysis = if is_health {
-                        Some(crate::common::iq_monitor::analyze_iq_batch(
-                            &cache.post_ln_f, &model_ref.wte, target,
-                            dims.n_bands, &model_ref.output_corrector, &model_ref.output_scale, 10,
-                        ))
-                    } else {
-                        None
-                    };
-
-                    let delta_tokens = if model_ref.delta_decode { Some(input) } else { None };
-                    let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref, delta_tokens);
+                    let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref);
                     // Gradient flow analysis on first batch element at health intervals
                     let grad_flow = if is_health {
                         Some(crate::common::gradient_monitor::analyze_gradients(&grads, dims))
@@ -404,7 +362,7 @@ pub fn run_training(config: TrainConfig) {
                         None
                     };
                     (loss, flatten_grads_ex(&grads, dims.tied), BatchHealthData {
-                        distortion, grad_flow, attn_stats, flow_stats, output_stats, ode_dynamics, iq_analysis,
+                        distortion, grad_flow, attn_stats, flow_stats, output_stats, ode_dynamics,
                     })
                 })
             }).collect();
@@ -484,27 +442,6 @@ pub fn run_training(config: TrainConfig) {
                     }).collect());
                 }
             }
-            // I/Q channel monitor + w_I/w_Q + corrector angle logging (print once, NO break)
-            if let Some(ref iq) = health.iq_analysis {
-                let wiq = model.iq_weights.map_or(String::new(), |w| format!(" w_I={:.4} w_Q={:.4}", w[0], w[1]));
-                eprintln!("  [I/Q] I_disc={:.3} Q_disc={:.3} IQ_ratio={:.3} phase_std={:.3} I_rank={} Q_rank={}{}",
-                    iq.i_discrim, iq.q_discrim, iq.iq_ratio, iq.phase_std, iq.i_correct_rank, iq.q_correct_rank, wiq);
-                if !model.output_corrector.is_empty() {
-                    let n = model.output_corrector.len() as f32;
-                    let mean = model.output_corrector.iter().sum::<f32>() / n;
-                    let std = (model.output_corrector.iter().map(|&a| (a - mean) * (a - mean)).sum::<f32>() / n).sqrt();
-                    let max_abs = model.output_corrector.iter().map(|a| a.abs()).fold(0.0f32, f32::max);
-                    eprintln!("  [corrector] mean={:.4} std={:.4} max_abs={:.4} (radians)", mean, std, max_abs);
-                }
-                if model.output_scale.iter().any(|&s| (s - 1.0).abs() > 0.001) {
-                    let n = model.output_scale.len() as f32;
-                    let mean = model.output_scale.iter().sum::<f32>() / n;
-                    let min_s = model.output_scale.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let max_s = model.output_scale.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    eprintln!("  [prism] mean={:.4} min={:.4} max={:.4}", mean, min_s, max_s);
-                }
-                // NOTE: Do NOT break here — the loop must finish to accumulate all batch losses
-            }
         }
         total_loss /= batch_size as f32;
         for g in total_grads.iter_mut() { *g /= batch_size as f32; }
@@ -563,13 +500,6 @@ pub fn run_training(config: TrainConfig) {
         // LR scale: per-group gradient scaling before optimizer step.
         train_health::apply_lr_scale(&mut model, &config, dims, &mut total_grads, current_lr);
 
-        // IQ weight LR damping: 2 params need 100x lower LR to prevent oscillation
-        if model.iq_weights.is_some() && total_grads.len() >= 2 {
-            let n = total_grads.len();
-            total_grads[n - 2] *= 0.01;
-            total_grads[n - 1] *= 0.01;
-        }
-
         let mut params = flatten_params_ex(&model, config.tied);
         if config.wd.is_active() {
             // Per-group weight decay: apply WD manually, then Adam without WD
@@ -598,15 +528,8 @@ pub fn run_training(config: TrainConfig) {
             &model, &config, &total_grads, grad_norm, n_trainable, dims,
         );
 
-        // Track rolling loss (uncontaminated by health-interval batch alignment)
-        recent_losses.push(total_loss);
-        if recent_losses.len() > 100 { recent_losses.remove(0); }
-
         if iter % 10 == 0 || iter == total_iters - 1 {
-            let avg_loss = if recent_losses.len() >= 10 {
-                recent_losses.iter().sum::<f32>() / recent_losses.len() as f32
-            } else { total_loss };
-            println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  gnorm={:.2}  avg100={:.4}", iter, total_loss, iter_start.elapsed(), current_lr, grad_norm, avg_loss);
+            println!("{:>6} {:>10.4} {:>10.1?}  lr={:.6}  gnorm={:.2}", iter, total_loss, iter_start.elapsed(), current_lr, grad_norm);
             if monitor.enabled() {
                 monitor.report(if iter == 0 { 1 } else { 50.min(iter) });
                 monitor.reset();

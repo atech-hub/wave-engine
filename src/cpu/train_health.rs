@@ -370,7 +370,6 @@ pub struct BatchHealthData {
     pub flow_stats: Option<Vec<crate::common::layer_flow_monitor::LayerFlowStats>>,
     pub output_stats: Option<crate::common::output_monitor::OutputDistStats>,
     pub ode_dynamics: Option<Vec<crate::common::ode_dynamics_monitor::OdeDynamicsStats>>,
-    pub iq_analysis: Option<crate::common::iq_monitor::IqAnalysis>,
 }
 
 /// Write all health monitor data to JSONL at health intervals.

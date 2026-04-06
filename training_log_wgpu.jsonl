@@ -1,0 +1,10 @@
+{"iter":0,"loss":4.3423,"lr":0.000001,"time_ms":136,"nan_skips":0,"model_gn":0.5955,"head_gn":0.8034,"head_pct":80.3,"layer_gn":[0.341,0.307,0.268,0.269],"ode_clamps":13763,"ode_max_mag":4.12,"agc_threshold":1.000,"agc_mean":1.113,"agc_std":0.478}
+{"iter":1,"loss":4.3676,"lr":0.000002,"time_ms":131,"nan_skips":0}
+{"iter":2,"loss":4.3484,"lr":0.000003,"time_ms":130,"nan_skips":0}
+{"iter":3,"loss":4.3649,"lr":0.000004,"time_ms":128,"nan_skips":0}
+{"iter":4,"loss":4.3424,"lr":0.000005,"time_ms":135,"nan_skips":0}
+{"iter":5,"loss":4.3680,"lr":0.000006,"time_ms":139,"nan_skips":0}
+{"iter":6,"loss":4.3435,"lr":0.000007,"time_ms":137,"nan_skips":0}
+{"iter":7,"loss":4.3439,"lr":0.000008,"time_ms":136,"nan_skips":0}
+{"iter":8,"loss":4.3822,"lr":0.000009,"time_ms":131,"nan_skips":0}
+{"iter":9,"loss":4.3509,"lr":0.000010,"time_ms":129,"nan_skips":0}
