@@ -243,7 +243,9 @@ pub mod forward {
             let normed = layer_norm(&hidden, &self.ln_f_w, &self.ln_f_b)?;
 
             let logits = if self.phase_native {
-                // Phase-native: output corrector + dot product against frozen embeddings
+                // Phase-native: output corrector + scaled dot product against frozen embeddings
+                // Scale by 1/sqrt(n_embd) to prevent logit explosion at high dimensions
+                let scale = 1.0 / (self.n_embd as f64).sqrt();
                 if let Some(ref oc) = self.output_corrector {
                     let n_b = self.n_bands;
                     let reshaped = normed.reshape((n_pos, n_b, 2))?;
@@ -256,11 +258,11 @@ pub mod forward {
                     let r_exp = r_rot.unsqueeze(2)?;
                     let s_exp = s_rot.unsqueeze(2)?;
                     let corrected = Tensor::cat(&[&r_exp, &s_exp], 2)?.reshape((n_pos, self.n_embd))?;
-                    // Dot product against frozen embeddings (wte): [n_pos, n_embd] × [n_embd, vocab] = [n_pos, vocab]
-                    corrected.matmul(&self.wte.t()?)?
+                    // Scaled dot product against frozen embeddings
+                    (corrected.matmul(&self.wte.t()?)? * scale)?
                 } else {
-                    // No output corrector — direct dot product
-                    normed.matmul(&self.wte.t()?)?
+                    // No output corrector — scaled direct dot product
+                    (normed.matmul(&self.wte.t()?)? * scale)?
                 }
             } else {
                 // Standard: lm_head projection
@@ -596,6 +598,7 @@ pub mod forward {
             // Final LN + logits (same as forward_with_curriculum)
             let normed = layer_norm(&hidden, &self.ln_f_w, &self.ln_f_b)?;
             let logits = if self.phase_native {
+                let scale = 1.0 / (self.n_embd as f64).sqrt();
                 if let Some(ref oc) = self.output_corrector {
                     let n_b = self.n_bands;
                     let reshaped = normed.reshape((n_pos, n_b, 2))?;
@@ -608,9 +611,9 @@ pub mod forward {
                     let r_exp = r_rot.unsqueeze(2)?;
                     let s_exp = s_rot.unsqueeze(2)?;
                     let corrected = Tensor::cat(&[&r_exp, &s_exp], 2)?.reshape((n_pos, self.n_embd))?;
-                    corrected.matmul(&self.wte.t()?)?
+                    (corrected.matmul(&self.wte.t()?)? * scale)?
                 } else {
-                    normed.matmul(&self.wte.t()?)?
+                    (normed.matmul(&self.wte.t()?)? * scale)?
                 }
             } else {
                 normed.matmul(&self.lm_head.t()?)?
