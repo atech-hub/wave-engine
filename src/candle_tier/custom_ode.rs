@@ -78,6 +78,7 @@ pub mod custom_ode {
                 rk4_n_steps: self.rk4_steps,
                 phase_correction: vec![0.0; self.n_bands], // corrector applied separately
                 rk4_weights: self.rk4_weights,
+                coherent_matrix: vec![], mix_strength: 0.0, chi: 0.0,
             }
         }
     }

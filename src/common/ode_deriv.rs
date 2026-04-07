@@ -6,10 +6,12 @@
 /// Kerr nonlinear derivative: coupled oscillator ODE right-hand side.
 ///
 /// Conv1d neighbour sum with kernel [1, 1, 0, 1, 1], padding=2.
+/// chi: four-wave mixing strength (0.0 = disabled, backward compatible).
 pub(crate) fn kerr_derivative(
     r: &[f32], s: &[f32],
     gamma: &[f32], omega: &[f32],
     alpha: f32, beta: f32,
+    chi: f32,
 ) -> (Vec<f32>, Vec<f32>) {
     let n = r.len();
     let mut dr = vec![0.0f32; n];
@@ -33,6 +35,53 @@ pub(crate) fn kerr_derivative(
         ds[k] = -gamma[k] * s[k] + phi * r[k];
     }
 
+    // Four-wave mixing: energy-conserving Hamiltonian flow.
+    // For each quartet (a,b,c,d) with a+b=c+d, ALL FOUR bands get a derivative term.
+    // Derived from H = chi * Re(z_a * z_b * z_c* * z_d*).
+    if chi != 0.0 && n > 4 {
+        #[inline(always)]
+        fn apply_quartet(
+            dr: &mut [f32], ds: &mut [f32], r: &[f32], s: &[f32],
+            chi: f32, a: usize, b: usize, c: usize, d: usize,
+        ) {
+            let (ra, sa) = (r[a], s[a]);
+            let (rb, sb) = (r[b], s[b]);
+            let (rc, sc) = (r[c], s[c]);
+            let (rd, sd) = (r[d], s[d]);
+
+            // P_ab = z_a * z_b, P_cd = z_c * z_d
+            let pab_re = ra*rb - sa*sb;
+            let pab_im = ra*sb + sa*rb;
+            let pcd_re = rc*rd - sc*sd;
+            let pcd_im = rc*sd + sc*rd;
+
+            // dz_a += -i*chi * z_b* * P_cd
+            dr[a] += chi * (rb*pcd_im - sb*pcd_re);
+            ds[a] -= chi * (rb*pcd_re + sb*pcd_im);
+
+            // dz_b += -i*chi * z_a* * P_cd
+            dr[b] += chi * (ra*pcd_im - sa*pcd_re);
+            ds[b] -= chi * (ra*pcd_re + sa*pcd_im);
+
+            // dz_c += -i*chi * P_ab * z_d*
+            dr[c] += chi * (pab_im*rd - pab_re*sd);
+            ds[c] -= chi * (pab_re*rd + pab_im*sd);
+
+            // dz_d += -i*chi * P_ab * z_c*
+            dr[d] += chi * (pab_im*rc - pab_re*sc);
+            ds[d] -= chi * (pab_re*rc + pab_im*sc);
+        }
+
+        // Type A: (k-2, k+1) <-> (k-1, k), sum = 2k-1
+        for k in 2..(n - 1) {
+            apply_quartet(&mut dr, &mut ds, r, s, chi, k - 2, k + 1, k - 1, k);
+        }
+        // Type B: (k-1, k+2) <-> (k, k+1), sum = 2k+1
+        for k in 1..(n - 2) {
+            apply_quartet(&mut dr, &mut ds, r, s, chi, k - 1, k + 2, k, k + 1);
+        }
+    }
+
     (dr, ds)
 }
 
@@ -40,27 +89,27 @@ pub(crate) fn kerr_derivative(
 pub(crate) fn rk4_step(
     r: &[f32], s: &[f32], dt: f32,
     gamma: &[f32], omega: &[f32],
-    alpha: f32, beta: f32, w: &[f32; 4],
+    alpha: f32, beta: f32, chi: f32, w: &[f32; 4],
 ) -> (Vec<f32>, Vec<f32>) {
     let n = r.len();
 
     // k1
-    let (dr1, ds1) = kerr_derivative(r, s, gamma, omega, alpha, beta);
+    let (dr1, ds1) = kerr_derivative(r, s, gamma, omega, alpha, beta, chi);
 
     // k2
     let r2: Vec<f32> = (0..n).map(|k| r[k] + 0.5 * dt * dr1[k]).collect();
     let s2: Vec<f32> = (0..n).map(|k| s[k] + 0.5 * dt * ds1[k]).collect();
-    let (dr2, ds2) = kerr_derivative(&r2, &s2, gamma, omega, alpha, beta);
+    let (dr2, ds2) = kerr_derivative(&r2, &s2, gamma, omega, alpha, beta, chi);
 
     // k3
     let r3: Vec<f32> = (0..n).map(|k| r[k] + 0.5 * dt * dr2[k]).collect();
     let s3: Vec<f32> = (0..n).map(|k| s[k] + 0.5 * dt * ds2[k]).collect();
-    let (dr3, ds3) = kerr_derivative(&r3, &s3, gamma, omega, alpha, beta);
+    let (dr3, ds3) = kerr_derivative(&r3, &s3, gamma, omega, alpha, beta, chi);
 
     // k4
     let r4: Vec<f32> = (0..n).map(|k| r[k] + dt * dr3[k]).collect();
     let s4: Vec<f32> = (0..n).map(|k| s[k] + dt * ds3[k]).collect();
-    let (dr4, ds4) = kerr_derivative(&r4, &s4, gamma, omega, alpha, beta);
+    let (dr4, ds4) = kerr_derivative(&r4, &s4, gamma, omega, alpha, beta, chi);
 
     // Combine: y_new = y + dt * (w0*k1 + w1*k2 + w2*k3 + w3*k4)
     let r_new: Vec<f32> = (0..n)
@@ -73,11 +122,11 @@ pub(crate) fn rk4_step(
     (r_new, s_new)
 }
 
-/// Public wrapper for rk4_step (needed by backward.rs, compute.rs).
+/// Public wrapper for rk4_step (needed by backward.rs, compute.rs, wave_probe).
 pub fn rk4_step_public(
     r: &[f32], s: &[f32], dt: f32,
     gamma: &[f32], omega: &[f32],
-    alpha: f32, beta: f32, w: &[f32; 4],
+    alpha: f32, beta: f32, chi: f32, w: &[f32; 4],
 ) -> (Vec<f32>, Vec<f32>) {
-    rk4_step(r, s, dt, gamma, omega, alpha, beta, w)
+    rk4_step(r, s, dt, gamma, omega, alpha, beta, chi, w)
 }

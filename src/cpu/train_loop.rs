@@ -34,7 +34,7 @@ pub fn run_training(config: TrainConfig) {
         println!("Resuming from checkpoint: {ckpt}");
         let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v, _ck_groups, _ck_flags) = wave_checkpoint::load_checkpoint(ckpt);
         assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
-        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()), config.alpha, config.beta);
+        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()), config.alpha, config.beta);
         m.phase_native = config.phase_native; // Must set before count_trainable for correct param count
         let ext_count = count_trainable_ex(&m, config.tied);
         if params.len() == ext_count {
@@ -42,7 +42,7 @@ pub fn run_training(config: TrainConfig) {
             println!("  Loaded {} params (with ODE/corrector)", params.len());
         } else {
             // Old checkpoint without ODE/corrector — load base params, ODE starts fresh
-            let base_dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(false).with_corrector(false);
+            let base_dims = crate::Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(false).with_corrector(false);
             m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, base_dims, config.alpha, config.beta);
             unflatten_params(&mut m, &params);
             // Re-enable learnable ODE and phase-native on the loaded model
@@ -67,7 +67,7 @@ pub fn run_training(config: TrainConfig) {
         }
     } else {
         println!("Initializing model (seed=42)...");
-        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()), config.alpha, config.beta);
+        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()), config.alpha, config.beta);
         model.phase_native = config.phase_native; // Must set before count_trainable
         start_iter = 0;
         let n_t = count_trainable_ex(&model, config.tied);
@@ -84,12 +84,30 @@ pub fn run_training(config: TrainConfig) {
     println!("  Architecture: {} parallel blocks, {} harmonic heads, {} bands ({}-dim)", config.n_layers, config.n_head, config.n_bands, config.n_bands * 2);
 
     // Runtime dimensions (needed by pre-flight, forward, backward)
-    let mut dims = crate::Dims::from_cli(config.n_bands, config.n_head, crate::MAESTRO_DIM, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active());
+    let mut dims = crate::Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active());
     dims.phase_temp = config.phase_temp;
     dims.pythagorean = config.pythagorean;
 
     // Phase-native mode: ODE learns to output in embedding space, no lm_head
     model.phase_native = config.phase_native;
+
+    // Four-wave mixing: cubic amplitude coupling inside ODE
+    if config.fwm_strength > 0.0 {
+        for block in &mut model.blocks {
+            block.ffn.kerr.chi = config.fwm_strength;
+        }
+        println!("  FWM: chi={:.1} (four-wave mixing enabled)", config.fwm_strength);
+    }
+
+    // Quantum ladder operators: creation + annihilation inside ODE
+    // From Wang & Kang unified matrix/wave mechanics
+    // No matrix needed — O(n) tridiagonal, strength √k, computed on the fly
+    if config.mix_strength > 0.0 {
+        for block in &mut model.blocks {
+            block.ffn.kerr.mix_strength = config.mix_strength;
+        }
+        println!("  Ladder operators: strength={:.3} (adjacent bands, sqrt(k) scaling, {} bands)", config.mix_strength, config.n_bands);
+    }
 
     // Apply fixed values from CLI for dynamic params
     if let DynParam::Fixed(ref vals) = config.layer_scale {
@@ -469,6 +487,58 @@ pub fn run_training(config: TrainConfig) {
         total_loss /= batch_size as f32;
         for g in total_grads.iter_mut() { *g /= batch_size as f32; }
         monitor.record("reduce", t_reduce);
+
+        // FWM stability scan at iter 0 (one-shot)
+        if iter == 0 && config.fwm_strength > 0.0 {
+            // Grab a sample precond from the first batch
+            let sample = &batch_results[0].2; // BatchHealthData — not ideal but we need a hidden state
+            // Use the model's first block weights for the scan
+            let scan = crate::common::fwm_monitor::fwm_stability_scan(
+                &vec![0.1f32; config.n_bands * 2], // unit-ish broadband input
+                &model.blocks[0].ffn.kerr, config.n_bands,
+                &[0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+            );
+            eprintln!("  [FWM stability scan]");
+            for (chi, diag, stable) in &scan {
+                eprintln!("    chi={:.2}: fwm_ratio={:.4} rk4_ratio={:.2} triple={:.2} max_amp={:.3} {}",
+                    chi, diag.fwm_ratio, diag.rk4_step_ratio, diag.triple_ratio, diag.max_band_amp,
+                    if *stable { "STABLE" } else { "UNSTABLE" });
+            }
+        }
+
+        // FWM monitor at health intervals — uses real training activations, writes to JSONL
+        if config.health_interval > 0 && iter % config.health_interval == 0 && config.fwm_strength > 0.0 {
+            // Grab real precond from the first batch's forward cache
+            let cache_ref = &batch_results[0].2; // BatchHealthData from first batch
+            // We need the actual hidden state — use the training data directly
+            let sample_start = (crate::rng::Rng::new(iter as u64).next_u64() as usize) % (train_data.len() - seq_len - 1);
+            let sample_tokens = &train_data[sample_start..sample_start + seq_len];
+            // Run a quick forward to get block caches with real activations
+            let sample_cache = crate::cpu::forward::forward_with_cache(
+                &model, sample_tokens, dims, None, None, None, Some(&stencil), None, None,
+            );
+            use std::io::Write;
+            let mut fwm_layers = Vec::new();
+            for (layer_idx, block) in model.blocks.iter().enumerate() {
+                // Use the normed FFN input from the cache as a proxy for precond
+                let precond = &sample_cache.block_caches[layer_idx].normed_ffn[0];
+                let diag = crate::common::fwm_monitor::measure_fwm(
+                    precond, &block.ffn.kerr, config.n_bands, layer_idx,
+                );
+                fwm_layers.push(format!(
+                    r#"{{"layer":{},"fwm_ratio":{:.4},"fwm_vs_phase":{:.4},"triple_ratio":{:.2},"max_amp":{:.4},"mean_amp":{:.4},"rk4_ratio":{:.3},"flux_max":{:.6},"top_bands":[{},{},{}]}}"#,
+                    layer_idx, diag.fwm_ratio, diag.fwm_vs_phase, diag.triple_ratio,
+                    diag.max_band_amp, diag.mean_band_amp, diag.rk4_step_ratio,
+                    diag.flux_max, diag.top_3_bands[0], diag.top_3_bands[1], diag.top_3_bands[2]
+                ));
+                eprintln!("  [FWM L{}] ratio={:.4} vs_phase={:.4} triple={:.2} max_amp={:.3} rk4={:.2}",
+                    layer_idx, diag.fwm_ratio, diag.fwm_vs_phase, diag.triple_ratio,
+                    diag.max_band_amp, diag.rk4_step_ratio);
+            }
+            let _ = writeln!(log_writer, r#"{{"iter":{},"type":"fwm_monitor","chi":{},"layers":[{}]}}"#,
+                iter, config.fwm_strength, fwm_layers.join(","));
+            let _ = log_writer.flush();
+        }
 
         // NaN skip with post-mortem: discard batch, diagnose cause
         if total_loss.is_nan() || total_loss.is_infinite() {

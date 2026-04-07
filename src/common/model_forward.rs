@@ -337,7 +337,7 @@ impl ModelWeights {
         // RK4 integration steps
         for _ in 0..n_steps {
             let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma,
-                                           &weights.omega, weights.alpha, weights.beta, &weights.rk4_weights);
+                                           &weights.omega, weights.alpha, weights.beta, weights.chi, &weights.rk4_weights);
             r = r_new;
             s = s_new;
         }
@@ -430,7 +430,7 @@ impl ModelWeights {
                         let dt = 1.0 / n_steps as f32;
                         for _ in 0..n_steps {
                             let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma,
-                                &w.kerr.omega, w.kerr.alpha, w.kerr.beta, &w.kerr.rk4_weights);
+                                &w.kerr.omega, w.kerr.alpha, w.kerr.beta, 0.0, &w.kerr.rk4_weights);
                             r = r_new;
                             s = s_new;
                         }
@@ -490,7 +490,7 @@ impl ModelWeights {
                         let dt = 1.0 / n_steps as f32;
                         for _ in 0..n_steps {
                             let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma,
-                                &w.kerr.omega, w.kerr.alpha, w.kerr.beta, &w.kerr.rk4_weights);
+                                &w.kerr.omega, w.kerr.alpha, w.kerr.beta, 0.0, &w.kerr.rk4_weights);
                             r = r_new;
                             s = s_new;
                         }

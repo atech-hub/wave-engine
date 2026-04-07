@@ -75,6 +75,7 @@ fn deriv_into(
     r: &[f32], s: &[f32],
     gamma: &[f32], omega: &[f32],
     alpha: f32, beta: f32,
+    coherent: &[Vec<f32>], mix_s: f32,
     dr: &mut [f32], ds: &mut [f32],
 ) {
     let n = r.len();
@@ -84,6 +85,23 @@ fn deriv_into(
         let phi = omega[k] + alpha * mag_sq + beta * ns;
         dr[k] = -gamma[k] * r[k] - phi * s[k];
         ds[k] = -gamma[k] * s[k] + phi * r[k];
+    }
+    // Four-wave mixing: Hamiltonian energy-conserving cubic coupling
+    if mix_s > 0.0 && n > 4 {
+        #[inline(always)]
+        fn apply_quartet(dr: &mut [f32], ds: &mut [f32], r: &[f32], s: &[f32],
+                         chi: f32, a: usize, b: usize, c: usize, d: usize) {
+            let (ra, sa) = (r[a], s[a]); let (rb, sb) = (r[b], s[b]);
+            let (rc, sc) = (r[c], s[c]); let (rd, sd) = (r[d], s[d]);
+            let pab_re = ra*rb - sa*sb; let pab_im = ra*sb + sa*rb;
+            let pcd_re = rc*rd - sc*sd; let pcd_im = rc*sd + sc*rd;
+            dr[a] += chi * (rb*pcd_im - sb*pcd_re); ds[a] -= chi * (rb*pcd_re + sb*pcd_im);
+            dr[b] += chi * (ra*pcd_im - sa*pcd_re); ds[b] -= chi * (ra*pcd_re + sa*pcd_im);
+            dr[c] += chi * (pab_im*rd - pab_re*sd); ds[c] -= chi * (pab_re*rd + pab_im*sd);
+            dr[d] += chi * (pab_im*rc - pab_re*sc); ds[d] -= chi * (pab_re*rc + pab_im*sc);
+        }
+        for k in 2..(n - 1) { apply_quartet(dr, ds, r, s, mix_s, k - 2, k + 1, k - 1, k); }
+        for k in 1..(n - 2) { apply_quartet(dr, ds, r, s, mix_s, k - 1, k + 2, k, k + 1); }
     }
 }
 
@@ -129,22 +147,22 @@ pub fn ode_forward_with_cache(
         s_at_step.push(s.clone());
 
         // k1 at (r, s)
-        deriv_into(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, &mut k1r, &mut k1s);
+        deriv_into(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, &weights.coherent_matrix, weights.chi, &mut k1r, &mut k1s);
 
         // k2 at (r + 0.5*dt*k1, s + 0.5*dt*k1)
         for i in 0..n_bands { r_tmp[i] = r[i] + 0.5*dt*k1r[i]; }
         for i in 0..n_bands { s_tmp[i] = s[i] + 0.5*dt*k1s[i]; }
-        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &mut k2r, &mut k2s);
+        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &weights.coherent_matrix, weights.chi, &mut k2r, &mut k2s);
 
         // k3 at (r + 0.5*dt*k2, s + 0.5*dt*k2)
         for i in 0..n_bands { r_tmp[i] = r[i] + 0.5*dt*k2r[i]; }
         for i in 0..n_bands { s_tmp[i] = s[i] + 0.5*dt*k2s[i]; }
-        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &mut k3r, &mut k3s);
+        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &weights.coherent_matrix, weights.chi, &mut k3r, &mut k3s);
 
         // k4 at (r + dt*k3, s + dt*k3)
         for i in 0..n_bands { r_tmp[i] = r[i] + dt*k3r[i]; }
         for i in 0..n_bands { s_tmp[i] = s[i] + dt*k3s[i]; }
-        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &mut k4r, &mut k4s);
+        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &weights.coherent_matrix, weights.chi, &mut k4r, &mut k4s);
 
         // Store k-values (backward needs these per-step)
         all_kr.push([k1r.clone(), k2r.clone(), k3r.clone(), k4r.clone()]);

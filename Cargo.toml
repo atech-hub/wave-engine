@@ -55,3 +55,7 @@ path = "lab/ode_bench.rs"
 [[bin]]
 name = "ode-train-test"
 path = "lab/ode_train_test.rs"
+
+[[bin]]
+name = "wave-probe"
+path = "lab/wave_probe.rs"

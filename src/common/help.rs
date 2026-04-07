@@ -96,6 +96,11 @@ pub fn print_help() {
     println!("    --phase-native      Train ODE to output in embedding space (no lm_head)");
     println!("                        Dot product loss against frozen embeddings. 55/55 arithmetic.");
     println!("    --phase-temp F      Temperature for phase-native softmax              [default: 1.0]");
+    println!("    --fwm-strength F    Four-wave mixing chi coefficient                  [default: 0.0]");
+    println!("                        Hamiltonian energy-conserving cubic coupling.");
+    println!("                        Recommended: 0.03 (8-12% of ODE derivative).");
+    println!("                        Monitor with --health-interval to verify fwm_ratio.");
+    println!("    --residual-weight F Scale input in residual connection                [default: 1.0]");
     println!("    --pythagorean       Pythagorean sphere encoding (experimental — 0/10, for research)");
     println!();
     println!("DYNAMIC PARAMETERS (--flag dyn = model decides, --flag V,V = human prescribes):");

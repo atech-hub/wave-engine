@@ -76,6 +76,7 @@ pub struct TrainConfig {
     pub checkpoint_name: String,
     pub n_bands: usize,
     pub n_head: usize,
+    pub maestro_dim: usize,
     pub alpha: f32,
     pub beta: f32,
     pub agc_ceiling: Option<f32>, // None = auto-derive from alpha
@@ -93,6 +94,8 @@ pub struct TrainConfig {
     pub layer_scale: DynParam, // --layer-scale dyn | --layer-scale 1.0,0.8,1.0,1.0
     pub lr_scale: DynParam,    // --lr-scale dyn | --lr-scale 1.0,1.5,1.5,0.5,1.0
     pub phase_native: bool,
+    pub mix_strength: f32,  // --mix-strength 0.05 (coherent coupling, 0.0=off)
+    pub fwm_strength: f32,  // --fwm-strength 5.0 (four-wave mixing chi, 0.0=off)
     pub pythagorean: bool,    // --phase-native: use phase coherence loss, no lm_head
     pub phase_temp: f32,       // temperature for phase-native softmax (default 1.0)
     pub spring_k: f32, // spring constant for dynamic params (0.0 = no spring, 0.1 = moderate)

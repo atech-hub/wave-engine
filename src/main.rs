@@ -476,6 +476,7 @@ fn main() {
         checkpoint_name: parse_flag("--checkpoint-name", "checkpoint.bin".to_string()),
         n_bands: parse_flag("--n-bands", N_BANDS),
         n_head: parse_flag("--n-head", N_HEAD),
+        maestro_dim: parse_flag("--maestro-dim", MAESTRO_DIM),
         alpha: parse_flag("--alpha", 0.1),
         beta: parse_flag("--beta", parse_flag("--alpha", 0.1)), // default beta = alpha
         agc_ceiling: std::env::args().skip_while(|a| a != "--agc-ceiling").nth(1)
@@ -494,6 +495,8 @@ fn main() {
         layer_scale: parse_dyn_param("--layer-scale"),
         lr_scale: parse_dyn_param("--lr-scale"),
         phase_native: std::env::args().any(|a| a == "--phase-native"),
+        mix_strength: parse_flag("--mix-strength", 0.0),
+        fwm_strength: parse_flag("--fwm-strength", 0.0),
         phase_temp: parse_flag("--phase-temp", 1.0),
         pythagorean: std::env::args().any(|a| a == "--pythagorean"),
         spring_k: parse_flag("--spring", 0.1),

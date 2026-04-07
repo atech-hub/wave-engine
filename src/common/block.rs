@@ -202,8 +202,9 @@ fn kerr_ode_forward_cpu(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
     let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
 
     let w = &weights.rk4_weights;
+    let chi = weights.chi;
     for _ in 0..n_steps {
-        let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, w);
+        let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, chi, w);
         r = r_new;
         s = s_new;
     }
@@ -213,10 +214,9 @@ fn kerr_ode_forward_cpu(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
     out
 }
 
-fn rk4_step(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: f32, beta: f32, w: &[f32; 4]) -> (Vec<f32>, Vec<f32>) {
+fn rk4_step(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: f32, beta: f32, chi: f32, w: &[f32; 4]) -> (Vec<f32>, Vec<f32>) {
     let n = r.len();
 
-    // Pre-allocate scratch buffers (avoids 8 heap allocations per step)
     let mut r_tmp = vec![0.0f32; n];
     let mut s_tmp = vec![0.0f32; n];
     let mut k1r = vec![0.0f32; n];
@@ -228,29 +228,19 @@ fn rk4_step(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: 
     let mut k4r = vec![0.0f32; n];
     let mut k4s = vec![0.0f32; n];
 
-    // k1 at (r, s)
-    deriv_into(r, s, gamma, omega, alpha, beta, &mut k1r, &mut k1s);
+    deriv_into(r, s, gamma, omega, alpha, beta, chi, &mut k1r, &mut k1s);
 
-    // r_tmp = r + 0.5*dt*k1r, s_tmp = s + 0.5*dt*k1s
     for i in 0..n { r_tmp[i] = r[i] + 0.5*dt*k1r[i]; }
     for i in 0..n { s_tmp[i] = s[i] + 0.5*dt*k1s[i]; }
+    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, chi, &mut k2r, &mut k2s);
 
-    // k2 at (r_tmp, s_tmp)
-    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, &mut k2r, &mut k2s);
-
-    // r_tmp = r + 0.5*dt*k2r, s_tmp = s + 0.5*dt*k2s
     for i in 0..n { r_tmp[i] = r[i] + 0.5*dt*k2r[i]; }
     for i in 0..n { s_tmp[i] = s[i] + 0.5*dt*k2s[i]; }
+    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, chi, &mut k3r, &mut k3s);
 
-    // k3 at (r_tmp, s_tmp)
-    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, &mut k3r, &mut k3s);
-
-    // r_tmp = r + dt*k3r, s_tmp = s + dt*k3s
     for i in 0..n { r_tmp[i] = r[i] + dt*k3r[i]; }
     for i in 0..n { s_tmp[i] = s[i] + dt*k3s[i]; }
-
-    // k4 at (r_tmp, s_tmp)
-    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, &mut k4r, &mut k4s);
+    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, chi, &mut k4r, &mut k4s);
 
     // RK4 combination: r_new = r + dt * (w0*k1 + w1*k2 + w2*k3 + w3*k4)
     // Standard: w = [1/6, 1/3, 1/3, 1/6]. Learnable: model decides.
@@ -267,7 +257,7 @@ fn rk4_step(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: 
 fn deriv_into(
     r: &[f32], s: &[f32],
     gamma: &[f32], omega: &[f32],
-    alpha: f32, beta: f32,
+    alpha: f32, beta: f32, chi: f32,
     dr: &mut [f32], ds: &mut [f32],
 ) {
     let n = r.len();
@@ -281,5 +271,26 @@ fn deriv_into(
         let phi = omega[k] + alpha * mag_sq + beta * ns;
         dr[k] = -gamma[k] * r[k] - phi * s[k];
         ds[k] = -gamma[k] * s[k] + phi * r[k];
+    }
+    // Four-wave mixing: Hamiltonian energy-conserving cubic coupling
+    if chi != 0.0 && n > 4 {
+        #[inline(always)]
+        fn apply_quartet(dr: &mut [f32], ds: &mut [f32], r: &[f32], s: &[f32],
+                         chi: f32, a: usize, b: usize, c: usize, d: usize) {
+            let (ra, sa) = (r[a], s[a]); let (rb, sb) = (r[b], s[b]);
+            let (rc, sc) = (r[c], s[c]); let (rd, sd) = (r[d], s[d]);
+            let pab_re = ra*rb - sa*sb; let pab_im = ra*sb + sa*rb;
+            let pcd_re = rc*rd - sc*sd; let pcd_im = rc*sd + sc*rd;
+            dr[a] += chi * (rb*pcd_im - sb*pcd_re); ds[a] -= chi * (rb*pcd_re + sb*pcd_im);
+            dr[b] += chi * (ra*pcd_im - sa*pcd_re); ds[b] -= chi * (ra*pcd_re + sa*pcd_im);
+            dr[c] += chi * (pab_im*rd - pab_re*sd); ds[c] -= chi * (pab_re*rd + pab_im*sd);
+            dr[d] += chi * (pab_im*rc - pab_re*sc); ds[d] -= chi * (pab_re*rc + pab_im*sc);
+        }
+        for k in 2..(n - 1) {
+            apply_quartet(dr, ds, r, s, chi, k - 2, k + 1, k - 1, k);
+        }
+        for k in 1..(n - 2) {
+            apply_quartet(dr, ds, r, s, chi, k - 1, k + 2, k, k + 1);
+        }
     }
 }

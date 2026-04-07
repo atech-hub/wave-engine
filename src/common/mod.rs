@@ -43,6 +43,7 @@ pub mod ode_dynamics_monitor;
 pub mod curriculum_monitor;
 pub mod checkpoint_monitor;
 pub mod iq_monitor;
+pub mod fwm_monitor;
 pub mod recommend;
 pub mod data_loader;
 pub mod ode_backward;

@@ -23,6 +23,7 @@ pub fn diagnose_ode_gpu_vs_cpu(gpu_be: &gpu_pipelines::GpuBackend) {
         alpha: 0.1, beta: 0.1, rk4_n_steps: RK4_STEPS,
         phase_correction: vec![0.0; n_bands],
         rk4_weights: [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0],
+            coherent_matrix: vec![], mix_strength: 0.0, chi: 0.0,
     };
 
     // CPU ODE
