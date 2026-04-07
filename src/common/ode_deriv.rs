@@ -122,7 +122,7 @@ pub(crate) fn rk4_step(
     (r_new, s_new)
 }
 
-/// Public wrapper for rk4_step (needed by backward.rs, compute.rs, wave_probe).
+/// Public wrapper for rk4_step (needed by backward.rs, compute.rs).
 pub fn rk4_step_public(
     r: &[f32], s: &[f32], dt: f32,
     gamma: &[f32], omega: &[f32],
