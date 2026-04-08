@@ -573,6 +573,25 @@ pub fn run_training(config: TrainConfig) {
             let _ = writeln!(log_writer, r#"{{"iter":{},"type":"ode_decomposition","tier":"{}","chi":{},"layers":[{}]}}"#,
                 iter, compute_tier, config.fwm_strength, fwm_layers.join(","));
             let _ = log_writer.flush();
+
+            // Backward decomposition — per-layer gradient flow through physics terms
+            let mut bwd_stats = Vec::new();
+            for (layer_idx, block) in model.blocks.iter().enumerate() {
+                let precond_data = if let Some(ref fc) = sample_cache.block_caches[layer_idx].ffn_backend_cache {
+                    fc.precond[0].clone()
+                } else {
+                    sample_cache.block_caches[layer_idx].ffn_precond[0].clone()
+                };
+                let bwd = crate::common::ode_backward_monitor::measure_layer_backward(
+                    &precond_data, &block.ffn.kerr, layer_idx,
+                );
+                eprintln!("  [BWD L{}] damp={:.3} phase={:.3} fwm={:.3} d_chi={:.6}",
+                    layer_idx, bwd.damping_frac, bwd.phase_frac, bwd.fwm_frac, bwd.d_chi_norm);
+                bwd_stats.push(bwd);
+            }
+            let bwd_json = crate::common::ode_backward_monitor::to_json(&bwd_stats, compute_tier);
+            let _ = writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, bwd_json);
+            let _ = log_writer.flush();
         }
 
         // NaN skip with post-mortem: discard batch, diagnose cause
