@@ -19,6 +19,7 @@ pub mod gpu_ode {
         pub omega: Tensor,         // [1, n_bands] — natural frequency per band (always frozen)
         pub alpha: Tensor,         // [1, 1] — self-coupling
         pub beta: Tensor,          // [1, 1] — cross-coupling
+        pub chi: f32,              // four-wave mixing strength (0.0 = off, NOT learnable)
         pub rk4_w: Option<Tensor>, // [4] — RK4 combination weights (None = standard 1/6,1/3,1/3,1/6)
         pub n_bands: usize,
         pub rk4_steps: usize,
@@ -32,6 +33,7 @@ pub mod gpu_ode {
             omega: &[f32],
             alpha: f32,
             beta: f32,
+            chi: f32,
             rk4_steps: usize,
             device: &Device,
         ) -> Result<Self> {
@@ -41,6 +43,7 @@ pub mod gpu_ode {
                 omega: Tensor::from_vec(omega.to_vec(), (1, n_bands), device)?,
                 alpha: Tensor::from_vec(vec![alpha], (1, 1), device)?,
                 beta: Tensor::from_vec(vec![beta], (1, 1), device)?,
+                chi,
                 rk4_w: None, // standard weights
                 n_bands,
                 rk4_steps,
@@ -49,10 +52,12 @@ pub mod gpu_ode {
         }
 
         /// Create learnable ODE params from VarMap (autograd tracks gradients).
+        /// chi is NOT learnable (FWM Jacobian is zero on all tiers).
         pub fn learnable(
             n_bands: usize,
             alpha: f32,
             beta: f32,
+            chi: f32,
             rk4_steps: usize,
             vb: candle_nn::VarBuilder,
         ) -> Result<Self> {
@@ -80,6 +85,7 @@ pub mod gpu_ode {
                 omega,
                 alpha: alpha_t,
                 beta: beta_t,
+                chi,
                 rk4_w: None, // set via set_rk4_learnable() if --rk4-weights dyn
                 n_bands,
                 rk4_steps,
@@ -153,10 +159,132 @@ pub mod gpu_ode {
 
         // dr = -gamma * r - phi * s
         // ds = -gamma * s + phi * r
-        let dr = (r.broadcast_mul(gamma)?.neg()? - (&phi * s)?)?;
-        let ds = (s.broadcast_mul(gamma)?.neg()? + (&phi * r)?)?;
+        let mut dr = (r.broadcast_mul(gamma)?.neg()? - (&phi * s)?)?;
+        let mut ds = (s.broadcast_mul(gamma)?.neg()? + (&phi * r)?)?;
+
+        // FWM contribution (only if chi != 0)
+        if params.chi != 0.0 && n_bands > 4 {
+            let (fwm_dr, fwm_ds) = compute_fwm_contribution(r, s, params.chi, n_bands, n_pos)?;
+            dr = (dr + fwm_dr)?;
+            ds = (ds + fwm_ds)?;
+        }
 
         Ok((dr, ds))
+    }
+
+    /// Compute FWM contribution for all bands via tensor shifts.
+    /// Uses the same quartet enumeration as the CPU canonical.
+    /// Returns (fwm_dr, fwm_ds) each of shape [n_pos, n_bands].
+    fn compute_fwm_contribution(
+        r: &Tensor, s: &Tensor,
+        chi: f32, n_bands: usize, n_pos: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let device = r.device();
+        let z1 = Tensor::zeros((n_pos, 1), DType::F32, device)?;
+        let z2 = Tensor::zeros((n_pos, 2), DType::F32, device)?;
+
+        // Shifted versions of r and s
+        let r_m2 = Tensor::cat(&[&z2, &r.narrow(1, 0, n_bands - 2)?], 1)?;
+        let r_m1 = Tensor::cat(&[&z1, &r.narrow(1, 0, n_bands - 1)?], 1)?;
+        let r_p1 = Tensor::cat(&[&r.narrow(1, 1, n_bands - 1)?, &z1], 1)?;
+        let r_p2 = Tensor::cat(&[&r.narrow(1, 2, n_bands - 2)?, &z2], 1)?;
+        let s_m2 = Tensor::cat(&[&z2, &s.narrow(1, 0, n_bands - 2)?], 1)?;
+        let s_m1 = Tensor::cat(&[&z1, &s.narrow(1, 0, n_bands - 1)?], 1)?;
+        let s_p1 = Tensor::cat(&[&s.narrow(1, 1, n_bands - 1)?, &z1], 1)?;
+        let s_p2 = Tensor::cat(&[&s.narrow(1, 2, n_bands - 2)?, &z2], 1)?;
+
+        let mut fwm_dr = Tensor::zeros((n_pos, n_bands), DType::F32, device)?;
+        let mut fwm_ds = Tensor::zeros((n_pos, n_bands), DType::F32, device)?;
+
+        // Family A: quartet (a=k-2, b=k+1, c=k-1, d=k)
+        // For band k (role d): a=k-2, b=k+1, c=k-1, d=k
+        //   p_ab = z_{k-2} * z_{k+1}
+        //   contribution to dr[k] = chi * (p_ab_im * r_{k-1} - p_ab_re * s_{k-1})
+        //   contribution to ds[k] = -chi * (p_ab_re * r_{k-1} + p_ab_im * s_{k-1})
+        {
+            // p_ab = z_{k-2} * z_{k+1}: complex multiply
+            let pab_re = (&r_m2 * &r_p1)?.sub(&(&s_m2 * &s_p1)?)?;
+            let pab_im = (&r_m2 * &s_p1)?.add(&(&s_m2 * &r_p1)?)?;
+            // p_cd = z_{k-1} * z_k: complex multiply
+            let pcd_re = (&r_m1 * r)?.sub(&(&s_m1 * s)?)?;
+            let pcd_im = (&r_m1 * s)?.add(&(&s_m1 * r)?)?;
+
+            // Role d (band = k): dr[k] += chi * (pab_im*r_c - pab_re*s_c) where c=k-1
+            fwm_dr = (fwm_dr + ((&pab_im * &r_m1)?.sub(&(&pab_re * &s_m1)?)? * chi as f64)?)?;
+            fwm_ds = (fwm_ds - ((&pab_re * &r_m1)?.add(&(&pab_im * &s_m1)?)? * chi as f64)?)?;
+
+            // Role c (band = k-1): dr[k-1] += chi * (pab_im*r_d - pab_re*s_d) where d=k
+            // This writes to k-1, so we shift the result right by 1
+            let dc_dr = (&pab_im * r)?.sub(&(&pab_re * s)?)?;
+            let dc_ds_neg = (&pab_re * r)?.add(&(&pab_im * s)?)?;
+            // Shift: contribution computed at position k goes to position k-1
+            // narrow(k=2..n-1) then pad right
+            let dc_dr_shifted = Tensor::cat(&[&z1, &dc_dr.narrow(1, 2, n_bands - 3)?, &z2], 1)?;
+            let dc_ds_shifted = Tensor::cat(&[&z1, &dc_ds_neg.narrow(1, 2, n_bands - 3)?, &z2], 1)?;
+            fwm_dr = (fwm_dr + (dc_dr_shifted * chi as f64)?)?;
+            fwm_ds = (fwm_ds - (dc_ds_shifted * chi as f64)?)?;
+
+            // Role a (band = k-2): dr[k-2] += chi * (r_b*pcd_im - s_b*pcd_re) where b=k+1
+            let da_dr = (&r_p1 * &pcd_im)?.sub(&(&s_p1 * &pcd_re)?)?;
+            let da_ds_neg = (&r_p1 * &pcd_re)?.add(&(&s_p1 * &pcd_im)?)?;
+            // Contribution at k goes to k-2: shift right by 2
+            let da_dr_shifted = Tensor::cat(&[&z2, &da_dr.narrow(1, 2, n_bands - 3)?, &z1], 1)?;
+            let da_ds_shifted = Tensor::cat(&[&z2, &da_ds_neg.narrow(1, 2, n_bands - 3)?, &z1], 1)?;
+            fwm_dr = (fwm_dr + (da_dr_shifted * chi as f64)?)?;
+            fwm_ds = (fwm_ds - (da_ds_shifted * chi as f64)?)?;
+
+            // Role b (band = k+1): dr[k+1] += chi * (r_a*pcd_im - s_a*pcd_re) where a=k-2
+            let db_dr = (&r_m2 * &pcd_im)?.sub(&(&s_m2 * &pcd_re)?)?;
+            let db_ds_neg = (&r_m2 * &pcd_re)?.add(&(&s_m2 * &pcd_im)?)?;
+            // Contribution at k goes to k+1: shift left by 1
+            let db_dr_shifted = Tensor::cat(&[&db_dr.narrow(1, 2, n_bands - 3)?, &z1, &z2], 1)?;
+            let db_ds_shifted = Tensor::cat(&[&db_ds_neg.narrow(1, 2, n_bands - 3)?, &z1, &z2], 1)?;
+            fwm_dr = (fwm_dr + (db_dr_shifted * chi as f64)?)?;
+            fwm_ds = (fwm_ds - (db_ds_shifted * chi as f64)?)?;
+        }
+
+        // Family B: quartet (a=k-1, b=k+2, c=k, d=k+1)
+        {
+            let pab_re = (&r_m1 * &r_p2)?.sub(&(&s_m1 * &s_p2)?)?;
+            let pab_im = (&r_m1 * &s_p2)?.add(&(&s_m1 * &r_p2)?)?;
+            let pcd_re = (r * &r_p1)?.sub(&(s * &s_p1)?)?;
+            let pcd_im = (r * &s_p1)?.add(&(s * &r_p1)?)?;
+
+            // Role d (band = k+1): dr[k+1] += chi * (pab_im*r_c - pab_re*s_c) where c=k
+            let dd_dr = (&pab_im * r)?.sub(&(&pab_re * s)?)?;
+            let dd_ds_neg = (&pab_re * r)?.add(&(&pab_im * s)?)?;
+            // Shift left by 1: contribution at k goes to k+1
+            let dd_dr_s = Tensor::cat(&[&dd_dr.narrow(1, 1, n_bands - 3)?, &z1, &z2], 1)?;
+            let dd_ds_s = Tensor::cat(&[&dd_ds_neg.narrow(1, 1, n_bands - 3)?, &z1, &z2], 1)?;
+            fwm_dr = (fwm_dr + (dd_dr_s * chi as f64)?)?;
+            fwm_ds = (fwm_ds - (dd_ds_s * chi as f64)?)?;
+
+            // Role c (band = k): dr[k] += chi * (pab_im*r_d - pab_re*s_d) where d=k+1
+            let dc_dr = (&pab_im * &r_p1)?.sub(&(&pab_re * &s_p1)?)?;
+            let dc_ds_neg = (&pab_re * &r_p1)?.add(&(&pab_im * &s_p1)?)?;
+            let dc_dr_s = Tensor::cat(&[&z1, &dc_dr.narrow(1, 1, n_bands - 3)?, &z2], 1)?;
+            let dc_ds_s = Tensor::cat(&[&z1, &dc_ds_neg.narrow(1, 1, n_bands - 3)?, &z2], 1)?;
+            fwm_dr = (fwm_dr + (dc_dr_s * chi as f64)?)?;
+            fwm_ds = (fwm_ds - (dc_ds_s * chi as f64)?)?;
+
+            // Role a (band = k-1): dr[k-1] += chi * (r_b*pcd_im - s_b*pcd_re) where b=k+2
+            let da_dr = (&r_p2 * &pcd_im)?.sub(&(&s_p2 * &pcd_re)?)?;
+            let da_ds_neg = (&r_p2 * &pcd_re)?.add(&(&s_p2 * &pcd_im)?)?;
+            let da_dr_s = Tensor::cat(&[&z1, &da_dr.narrow(1, 1, n_bands - 3)?, &z2], 1)?;
+            let da_ds_s = Tensor::cat(&[&z1, &da_ds_neg.narrow(1, 1, n_bands - 3)?, &z2], 1)?;
+            fwm_dr = (fwm_dr + (da_dr_s * chi as f64)?)?;
+            fwm_ds = (fwm_ds - (da_ds_s * chi as f64)?)?;
+
+            // Role b (band = k+2): dr[k+2] += chi * (r_a*pcd_im - s_a*pcd_re) where a=k-1
+            let db_dr = (&r_m1 * &pcd_im)?.sub(&(&s_m1 * &pcd_re)?)?;
+            let db_ds_neg = (&r_m1 * &pcd_re)?.add(&(&s_m1 * &pcd_im)?)?;
+            let db_dr_s = Tensor::cat(&[&db_dr.narrow(1, 1, n_bands - 3)?, &z2, &z1], 1)?;
+            let db_ds_s = Tensor::cat(&[&db_ds_neg.narrow(1, 1, n_bands - 3)?, &z2, &z1], 1)?;
+            fwm_dr = (fwm_dr + (db_dr_s * chi as f64)?)?;
+            fwm_ds = (fwm_ds - (db_ds_s * chi as f64)?)?;
+        }
+
+        Ok((fwm_dr, fwm_ds))
     }
 
     /// GPU-native RK4 ODE forward pass.

@@ -196,9 +196,10 @@ fn main() {
         let debug_nan = std::env::args().any(|a| a == "--debug-nan");
         let alpha: f32 = pflag("--alpha", 0.1);
         let beta: f32 = pflag("--beta", alpha);
+        let chi: f32 = pflag("--fwm-strength", 0.0);
         let phase_native = std::env::args().any(|a| a == "--phase-native");
         match candle_engine::engine::train_candle(
-            &data_path, n_iters, n_bands, n_head, n_layers, maestro_dim, rk4_steps, out_proj_groups, debug_nan, alpha, beta, phase_native,
+            &data_path, n_iters, n_bands, n_head, n_layers, maestro_dim, rk4_steps, out_proj_groups, debug_nan, alpha, beta, chi, phase_native,
         ) {
             Ok(()) => return,
             Err(e) => { eprintln!("Candle error: {e:?}"); std::process::exit(1); }

@@ -21,7 +21,7 @@ pub mod train {
         data_path: &str, n_iters: usize,
         n_bands: usize, n_head: usize, n_layers: usize,
         maestro_dim: usize, _rk4_steps: usize, out_proj_groups: usize,
-        debug_nan: bool, alpha: f32, beta: f32, phase_native: bool,
+        debug_nan: bool, alpha: f32, beta: f32, chi: f32, phase_native: bool,
     ) -> Result<()> {
         // Runtime config — lowercase variables used throughout
         let n_embd = n_bands * 2;
@@ -61,7 +61,7 @@ pub mod train {
         let mut varmap = VarMap::new();
         let mut model = CandleWaveModel::new(&varmap, vocab_size, &device,
             n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups, alpha, beta,
-            phase_native)?;
+            chi, phase_native)?;
         model.debug_nan = debug_nan;
         model.use_custom_op = use_custom_op;
         model.use_cuda_kernel = use_cuda_kernel;

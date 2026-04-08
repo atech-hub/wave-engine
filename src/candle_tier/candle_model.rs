@@ -96,7 +96,7 @@ pub mod model {
         pub fn new(varmap: &VarMap, vocab_size: usize, device: &Device,
                    n_bands: usize, n_head: usize, n_layers: usize, maestro_dim: usize,
                    rk4_steps: usize, out_proj_groups: usize, alpha: f32, beta: f32,
-                   phase_native: bool) -> Result<Self> {
+                   chi: f32, phase_native: bool) -> Result<Self> {
             let n_embd = n_bands * 2;
             let block_size = 256; // positional table size
             // Save config for methods
@@ -175,7 +175,7 @@ pub mod model {
                     rk4_n_steps: rk4_steps,
                 };
                 let gpu_ode_params = crate::gpu_ode::gpu_ode::GpuOdeParams::learnable(
-                    n_bands, alpha, beta, rk4_steps, vs_block.pp("ode"),
+                    n_bands, alpha, beta, chi, rk4_steps, vs_block.pp("ode"),
                 )?;
 
                 // Cache frozen attention weights on CPU — eliminates 48 GPU→CPU transfers per layer per forward
