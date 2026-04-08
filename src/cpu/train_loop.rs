@@ -227,6 +227,9 @@ pub fn run_training(config: TrainConfig) {
     let seq_len = config.seq_len;
     let lr = config.lr;
 
+    // Tier identification for monitor tagging
+    let compute_tier = if config.use_gpu { "wgpu" } else { "cpu" };
+
     // JSONL telemetry — derive from checkpoint name or use explicit --log-name
     let log_name = config.log_name.clone().unwrap_or_else(|| {
         let tier = if config.use_gpu { "wgpu" } else { "cpu" };
@@ -555,9 +558,14 @@ pub fn run_training(config: TrainConfig) {
                 eprintln!("  [ODE L{}] damp={:.3} phase={:.3} fwm={:.4} max_amp={:.3}",
                     layer_idx, diag.damping_ratio, diag.phase_ratio, diag.fwm_ratio,
                     diag.max_band_amp);
+                // Sanity check: fwm_ratio should be in [0, 1]
+                if diag.fwm_ratio < 0.0 || diag.fwm_ratio > 1.0 || diag.fwm_ratio.is_nan() {
+                    eprintln!("  WARNING: L{} fwm_ratio={:.4} out of range [0,1] — activation cache may not reflect {} tier",
+                        layer_idx, diag.fwm_ratio, compute_tier);
+                }
             }
-            let _ = writeln!(log_writer, r#"{{"iter":{},"type":"ode_decomposition","chi":{},"layers":[{}]}}"#,
-                iter, config.fwm_strength, fwm_layers.join(","));
+            let _ = writeln!(log_writer, r#"{{"iter":{},"type":"ode_decomposition","tier":"{}","chi":{},"layers":[{}]}}"#,
+                iter, compute_tier, config.fwm_strength, fwm_layers.join(","));
             let _ = log_writer.flush();
         }
 
