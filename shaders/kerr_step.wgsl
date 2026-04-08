@@ -27,7 +27,7 @@ struct Params {
 @group(0) @binding(4) var<storage, read> gamma: array<f32>;   // [N_BANDS] softplus(raw)
 @group(0) @binding(5) var<storage, read> omega: array<f32>;   // [N_BANDS]
 @group(0) @binding(6) var<uniform> params: Params;
-@group(0) @binding(7) var<storage, read> alpha_beta: array<f32>; // [2]: alpha, beta
+@group(0) @binding(7) var<storage, read> alpha_beta_chi: array<f32>; // [3]: alpha, beta, chi
 
 @compute @workgroup_size(64)
 fn kerr_derivative(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -68,8 +68,8 @@ fn kerr_derivative(@builtin(global_invocation_id) id: vec3<u32>) {
         ns += rp2 * rp2 + sp2 * sp2;
     }
 
-    let alpha = alpha_beta[0];
-    let beta = alpha_beta[1];
+    let alpha = alpha_beta_chi[0];
+    let beta = alpha_beta_chi[1];
 
     let mag_sq_c = min(mag_sq, 2500.0);
     let ns_c = min(ns, 10000.0);

@@ -143,9 +143,9 @@ impl GpuBackend {
     }
 
     /// Kerr derivative on GPU. Pooled scratch + staging.
-    pub(crate) fn gpu_kerr_derivative(&self, r: &[f32], s: &[f32], gamma: &[f32], omega: &[f32], alpha: f32, beta: f32) -> (Vec<f32>, Vec<f32>) {
+    pub(crate) fn gpu_kerr_derivative(&self, r: &[f32], s: &[f32], gamma: &[f32], omega: &[f32], alpha: f32, beta: f32, chi: f32) -> (Vec<f32>, Vec<f32>) {
         let n = r.len();
-        let ab = [alpha, beta];
+        let ab = [alpha, beta, chi];
         let r_buf = self.storage_buf("r", r);
         let s_buf = self.storage_buf("s", s);
         let gamma_buf = self.storage_buf("gamma", gamma);
@@ -207,28 +207,28 @@ impl GpuBackend {
         }
 
         for _ in 0..n_steps {
-            let (mut k1r, mut k1s) = self.gpu_kerr_derivative(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta);
+            let (mut k1r, mut k1s) = self.gpu_kerr_derivative(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi);
             clamp_single(&mut k1r, &mut k1s, DERIV_BOUND);
 
             let mut r2: Vec<f32> = r.iter().zip(&k1r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
             let mut s2: Vec<f32> = s.iter().zip(&k1s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
             clamp_single(&mut r2, &mut s2, MAG_BOUND);
 
-            let (mut k2r, mut k2s) = self.gpu_kerr_derivative(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta);
+            let (mut k2r, mut k2s) = self.gpu_kerr_derivative(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi);
             clamp_single(&mut k2r, &mut k2s, DERIV_BOUND);
 
             let mut r3: Vec<f32> = r.iter().zip(&k2r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
             let mut s3: Vec<f32> = s.iter().zip(&k2s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
             clamp_single(&mut r3, &mut s3, MAG_BOUND);
 
-            let (mut k3r, mut k3s) = self.gpu_kerr_derivative(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta);
+            let (mut k3r, mut k3s) = self.gpu_kerr_derivative(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi);
             clamp_single(&mut k3r, &mut k3s, DERIV_BOUND);
 
             let mut r4: Vec<f32> = r.iter().zip(&k3r).map(|(&ri, &k)| ri + dt * k).collect();
             let mut s4: Vec<f32> = s.iter().zip(&k3s).map(|(&si, &k)| si + dt * k).collect();
             clamp_single(&mut r4, &mut s4, MAG_BOUND);
 
-            let (mut k4r, mut k4s) = self.gpu_kerr_derivative(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta);
+            let (mut k4r, mut k4s) = self.gpu_kerr_derivative(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi);
             clamp_single(&mut k4r, &mut k4s, DERIV_BOUND);
 
             let w = &weights.rk4_weights;
@@ -354,11 +354,11 @@ impl GpuBackend {
     /// Batched Kerr derivative. Pooled scratch + staging.
     pub(crate) fn gpu_kerr_derivative_batch(
         &self, r_flat: &[f32], s_flat: &[f32],
-        gamma: &[f32], omega: &[f32], alpha: f32, beta: f32,
+        gamma: &[f32], omega: &[f32], alpha: f32, beta: f32, chi: f32,
         n_bands: usize, n_pos: usize,
     ) -> (Vec<f32>, Vec<f32>) {
         let total = n_pos * n_bands;
-        let ab = [alpha, beta];
+        let ab = [alpha, beta, chi];
         let r_buf = self.storage_buf("r", r_flat);
         let s_buf = self.storage_buf("s", s_flat);
         let gamma_buf = self.storage_buf("gamma", gamma);
@@ -421,7 +421,7 @@ impl GpuBackend {
         }
 
         let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
-        let ab = [weights.alpha, weights.beta];
+        let ab = [weights.alpha, weights.beta, weights.chi];
 
         let buf_size = (total * 4) as u64;
         let make_rw = |label| self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -615,6 +615,12 @@ impl GpuBackend {
     /// Replaces 192-dispatch RK4 chain with ONE dispatch.
     /// Lab-validated: MSE 0.000005 vs RK4-16 baseline, trains better.
     pub(crate) fn gpu_kerr_ode_perturbative_batch(&self, weights: &KerrWeights, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        // Perturbative path uses closed-form analytical solution for damped harmonic
+        // oscillators. FWM is a cubic interaction that cannot be expressed in closed form.
+        // When chi != 0, fall back to the fused RK4 path which handles FWM correctly.
+        if weights.chi != 0.0 {
+            return self.gpu_kerr_ode_batch_fused(weights, xs);
+        }
         let n_pos = xs.len();
         let n_bands = weights.gamma_raw.len();
         let n_embd = n_bands * 2;
@@ -774,28 +780,28 @@ impl GpuBackend {
         const DERIV_BOUND: f32 = 1000.0;
 
         for _ in 0..n_steps {
-            let (mut k1r, mut k1s) = self.gpu_kerr_derivative_batch(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
+            let (mut k1r, mut k1s) = self.gpu_kerr_derivative_batch(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, n_bands, n_pos);
             clamp_mag(&mut k1r, &mut k1s, total, DERIV_BOUND);
 
             let mut r2: Vec<f32> = r.iter().zip(&k1r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
             let mut s2: Vec<f32> = s.iter().zip(&k1s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
             clamp_mag(&mut r2, &mut s2, total, MAG_BOUND);
 
-            let (mut k2r, mut k2s) = self.gpu_kerr_derivative_batch(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
+            let (mut k2r, mut k2s) = self.gpu_kerr_derivative_batch(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, n_bands, n_pos);
             clamp_mag(&mut k2r, &mut k2s, total, DERIV_BOUND);
 
             let mut r3: Vec<f32> = r.iter().zip(&k2r).map(|(&ri, &k)| ri + 0.5 * dt * k).collect();
             let mut s3: Vec<f32> = s.iter().zip(&k2s).map(|(&si, &k)| si + 0.5 * dt * k).collect();
             clamp_mag(&mut r3, &mut s3, total, MAG_BOUND);
 
-            let (mut k3r, mut k3s) = self.gpu_kerr_derivative_batch(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
+            let (mut k3r, mut k3s) = self.gpu_kerr_derivative_batch(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, n_bands, n_pos);
             clamp_mag(&mut k3r, &mut k3s, total, DERIV_BOUND);
 
             let mut r4: Vec<f32> = r.iter().zip(&k3r).map(|(&ri, &k)| ri + dt * k).collect();
             let mut s4: Vec<f32> = s.iter().zip(&k3s).map(|(&si, &k)| si + dt * k).collect();
             clamp_mag(&mut r4, &mut s4, total, MAG_BOUND);
 
-            let (mut k4r, mut k4s) = self.gpu_kerr_derivative_batch(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta, n_bands, n_pos);
+            let (mut k4r, mut k4s) = self.gpu_kerr_derivative_batch(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, n_bands, n_pos);
             clamp_mag(&mut k4r, &mut k4s, total, DERIV_BOUND);
 
             let w = &weights.rk4_weights;

@@ -221,7 +221,7 @@ impl ComputeBackend for GpuBackend {
         // ONE upload (input x), all intermediate ops on GPU, ONE readback (final output).
         if let Some(ref res) = *resident {
             if let Some(crate::gpu_resident::FfnResidentBuffers::KerrDualMaestro {
-                    gamma, omega, alpha_beta: _,
+                    gamma, omega, alpha_beta_chi: _,
                     in_squeeze_w, in_squeeze_b, in_process_w, in_process_b,
                     out_squeeze_w, out_squeeze_b, out_process_w, out_process_b,
                     out_proj_w, out_proj_b,
@@ -291,7 +291,7 @@ impl ComputeBackend for GpuBackend {
                     let kd_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: None, contents: bytemuck::bytes_of(&kd_params), usage: wgpu::BufferUsages::UNIFORM,
                     });
-                    let ab = [weights.kerr.alpha, weights.kerr.beta];
+                    let ab = [weights.kerr.alpha, weights.kerr.beta, weights.kerr.chi];
                     let ab_buf = self.storage_buf("ab", &ab);
                     // RK4 scale params
                     let vsa_half = VecScaleAddParams { len: total_bands as u32, scale: 0.5 * dt, _pad1: 0, _pad2: 0 };

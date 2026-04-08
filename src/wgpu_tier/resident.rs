@@ -102,7 +102,7 @@ pub enum FfnResidentBuffers {
     KerrMaestro {
         gamma: wgpu::Buffer,     // pre-softplus'd [n_bands]
         omega: wgpu::Buffer,     // [n_bands]
-        alpha_beta: wgpu::Buffer, // [2]
+        alpha_beta_chi: wgpu::Buffer, // [3]: alpha, beta, chi
         squeeze_w: wgpu::Buffer,
         squeeze_b: wgpu::Buffer,
         process_w: wgpu::Buffer,
@@ -113,7 +113,7 @@ pub enum FfnResidentBuffers {
     KerrDualMaestro {
         gamma: wgpu::Buffer,
         omega: wgpu::Buffer,
-        alpha_beta: wgpu::Buffer,
+        alpha_beta_chi: wgpu::Buffer,
         in_squeeze_w: wgpu::Buffer,
         in_squeeze_b: wgpu::Buffer,
         in_process_w: wgpu::Buffer,
@@ -188,7 +188,7 @@ impl ResidentWeightBuffers {
                     FfnResidentBuffers::KerrMaestro {
                         gamma: create_buf(device, queue, &gamma),
                         omega: create_buf(device, queue, &w.kerr.omega),
-                        alpha_beta: create_buf(device, queue, &[w.kerr.alpha, w.kerr.beta]),
+                        alpha_beta_chi: create_buf(device, queue, &[w.kerr.alpha, w.kerr.beta, w.kerr.chi]),
                         squeeze_w: create_buf(device, queue, &flatten_weights(&w.maestro.squeeze.w)),
                         squeeze_b: create_buf(device, queue, &w.maestro.squeeze.b),
                         process_w: create_buf(device, queue, &flatten_weights(&w.maestro.process_1.w)),
@@ -202,7 +202,7 @@ impl ResidentWeightBuffers {
                     FfnResidentBuffers::KerrDualMaestro {
                         gamma: create_buf(device, queue, &gamma),
                         omega: create_buf(device, queue, &w.kerr.omega),
-                        alpha_beta: create_buf(device, queue, &[w.kerr.alpha, w.kerr.beta]),
+                        alpha_beta_chi: create_buf(device, queue, &[w.kerr.alpha, w.kerr.beta, w.kerr.chi]),
                         in_squeeze_w: create_buf(device, queue, &flatten_weights(&w.maestro_in.squeeze.w)),
                         in_squeeze_b: create_buf(device, queue, &w.maestro_in.squeeze.b),
                         in_process_w: create_buf(device, queue, &flatten_weights(&w.maestro_in.process_1.w)),
@@ -269,12 +269,12 @@ impl ResidentWeightBuffers {
                     queue.write_buffer(out_proj_b, 0, bytemuck::cast_slice(&w.out_proj.b));
                 }
                 (FfnWeights::KerrMaestro(w), FfnResidentBuffers::KerrMaestro {
-                    gamma, omega, alpha_beta, squeeze_w, squeeze_b, process_w, process_b, out_proj_w, out_proj_b,
+                    gamma, omega, alpha_beta_chi, squeeze_w, squeeze_b, process_w, process_b, out_proj_w, out_proj_b,
                 }) => {
                     let g: Vec<f32> = w.kerr.gamma_raw.iter().map(|&g| softplus(g)).collect();
                     queue.write_buffer(gamma, 0, bytemuck::cast_slice(&g));
                     queue.write_buffer(omega, 0, bytemuck::cast_slice(&w.kerr.omega));
-                    queue.write_buffer(alpha_beta, 0, bytemuck::cast_slice(&[w.kerr.alpha, w.kerr.beta]));
+                    queue.write_buffer(alpha_beta_chi, 0, bytemuck::cast_slice(&[w.kerr.alpha, w.kerr.beta, w.kerr.chi]));
                     queue.write_buffer(squeeze_w, 0, bytemuck::cast_slice(&flatten_weights(&w.maestro.squeeze.w)));
                     queue.write_buffer(squeeze_b, 0, bytemuck::cast_slice(&w.maestro.squeeze.b));
                     queue.write_buffer(process_w, 0, bytemuck::cast_slice(&flatten_weights(&w.maestro.process_1.w)));
@@ -283,7 +283,7 @@ impl ResidentWeightBuffers {
                     queue.write_buffer(out_proj_b, 0, bytemuck::cast_slice(&w.out_proj.b));
                 }
                 (FfnWeights::KerrDualMaestro(w), FfnResidentBuffers::KerrDualMaestro {
-                    gamma, omega, alpha_beta,
+                    gamma, omega, alpha_beta_chi,
                     in_squeeze_w, in_squeeze_b, in_process_w, in_process_b,
                     out_squeeze_w, out_squeeze_b, out_process_w, out_process_b,
                     out_proj_w, out_proj_b,
@@ -291,7 +291,7 @@ impl ResidentWeightBuffers {
                     let g: Vec<f32> = w.kerr.gamma_raw.iter().map(|&g| softplus(g)).collect();
                     queue.write_buffer(gamma, 0, bytemuck::cast_slice(&g));
                     queue.write_buffer(omega, 0, bytemuck::cast_slice(&w.kerr.omega));
-                    queue.write_buffer(alpha_beta, 0, bytemuck::cast_slice(&[w.kerr.alpha, w.kerr.beta]));
+                    queue.write_buffer(alpha_beta_chi, 0, bytemuck::cast_slice(&[w.kerr.alpha, w.kerr.beta, w.kerr.chi]));
                     queue.write_buffer(in_squeeze_w, 0, bytemuck::cast_slice(&flatten_weights(&w.maestro_in.squeeze.w)));
                     queue.write_buffer(in_squeeze_b, 0, bytemuck::cast_slice(&w.maestro_in.squeeze.b));
                     queue.write_buffer(in_process_w, 0, bytemuck::cast_slice(&flatten_weights(&w.maestro_in.process_1.w)));
