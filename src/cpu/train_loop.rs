@@ -102,12 +102,6 @@ pub fn run_training(config: TrainConfig) {
     // Quantum ladder operators: creation + annihilation inside ODE
     // From Wang & Kang unified matrix/wave mechanics
     // No matrix needed — O(n) tridiagonal, strength √k, computed on the fly
-    if config.mix_strength > 0.0 {
-        for block in &mut model.blocks {
-            block.ffn.kerr.mix_strength = config.mix_strength;
-        }
-        println!("  Ladder operators: strength={:.3} (adjacent bands, sqrt(k) scaling, {} bands)", config.mix_strength, config.n_bands);
-    }
 
     // Apply fixed values from CLI for dynamic params
     if let DynParam::Fixed(ref vals) = config.layer_scale {
@@ -409,6 +403,7 @@ pub fn run_training(config: TrainConfig) {
         let mut batch_flow_stats: Option<Vec<crate::common::layer_flow_monitor::LayerFlowStats>> = None;
         let mut batch_output_stats: Option<crate::common::output_monitor::OutputDistStats> = None;
         let mut batch_ode_dynamics: Option<Vec<crate::common::ode_dynamics_monitor::OdeDynamicsStats>> = None;
+        let mut batch_iq_analysis: Option<crate::common::iq_monitor::IqAnalysis> = None;
         for (loss, fg, health) in &batch_results {
             total_loss += loss;
             for (a, g) in total_grads.iter_mut().zip(fg.iter()) { *a += g; }
@@ -449,6 +444,8 @@ pub fn run_training(config: TrainConfig) {
                         output_norm: s.output_norm, attn_ratio: s.attn_ratio,
                         ffn_ratio: s.ffn_ratio, residual_ratio: s.residual_ratio,
                         cosine_in_out: s.cosine_in_out,
+                        band_amp_min: s.band_amp_min, band_amp_max: s.band_amp_max,
+                        band_amp_mean: s.band_amp_mean, band_amp_std: s.band_amp_std,
                     }).collect());
                 }
             }
@@ -471,6 +468,16 @@ pub fn run_training(config: TrainConfig) {
                     }).collect());
                 }
             }
+            if batch_iq_analysis.is_none() {
+                if let Some(ref iq) = health.iq_analysis {
+                    batch_iq_analysis = Some(crate::common::iq_monitor::IqAnalysis {
+                        i_discrim: iq.i_discrim, q_discrim: iq.q_discrim,
+                        iq_ratio: iq.iq_ratio, phase_mean: iq.phase_mean,
+                        phase_std: iq.phase_std, i_correct_rank: iq.i_correct_rank,
+                        q_correct_rank: iq.q_correct_rank,
+                    });
+                }
+            }
             // I/Q + corrector logging (after loop — no break, no contamination)
             if let Some(ref iq) = health.iq_analysis {
                 eprintln!("  [I/Q] I_disc={:.3} Q_disc={:.3} IQ_ratio={:.3} phase_std={:.3} I_rank={} Q_rank={}",
@@ -488,17 +495,24 @@ pub fn run_training(config: TrainConfig) {
         for g in total_grads.iter_mut() { *g /= batch_size as f32; }
         monitor.record("reduce", t_reduce);
 
-        // FWM stability scan at iter 0 (one-shot)
+        // FWM stability scan at iter 0 (one-shot) — uses real activations
         if iter == 0 && config.fwm_strength > 0.0 {
-            // Grab a sample precond from the first batch
-            let sample = &batch_results[0].2; // BatchHealthData — not ideal but we need a hidden state
-            // Use the model's first block weights for the scan
+            let scan_start = (crate::rng::Rng::new(42).next_u64() as usize) % (train_data.len() - seq_len - 1);
+            let scan_tokens = &train_data[scan_start..scan_start + seq_len];
+            let scan_cache = crate::cpu::forward::forward_with_cache(
+                &model, scan_tokens, dims, None, None, None, Some(&stencil), None, None,
+            );
+            let scan_precond = if let Some(ref fc) = scan_cache.block_caches[0].ffn_backend_cache {
+                fc.precond[0].clone()
+            } else {
+                scan_cache.block_caches[0].ffn_precond[0].clone()
+            };
             let scan = crate::common::fwm_monitor::fwm_stability_scan(
-                &vec![0.1f32; config.n_bands * 2], // unit-ish broadband input
+                &scan_precond,
                 &model.blocks[0].ffn.kerr, config.n_bands,
                 &[0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
             );
-            eprintln!("  [FWM stability scan]");
+            eprintln!("  [FWM stability scan (real activations)]");
             for (chi, diag, stable) in &scan {
                 eprintln!("    chi={:.2}: fwm_ratio={:.4} rk4_ratio={:.2} triple={:.2} max_amp={:.3} {}",
                     chi, diag.fwm_ratio, diag.rk4_step_ratio, diag.triple_ratio, diag.max_band_amp,
@@ -506,8 +520,8 @@ pub fn run_training(config: TrainConfig) {
             }
         }
 
-        // FWM monitor at health intervals — uses real training activations, writes to JSONL
-        if config.health_interval > 0 && iter % config.health_interval == 0 && config.fwm_strength > 0.0 {
+        // ODE decomposition monitor at health intervals — damping/phase/FWM ratios
+        if config.health_interval > 0 && iter % config.health_interval == 0 {
             // Grab real precond from the first batch's forward cache
             let cache_ref = &batch_results[0].2; // BatchHealthData from first batch
             // We need the actual hidden state — use the training data directly
@@ -520,22 +534,29 @@ pub fn run_training(config: TrainConfig) {
             use std::io::Write;
             let mut fwm_layers = Vec::new();
             for (layer_idx, block) in model.blocks.iter().enumerate() {
-                // Use the normed FFN input from the cache as a proxy for precond
-                let precond = &sample_cache.block_caches[layer_idx].normed_ffn[0];
+                // Use actual ODE precond from FFN backend cache (not normed_ffn!)
+                let precond_data = if let Some(ref fc) = sample_cache.block_caches[layer_idx].ffn_backend_cache {
+                    fc.precond[0].clone()
+                } else {
+                    // Fallback to legacy cache
+                    sample_cache.block_caches[layer_idx].ffn_precond[0].clone()
+                };
                 let diag = crate::common::fwm_monitor::measure_fwm(
-                    precond, &block.ffn.kerr, config.n_bands, layer_idx,
+                    &precond_data, &block.ffn.kerr, config.n_bands, layer_idx,
                 );
                 fwm_layers.push(format!(
-                    r#"{{"layer":{},"fwm_ratio":{:.4},"fwm_vs_phase":{:.4},"triple_ratio":{:.2},"max_amp":{:.4},"mean_amp":{:.4},"rk4_ratio":{:.3},"flux_max":{:.6},"top_bands":[{},{},{}]}}"#,
-                    layer_idx, diag.fwm_ratio, diag.fwm_vs_phase, diag.triple_ratio,
+                    r#"{{"layer":{},"fwm_ratio":{:.4},"fwm_vs_phase":{:.4},"damping_ratio":{:.4},"phase_ratio":{:.4},"triple_ratio":{:.2},"max_amp":{:.4},"mean_amp":{:.4},"rk4_ratio":{:.3},"flux_max":{:.6},"top_bands":[{},{},{}]}}"#,
+                    layer_idx, diag.fwm_ratio, diag.fwm_vs_phase,
+                    diag.damping_ratio, diag.phase_ratio,
+                    diag.triple_ratio,
                     diag.max_band_amp, diag.mean_band_amp, diag.rk4_step_ratio,
                     diag.flux_max, diag.top_3_bands[0], diag.top_3_bands[1], diag.top_3_bands[2]
                 ));
-                eprintln!("  [FWM L{}] ratio={:.4} vs_phase={:.4} triple={:.2} max_amp={:.3} rk4={:.2}",
-                    layer_idx, diag.fwm_ratio, diag.fwm_vs_phase, diag.triple_ratio,
-                    diag.max_band_amp, diag.rk4_step_ratio);
+                eprintln!("  [ODE L{}] damp={:.3} phase={:.3} fwm={:.4} max_amp={:.3}",
+                    layer_idx, diag.damping_ratio, diag.phase_ratio, diag.fwm_ratio,
+                    diag.max_band_amp);
             }
-            let _ = writeln!(log_writer, r#"{{"iter":{},"type":"fwm_monitor","chi":{},"layers":[{}]}}"#,
+            let _ = writeln!(log_writer, r#"{{"iter":{},"type":"ode_decomposition","chi":{},"layers":[{}]}}"#,
                 iter, config.fwm_strength, fwm_layers.join(","));
             let _ = log_writer.flush();
         }
@@ -642,6 +663,7 @@ pub fn run_training(config: TrainConfig) {
                 &mut log_writer, iter, iters_into_run, &model, &config, dims, &stencil,
                 &batch_distortion_data, &batch_grad_flow, &batch_attn_stats,
                 &batch_flow_stats, &batch_output_stats, &batch_ode_dynamics,
+                &batch_iq_analysis,
                 &mut prev_dyn_snap, batch_size, seq_len,
                 iter_start.elapsed().as_secs_f32(),
                 fwd_bwd_elapsed.as_secs_f32(),

@@ -10,7 +10,7 @@ use super::model::{
     KerrDualMaestroWeights, KerrWeights, MaestroWeights, PerBandLinearWeights,
     AttentionWeights, layer_norm, linear_fn, gelu,
 };
-use super::ode_deriv::rk4_step;
+use super::ode_deriv::rk4_step_public as rk4_step;
 use super::math::softplus;
 
 /// Linear without bias: y[i] = sum_j w[i][j] * x[j]

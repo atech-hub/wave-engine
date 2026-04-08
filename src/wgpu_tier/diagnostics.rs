@@ -23,7 +23,7 @@ pub fn diagnose_ode_gpu_vs_cpu(gpu_be: &gpu_pipelines::GpuBackend) {
         alpha: 0.1, beta: 0.1, rk4_n_steps: RK4_STEPS,
         phase_correction: vec![0.0; n_bands],
         rk4_weights: [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0],
-            coherent_matrix: vec![], mix_strength: 0.0, chi: 0.0,
+            chi: 0.0,
     };
 
     // CPU ODE
@@ -131,6 +131,8 @@ pub fn validate_gpu_fft(gpu: &gpu_pipelines::GpuBackend) {
 }
 
 fn kerr_ode_forward_cpu_standalone(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
+    use crate::common::ode_deriv::rk4_step_public;
+
     let n_bands = weights.gamma_raw.len();
     let n_embd = n_bands * 2;
     let n_steps = weights.rk4_n_steps;
@@ -140,42 +142,10 @@ fn kerr_ode_forward_cpu_standalone(weights: &KerrWeights, x: &[f32]) -> Vec<f32>
     let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
     let w = &weights.rk4_weights;
     for _ in 0..n_steps {
-        let (r_new, s_new) = rk4_step_standalone(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, w);
+        let (r_new, s_new) = rk4_step_public(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, w);
         r = r_new; s = s_new;
     }
     let mut out = vec![0.0f32; n_embd];
     for k in 0..n_bands { out[k * 2] = r[k]; out[k * 2 + 1] = s[k]; }
     out
-}
-
-fn rk4_step_standalone(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: f32, beta: f32, w: &[f32; 4]) -> (Vec<f32>, Vec<f32>) {
-    let n = r.len();
-    let deriv = |r: &[f32], s: &[f32]| -> (Vec<f32>, Vec<f32>) {
-        let mut dr = vec![0.0f32; n]; let mut ds = vec![0.0f32; n];
-        for k in 0..n {
-            let mag_sq = r[k]*r[k] + s[k]*s[k];
-            let mut ns = 0.0f32;
-            if k >= 2 { ns += r[k-2]*r[k-2] + s[k-2]*s[k-2]; }
-            if k >= 1 { ns += r[k-1]*r[k-1] + s[k-1]*s[k-1]; }
-            if k+1 < n { ns += r[k+1]*r[k+1] + s[k+1]*s[k+1]; }
-            if k+2 < n { ns += r[k+2]*r[k+2] + s[k+2]*s[k+2]; }
-            let phi = omega[k] + alpha * mag_sq + beta * ns;
-            dr[k] = -gamma[k] * r[k] - phi * s[k];
-            ds[k] = -gamma[k] * s[k] + phi * r[k];
-        }
-        (dr, ds)
-    };
-    let (k1r, k1s) = deriv(r, s);
-    let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&a,&b)| a+0.5*dt*b).collect();
-    let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&a,&b)| a+0.5*dt*b).collect();
-    let (k2r, k2s) = deriv(&r2, &s2);
-    let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&a,&b)| a+0.5*dt*b).collect();
-    let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&a,&b)| a+0.5*dt*b).collect();
-    let (k3r, k3s) = deriv(&r3, &s3);
-    let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a,&b)| a+dt*b).collect();
-    let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a,&b)| a+dt*b).collect();
-    let (k4r, k4s) = deriv(&r4, &s4);
-    let rn: Vec<f32> = (0..n).map(|i| r[i]+dt*(w[0]*k1r[i]+w[1]*k2r[i]+w[2]*k3r[i]+w[3]*k4r[i])).collect();
-    let sn: Vec<f32> = (0..n).map(|i| s[i]+dt*(w[0]*k1s[i]+w[1]*k2s[i]+w[2]*k3s[i]+w[3]*k4s[i])).collect();
-    (rn, sn)
 }

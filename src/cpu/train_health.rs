@@ -388,6 +388,7 @@ pub fn write_health_monitors(
     batch_flow_stats: &Option<Vec<crate::common::layer_flow_monitor::LayerFlowStats>>,
     batch_output_stats: &Option<crate::common::output_monitor::OutputDistStats>,
     batch_ode_dynamics: &Option<Vec<crate::common::ode_dynamics_monitor::OdeDynamicsStats>>,
+    batch_iq_analysis: &Option<crate::common::iq_monitor::IqAnalysis>,
     prev_dyn_snap: &mut Option<crate::common::dyn_param_monitor::DynParamSnapshot>,
     batch_size: usize,
     seq_len: usize,
@@ -495,8 +496,8 @@ pub fn write_health_monitors(
 
     // --- Monitor suite (batch 3) ---
 
-    // Embedding space (#4) — medium cost, sample-based
-    {
+    // Embedding space (#4) — frozen embeddings, only changes at iter 0
+    if iters_into_run == 0 {
         let embed_stats = crate::common::embedding_monitor::analyze_embeddings(model);
         let embed_json = crate::common::embedding_monitor::to_json(&embed_stats);
         writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, embed_json).ok();
@@ -510,6 +511,16 @@ pub fn write_health_monitors(
             writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, ode_json).ok();
             log_writer.flush().ok();
         }
+    }
+
+    // I/Q channel analysis — now persisted to JSONL (was eprintln-only)
+    if let Some(iq) = batch_iq_analysis {
+        writeln!(log_writer,
+            r#"{{"iter":{},"type":"monitor","iq":{{"i_discrim":{:.4},"q_discrim":{:.4},"iq_ratio":{:.4},"phase_mean":{:.4},"phase_std":{:.4},"i_correct_rank":{},"q_correct_rank":{}}}}}"#,
+            iter, iq.i_discrim, iq.q_discrim, iq.iq_ratio, iq.phase_mean, iq.phase_std,
+            iq.i_correct_rank, iq.q_correct_rank
+        ).ok();
+        log_writer.flush().ok();
     }
 }
 

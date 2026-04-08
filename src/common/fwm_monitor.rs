@@ -1,8 +1,10 @@
 //! FWM Monitor — direct measurement of four-wave mixing during training.
-//! Runs a separate monitoring-only ODE forward with FWM capture.
+//! Uses the canonical kerr_derivative_into from ode_deriv.rs (single source of truth).
+//! Runs a separate monitoring-only ODE forward with DerivativeCapture.
 //! Zero cost to training path — only runs at health intervals.
 
 use crate::model::KerrWeights;
+use super::ode_deriv::{kerr_derivative_into, DerivativeCapture};
 
 pub struct FwmDiagnostics {
     pub layer: usize,
@@ -14,16 +16,21 @@ pub struct FwmDiagnostics {
     pub mean_band_amp: f32,   // mean band amplitude at ODE input
     pub max_band_amp: f32,    // max band amplitude at ODE input
     pub triple_ratio: f32,    // fraction of quartets with all 4 bands active
-    pub rk4_step_ratio: f32,  // step_16 fwm magnitude / step_1 fwm magnitude
+    pub rk4_step_ratio: f32,  // step_N fwm magnitude / step_1 fwm magnitude
+    // Decomposition fields (populated via DerivativeCapture)
+    pub damping_ratio: f32,   // ||damping|| / ||total_deriv||
+    pub phase_ratio: f32,     // ||phase_rotation|| / ||total_deriv||
 }
 
 /// Measure FWM contribution on a single position's ODE input.
+/// Uses canonical RK4 integration (not Euler) matching the training path.
 pub fn measure_fwm(precond: &[f32], weights: &KerrWeights, n_bands: usize, layer: usize) -> FwmDiagnostics {
     let n = n_bands;
     let n_steps = weights.rk4_n_steps;
     let dt = 1.0 / n_steps as f32;
     let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
     let chi = weights.chi;
+    let w = &weights.rk4_weights;
 
     let mut r: Vec<f32> = (0..n).map(|k| precond[k * 2]).collect();
     let mut s: Vec<f32> = (0..n).map(|k| precond[k * 2 + 1]).collect();
@@ -62,50 +69,53 @@ pub fn measure_fwm(precond: &[f32], weights: &KerrWeights, n_bands: usize, layer
     }
     let triple_ratio = if total_quartets > 0 { active_quartets as f32 / total_quartets as f32 } else { 0.0 };
 
-    // Run RK4 steps, capturing FWM contribution at step 1 and step N
-    let w = &weights.rk4_weights;
+    // Run RK4 steps using canonical derivative with DerivativeCapture
     let mut fwm_mag_step1 = 0.0f32;
     let mut fwm_mag_last = 0.0f32;
     let mut total_fwm_flux = vec![0.0f32; n];
     let mut total_deriv_norm_sq = 0.0f32;
     let mut total_fwm_norm_sq = 0.0f32;
-    let mut total_phi_norm_sq = 0.0f32;
+    let mut total_phase_norm_sq = 0.0f32;
+    let mut total_damping_norm_sq = 0.0f32;
+
+    // Scratch buffers for RK4
+    let mut r_tmp = vec![0.0f32; n];
+    let mut s_tmp = vec![0.0f32; n];
+    let mut k1r = vec![0.0f32; n]; let mut k1s = vec![0.0f32; n];
+    let mut k2r = vec![0.0f32; n]; let mut k2s = vec![0.0f32; n];
+    let mut k3r = vec![0.0f32; n]; let mut k3s = vec![0.0f32; n];
+    let mut k4r = vec![0.0f32; n]; let mut k4s = vec![0.0f32; n];
+
+    // Capture buffers (accumulated per step, then reset)
+    let mut damp_dr = vec![0.0f32; n]; let mut damp_ds = vec![0.0f32; n];
+    let mut phase_dr = vec![0.0f32; n]; let mut phase_ds = vec![0.0f32; n];
+    let mut fwm_dr = vec![0.0f32; n]; let mut fwm_ds = vec![0.0f32; n];
 
     for step in 0..n_steps {
-        // Compute full derivative
-        let mut dr = vec![0.0f32; n];
-        let mut ds = vec![0.0f32; n];
-        // SPM/XPM/damping part
-        for k in 0..n {
-            let mag_sq = r[k]*r[k] + s[k]*s[k];
-            let mut ns = 0.0f32;
-            if k >= 2 { ns += r[k-2]*r[k-2] + s[k-2]*s[k-2]; }
-            if k >= 1 { ns += r[k-1]*r[k-1] + s[k-1]*s[k-1]; }
-            if k+1 < n { ns += r[k+1]*r[k+1] + s[k+1]*s[k+1]; }
-            if k+2 < n { ns += r[k+2]*r[k+2] + s[k+2]*s[k+2]; }
-            let phi = weights.omega[k] + weights.alpha * mag_sq + weights.beta * ns;
-            dr[k] = -gamma[k] * r[k] - phi * s[k];
-            ds[k] = -gamma[k] * s[k] + phi * r[k];
-            total_phi_norm_sq += (phi * s[k]) * (phi * s[k]) + (phi * r[k]) * (phi * r[k]);
+        // Zero capture buffers for this step's k1 evaluation
+        for i in 0..n { damp_dr[i] = 0.0; damp_ds[i] = 0.0; }
+        for i in 0..n { phase_dr[i] = 0.0; phase_ds[i] = 0.0; }
+        for i in 0..n { fwm_dr[i] = 0.0; fwm_ds[i] = 0.0; }
+
+        // k1 with capture (captures decomposition at current state)
+        {
+            let mut cap = DerivativeCapture {
+                damping_dr: &mut damp_dr, damping_ds: &mut damp_ds,
+                phase_dr: &mut phase_dr, phase_ds: &mut phase_ds,
+                fwm_dr: &mut fwm_dr, fwm_ds: &mut fwm_ds,
+            };
+            kerr_derivative_into(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, chi, &mut k1r, &mut k1s, Some(&mut cap));
         }
 
-        // FWM part (separate accumulation)
-        let mut fwm_dr = vec![0.0f32; n];
-        let mut fwm_ds = vec![0.0f32; n];
-        if chi != 0.0 && n > 4 {
-            for k in 2..(n-1) {
-                apply_quartet_capture(&mut dr, &mut ds, &mut fwm_dr, &mut fwm_ds, &r, &s, chi, k-2, k+1, k-1, k);
-            }
-            for k in 1..(n-2) {
-                apply_quartet_capture(&mut dr, &mut ds, &mut fwm_dr, &mut fwm_ds, &r, &s, chi, k-1, k+2, k, k+1);
-            }
-        }
-
-        // Accumulate stats
+        // Accumulate stats from k1 capture (representative of this step)
         let fwm_norm: f32 = fwm_dr.iter().map(|x| x*x).sum::<f32>() + fwm_ds.iter().map(|x| x*x).sum::<f32>();
-        let deriv_norm: f32 = dr.iter().map(|x| x*x).sum::<f32>() + ds.iter().map(|x| x*x).sum::<f32>();
+        let deriv_norm: f32 = k1r.iter().map(|x| x*x).sum::<f32>() + k1s.iter().map(|x| x*x).sum::<f32>();
+        let phase_norm: f32 = phase_dr.iter().map(|x| x*x).sum::<f32>() + phase_ds.iter().map(|x| x*x).sum::<f32>();
+        let damping_norm: f32 = damp_dr.iter().map(|x| x*x).sum::<f32>() + damp_ds.iter().map(|x| x*x).sum::<f32>();
         total_fwm_norm_sq += fwm_norm;
         total_deriv_norm_sq += deriv_norm;
+        total_phase_norm_sq += phase_norm;
+        total_damping_norm_sq += damping_norm;
 
         if step == 0 { fwm_mag_step1 = fwm_norm.sqrt(); }
         fwm_mag_last = fwm_norm.sqrt();
@@ -114,13 +124,31 @@ pub fn measure_fwm(precond: &[f32], weights: &KerrWeights, n_bands: usize, layer
             total_fwm_flux[k] += fwm_dr[k]*fwm_dr[k] + fwm_ds[k]*fwm_ds[k];
         }
 
-        // RK4 step (simplified — just Euler for monitoring, not training)
-        for k in 0..n { r[k] += dt * dr[k]; s[k] += dt * ds[k]; }
+        // k2, k3, k4 without capture (we only capture at k1 for stats efficiency)
+        for i in 0..n { r_tmp[i] = r[i] + 0.5 * dt * k1r[i]; }
+        for i in 0..n { s_tmp[i] = s[i] + 0.5 * dt * k1s[i]; }
+        kerr_derivative_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, chi, &mut k2r, &mut k2s, None);
+
+        for i in 0..n { r_tmp[i] = r[i] + 0.5 * dt * k2r[i]; }
+        for i in 0..n { s_tmp[i] = s[i] + 0.5 * dt * k2s[i]; }
+        kerr_derivative_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, chi, &mut k3r, &mut k3s, None);
+
+        for i in 0..n { r_tmp[i] = r[i] + dt * k3r[i]; }
+        for i in 0..n { s_tmp[i] = s[i] + dt * k3s[i]; }
+        kerr_derivative_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, chi, &mut k4r, &mut k4s, None);
+
+        // RK4 state update
+        for i in 0..n {
+            r[i] += dt * (w[0] * k1r[i] + w[1] * k2r[i] + w[2] * k3r[i] + w[3] * k4r[i]);
+            s[i] += dt * (w[0] * k1s[i] + w[1] * k2s[i] + w[2] * k3s[i] + w[3] * k4s[i]);
+        }
     }
 
     // Compute summary stats
     let fwm_ratio = if total_deriv_norm_sq > 1e-20 { total_fwm_norm_sq.sqrt() / total_deriv_norm_sq.sqrt() } else { 0.0 };
-    let fwm_vs_phase = if total_phi_norm_sq > 1e-20 { total_fwm_norm_sq.sqrt() / total_phi_norm_sq.sqrt() } else { 0.0 };
+    let fwm_vs_phase = if total_phase_norm_sq > 1e-20 { total_fwm_norm_sq.sqrt() / total_phase_norm_sq.sqrt() } else { 0.0 };
+    let damping_ratio = if total_deriv_norm_sq > 1e-20 { total_damping_norm_sq.sqrt() / total_deriv_norm_sq.sqrt() } else { 0.0 };
+    let phase_ratio = if total_deriv_norm_sq > 1e-20 { total_phase_norm_sq.sqrt() / total_deriv_norm_sq.sqrt() } else { 0.0 };
     let flux_max = total_fwm_flux.iter().cloned().fold(0.0f32, f32::max);
     let flux_mean = total_fwm_flux.iter().sum::<f32>() / n as f32;
     let rk4_step_ratio = if fwm_mag_step1 > 1e-10 { fwm_mag_last / fwm_mag_step1 } else { 1.0 };
@@ -141,6 +169,7 @@ pub fn measure_fwm(precond: &[f32], weights: &KerrWeights, n_bands: usize, layer
         top_3_bands: top_3,
         mean_band_amp, max_band_amp,
         triple_ratio, rk4_step_ratio,
+        damping_ratio, phase_ratio,
     }
 }
 
@@ -158,34 +187,4 @@ pub fn fwm_stability_scan(
         results.push((chi, diag, stable));
     }
     results
-}
-
-/// Helper: apply_quartet that writes to BOTH main dr/ds and capture fwm_dr/fwm_ds
-#[inline(always)]
-fn apply_quartet_capture(
-    dr: &mut [f32], ds: &mut [f32],
-    fwm_dr: &mut [f32], fwm_ds: &mut [f32],
-    r: &[f32], s: &[f32],
-    chi: f32, a: usize, b: usize, c: usize, d: usize,
-) {
-    let (ra, sa) = (r[a], s[a]); let (rb, sb) = (r[b], s[b]);
-    let (rc, sc) = (r[c], s[c]); let (rd, sd) = (r[d], s[d]);
-    let pab_re = ra*rb - sa*sb; let pab_im = ra*sb + sa*rb;
-    let pcd_re = rc*rd - sc*sd; let pcd_im = rc*sd + sc*rd;
-
-    let da = chi * (rb*pcd_im - sb*pcd_re);
-    let sa_v = -chi * (rb*pcd_re + sb*pcd_im);
-    dr[a] += da; ds[a] += sa_v; fwm_dr[a] += da; fwm_ds[a] += sa_v;
-
-    let db = chi * (ra*pcd_im - sa*pcd_re);
-    let sb_v = -chi * (ra*pcd_re + sa*pcd_im);
-    dr[b] += db; ds[b] += sb_v; fwm_dr[b] += db; fwm_ds[b] += sb_v;
-
-    let dc = chi * (pab_im*rd - pab_re*sd);
-    let sc_v = -chi * (pab_re*rd + pab_im*sd);
-    dr[c] += dc; ds[c] += sc_v; fwm_dr[c] += dc; fwm_ds[c] += sc_v;
-
-    let dd_v = chi * (pab_im*rc - pab_re*sc);
-    let sd_v = -chi * (pab_re*rc + pab_im*sc);
-    dr[d] += dd_v; ds[d] += sd_v; fwm_dr[d] += dd_v; fwm_ds[d] += sd_v;
 }

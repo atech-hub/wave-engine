@@ -427,7 +427,7 @@ extern "C" __global__ void kerr_ode_bwd(
                 rk4_n_steps: self.rk4_steps,
                 phase_correction: vec![0.0; self.n_bands],
                 rk4_weights: self.rk4_weights,
-                coherent_matrix: vec![], mix_strength: 0.0, chi: 0.0,
+                chi: 0.0,
             }
         }
     }

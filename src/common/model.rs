@@ -212,8 +212,6 @@ pub struct KerrWeights {
     pub rk4_n_steps: usize,   // ODE integration steps (default 8)
     pub phase_correction: Vec<f32>,  // [N_BANDS] corrector plate — per-band phase offset (init 0.0)
     pub rk4_weights: [f32; 4],  // RK4 combination weights [w1,w2,w3,w4] (standard: 1/6, 1/3, 1/3, 1/6)
-    pub coherent_matrix: Vec<Vec<f32>>,  // [n_bands][n_bands] FROZEN antisymmetric (unused, kept for compat)
-    pub mix_strength: f32,               // unused, kept for compat
     pub chi: f32,                         // four-wave mixing strength (0.0 = off)
 }
 

@@ -1,13 +1,10 @@
 //! ODE backward pass — gradient flow through Kerr-ODE RK4 integration.
 //!
-//! Replaces the identity pass-through (d_precond = d_kerr_out) with proper
-//! backpropagation through 16 RK4 steps. Enables learnable α, β, γ per layer.
-//!
-//! Architecture: stores forward intermediates in OdeForwardCache during the
-//! forward pass, then walks backward through the RK4 steps computing gradients
-//! via the chain rule through the Kerr nonlinearity Jacobian.
+//! Forward: uses `ode_deriv::kerr_derivative_into` (single source of truth).
+//! Backward: analytical Jacobian via `deriv_backward` (SPM/XPM only; FWM Jacobian not yet derived).
 
 use crate::model::KerrWeights;
+use super::ode_deriv::kerr_derivative_into;
 
 // ─── Forward cache ─────────────────────────────────────────
 
@@ -39,6 +36,7 @@ pub struct OdeParamGrads {
 use super::math::{softplus, softplus_derivative};
 
 /// Compute neighbour sum of mag_sq for band k (stencil ±2).
+/// Kept here for deriv_backward (Jacobian computation).
 fn neighbour_sum(r: &[f32], s: &[f32], k: usize) -> f32 {
     let n = r.len();
     let mut ns = 0.0f32;
@@ -47,62 +45,6 @@ fn neighbour_sum(r: &[f32], s: &[f32], k: usize) -> f32 {
     if k+1 < n { ns += r[k+1]*r[k+1] + s[k+1]*s[k+1]; }
     if k+2 < n { ns += r[k+2]*r[k+2] + s[k+2]*s[k+2]; }
     ns
-}
-
-/// Compute the ODE derivative for all bands.
-/// Returns (dr, ds) where dr[k] = -gamma[k]*r[k] - phi[k]*s[k], etc.
-fn deriv(
-    r: &[f32], s: &[f32],
-    gamma: &[f32], omega: &[f32],
-    alpha: f32, beta: f32,
-) -> (Vec<f32>, Vec<f32>) {
-    let n = r.len();
-    let mut dr = vec![0.0f32; n];
-    let mut ds = vec![0.0f32; n];
-    for k in 0..n {
-        let mag_sq = r[k]*r[k] + s[k]*s[k];
-        let ns = neighbour_sum(r, s, k);
-        let phi = omega[k] + alpha * mag_sq + beta * ns;
-        dr[k] = -gamma[k] * r[k] - phi * s[k];
-        ds[k] = -gamma[k] * s[k] + phi * r[k];
-    }
-    (dr, ds)
-}
-
-/// In-place derivative — writes into pre-allocated output buffers.
-/// Same computation as `deriv` but zero allocation.
-fn deriv_into(
-    r: &[f32], s: &[f32],
-    gamma: &[f32], omega: &[f32],
-    alpha: f32, beta: f32,
-    coherent: &[Vec<f32>], mix_s: f32,
-    dr: &mut [f32], ds: &mut [f32],
-) {
-    let n = r.len();
-    for k in 0..n {
-        let mag_sq = r[k]*r[k] + s[k]*s[k];
-        let ns = neighbour_sum(r, s, k);
-        let phi = omega[k] + alpha * mag_sq + beta * ns;
-        dr[k] = -gamma[k] * r[k] - phi * s[k];
-        ds[k] = -gamma[k] * s[k] + phi * r[k];
-    }
-    // Four-wave mixing: Hamiltonian energy-conserving cubic coupling
-    if mix_s > 0.0 && n > 4 {
-        #[inline(always)]
-        fn apply_quartet(dr: &mut [f32], ds: &mut [f32], r: &[f32], s: &[f32],
-                         chi: f32, a: usize, b: usize, c: usize, d: usize) {
-            let (ra, sa) = (r[a], s[a]); let (rb, sb) = (r[b], s[b]);
-            let (rc, sc) = (r[c], s[c]); let (rd, sd) = (r[d], s[d]);
-            let pab_re = ra*rb - sa*sb; let pab_im = ra*sb + sa*rb;
-            let pcd_re = rc*rd - sc*sd; let pcd_im = rc*sd + sc*rd;
-            dr[a] += chi * (rb*pcd_im - sb*pcd_re); ds[a] -= chi * (rb*pcd_re + sb*pcd_im);
-            dr[b] += chi * (ra*pcd_im - sa*pcd_re); ds[b] -= chi * (ra*pcd_re + sa*pcd_im);
-            dr[c] += chi * (pab_im*rd - pab_re*sd); ds[c] -= chi * (pab_re*rd + pab_im*sd);
-            dr[d] += chi * (pab_im*rc - pab_re*sc); ds[d] -= chi * (pab_re*rc + pab_im*sc);
-        }
-        for k in 2..(n - 1) { apply_quartet(dr, ds, r, s, mix_s, k - 2, k + 1, k - 1, k); }
-        for k in 1..(n - 2) { apply_quartet(dr, ds, r, s, mix_s, k - 1, k + 2, k, k + 1); }
-    }
 }
 
 // ─── Forward with cache ────────────────────────────────────
@@ -147,22 +89,22 @@ pub fn ode_forward_with_cache(
         s_at_step.push(s.clone());
 
         // k1 at (r, s)
-        deriv_into(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, &weights.coherent_matrix, weights.chi, &mut k1r, &mut k1s);
+        kerr_derivative_into(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, &mut k1r, &mut k1s, None);
 
         // k2 at (r + 0.5*dt*k1, s + 0.5*dt*k1)
         for i in 0..n_bands { r_tmp[i] = r[i] + 0.5*dt*k1r[i]; }
         for i in 0..n_bands { s_tmp[i] = s[i] + 0.5*dt*k1s[i]; }
-        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &weights.coherent_matrix, weights.chi, &mut k2r, &mut k2s);
+        kerr_derivative_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, &mut k2r, &mut k2s, None);
 
         // k3 at (r + 0.5*dt*k2, s + 0.5*dt*k2)
         for i in 0..n_bands { r_tmp[i] = r[i] + 0.5*dt*k2r[i]; }
         for i in 0..n_bands { s_tmp[i] = s[i] + 0.5*dt*k2s[i]; }
-        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &weights.coherent_matrix, weights.chi, &mut k3r, &mut k3s);
+        kerr_derivative_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, &mut k3r, &mut k3s, None);
 
         // k4 at (r + dt*k3, s + dt*k3)
         for i in 0..n_bands { r_tmp[i] = r[i] + dt*k3r[i]; }
         for i in 0..n_bands { s_tmp[i] = s[i] + dt*k3s[i]; }
-        deriv_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, &weights.coherent_matrix, weights.chi, &mut k4r, &mut k4s);
+        kerr_derivative_into(&r_tmp, &s_tmp, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, &mut k4r, &mut k4s, None);
 
         // Store k-values (backward needs these per-step)
         all_kr.push([k1r.clone(), k2r.clone(), k3r.clone(), k4r.clone()]);
@@ -445,6 +387,93 @@ pub fn ode_backward(
     (d_input, OdeParamGrads { d_gamma_raw, d_alpha, d_beta, d_rk4_weights })
 }
 
+// ─── Public gradient checker ──────────────────────────────
+
+/// Run finite-difference gradient checks on a KerrWeights instance.
+/// Returns (passed, total_checks, max_rel_err, details).
+/// When chi > 0, the FWM Jacobian is not implemented — d_input errors are expected.
+pub fn check_gradients(weights: &KerrWeights) -> (bool, usize, f32, Vec<String>) {
+    let n_bands = weights.gamma_raw.len();
+    let x: Vec<f32> = (0..n_bands * 2).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
+    let eps = 1e-3f32;
+    let threshold = 0.05f32;
+
+    let d_output: Vec<f32> = vec![1.0f32; n_bands * 2];
+    let (_out, cache) = ode_forward_with_cache(&x, weights);
+    let (d_input, param_grads) = ode_backward(&d_output, &cache, weights);
+
+    let mut all_passed = true;
+    let mut max_rel_err = 0.0f32;
+    let mut total_checks = 0usize;
+    let mut details = Vec::new();
+
+    // Check d_input
+    for i in 0..n_bands * 2 {
+        let mut x_plus = x.clone(); let mut x_minus = x.clone();
+        x_plus[i] += eps; x_minus[i] -= eps;
+        let (out_plus, _) = ode_forward_with_cache(&x_plus, weights);
+        let (out_minus, _) = ode_forward_with_cache(&x_minus, weights);
+        let fd: f32 = out_plus.iter().zip(&out_minus).map(|(a, b)| a - b).sum::<f32>() / (2.0 * eps);
+        let rel_err = if fd.abs() > 1e-6 { (d_input[i] - fd).abs() / fd.abs() } else { (d_input[i] - fd).abs() };
+        if rel_err > max_rel_err { max_rel_err = rel_err; }
+        total_checks += 1;
+        if rel_err > threshold {
+            all_passed = false;
+            details.push(format!("d_input[{}]: analytical={:.6}, fd={:.6}, rel_err={:.4}", i, d_input[i], fd, rel_err));
+        }
+    }
+
+    // Check d_alpha
+    {
+        let mut w_plus = weights.clone(); let mut w_minus = weights.clone();
+        w_plus.alpha += eps; w_minus.alpha -= eps;
+        let (out_plus, _) = ode_forward_with_cache(&x, &w_plus);
+        let (out_minus, _) = ode_forward_with_cache(&x, &w_minus);
+        let fd: f32 = out_plus.iter().zip(&out_minus).map(|(a, b)| a - b).sum::<f32>() / (2.0 * eps);
+        let rel_err = if fd.abs() > 1e-6 { (param_grads.d_alpha - fd).abs() / fd.abs() } else { (param_grads.d_alpha - fd).abs() };
+        if rel_err > max_rel_err { max_rel_err = rel_err; }
+        total_checks += 1;
+        if rel_err > threshold {
+            all_passed = false;
+            details.push(format!("d_alpha: analytical={:.6}, fd={:.6}, rel_err={:.4}", param_grads.d_alpha, fd, rel_err));
+        }
+    }
+
+    // Check d_beta
+    {
+        let mut w_plus = weights.clone(); let mut w_minus = weights.clone();
+        w_plus.beta += eps; w_minus.beta -= eps;
+        let (out_plus, _) = ode_forward_with_cache(&x, &w_plus);
+        let (out_minus, _) = ode_forward_with_cache(&x, &w_minus);
+        let fd: f32 = out_plus.iter().zip(&out_minus).map(|(a, b)| a - b).sum::<f32>() / (2.0 * eps);
+        let rel_err = if fd.abs() > 1e-6 { (param_grads.d_beta - fd).abs() / fd.abs() } else { (param_grads.d_beta - fd).abs() };
+        if rel_err > max_rel_err { max_rel_err = rel_err; }
+        total_checks += 1;
+        if rel_err > threshold {
+            all_passed = false;
+            details.push(format!("d_beta: analytical={:.6}, fd={:.6}, rel_err={:.4}", param_grads.d_beta, fd, rel_err));
+        }
+    }
+
+    // Check d_gamma_raw[0]
+    {
+        let mut w_plus = weights.clone(); let mut w_minus = weights.clone();
+        w_plus.gamma_raw[0] += eps; w_minus.gamma_raw[0] -= eps;
+        let (out_plus, _) = ode_forward_with_cache(&x, &w_plus);
+        let (out_minus, _) = ode_forward_with_cache(&x, &w_minus);
+        let fd: f32 = out_plus.iter().zip(&out_minus).map(|(a, b)| a - b).sum::<f32>() / (2.0 * eps);
+        let rel_err = if fd.abs() > 1e-6 { (param_grads.d_gamma_raw[0] - fd).abs() / fd.abs() } else { (param_grads.d_gamma_raw[0] - fd).abs() };
+        if rel_err > max_rel_err { max_rel_err = rel_err; }
+        total_checks += 1;
+        if rel_err > threshold {
+            all_passed = false;
+            details.push(format!("d_gamma_raw[0]: analytical={:.6}, fd={:.6}, rel_err={:.4}", param_grads.d_gamma_raw[0], fd, rel_err));
+        }
+    }
+
+    (all_passed, total_checks, max_rel_err, details)
+}
+
 // ─── Finite difference validation ──────────────────────────
 
 #[cfg(test)]
@@ -461,6 +490,7 @@ mod tests {
             rk4_n_steps: 4, // fewer steps for faster test
             phase_correction: vec![0.0; n_bands],
             rk4_weights: [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0],
+            chi: 0.0,
         }
     }
 
@@ -472,25 +502,16 @@ mod tests {
 
         let (out_cached, _cache) = ode_forward_with_cache(&x, &weights);
 
-        // Compare with the standalone forward from block.rs (reproduced here)
+        // Compare with the canonical rk4_step_public from ode_deriv.rs
+        use super::super::ode_deriv::rk4_step_public;
         let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus(g)).collect();
         let mut r: Vec<f32> = (0..n_bands).map(|k| x[k * 2]).collect();
         let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
         let dt = 1.0 / weights.rk4_n_steps as f32;
         for _ in 0..weights.rk4_n_steps {
-            let (dr, ds) = deriv(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta);
-            let r2: Vec<f32> = r.iter().zip(&dr).map(|(&a, &b)| a + 0.5*dt*b).collect();
-            let s2: Vec<f32> = s.iter().zip(&ds).map(|(&a, &b)| a + 0.5*dt*b).collect();
-            let (k2r, k2s) = deriv(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta);
-            let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&a, &b)| a + 0.5*dt*b).collect();
-            let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&a, &b)| a + 0.5*dt*b).collect();
-            let (k3r, k3s) = deriv(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta);
-            let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a, &b)| a + dt*b).collect();
-            let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a, &b)| a + dt*b).collect();
-            let (k4r, k4s) = deriv(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta);
-            let w = &weights.rk4_weights;
-            r = (0..n_bands).map(|i| r[i] + dt*(w[0]*dr[i]+w[1]*k2r[i]+w[2]*k3r[i]+w[3]*k4r[i])).collect();
-            s = (0..n_bands).map(|i| s[i] + dt*(w[0]*ds[i]+w[1]*k2s[i]+w[2]*k3s[i]+w[3]*k4s[i])).collect();
+            let (r_new, s_new) = rk4_step_public(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, &weights.rk4_weights);
+            r = r_new;
+            s = s_new;
         }
 
         for k in 0..n_bands {

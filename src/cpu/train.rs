@@ -94,7 +94,6 @@ pub struct TrainConfig {
     pub layer_scale: DynParam, // --layer-scale dyn | --layer-scale 1.0,0.8,1.0,1.0
     pub lr_scale: DynParam,    // --lr-scale dyn | --lr-scale 1.0,1.5,1.5,0.5,1.0
     pub phase_native: bool,
-    pub mix_strength: f32,  // --mix-strength 0.05 (coherent coupling, 0.0=off)
     pub fwm_strength: f32,  // --fwm-strength 5.0 (four-wave mixing chi, 0.0=off)
     pub pythagorean: bool,    // --phase-native: use phase coherence loss, no lm_head
     pub phase_temp: f32,       // temperature for phase-native softmax (default 1.0)

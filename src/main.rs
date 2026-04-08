@@ -97,6 +97,37 @@ fn main() {
         return;
     }
 
+    // ─── Check gradients mode ───
+    fn parse_flag_gradients<T: std::str::FromStr>(name: &str, default: T) -> T {
+        std::env::args().skip_while(|a| a != name).nth(1)
+            .and_then(|s| s.parse().ok()).unwrap_or(default)
+    }
+    if std::env::args().any(|a| a == "--check-gradients") {
+        let n_bands: usize = parse_flag_gradients("--n-bands", 84);
+        let alpha: f32 = parse_flag_gradients("--alpha", 0.1);
+        let beta: f32 = parse_flag_gradients("--beta", 0.2);
+        let chi: f32 = parse_flag_gradients("--fwm-strength", 0.0);
+        let rk4_steps: usize = parse_flag_gradients("--rk4-steps", 16);
+        let gamma_raw_val = ((0.1f32).exp() - 1.0).ln();
+        let weights = crate::model::KerrWeights {
+            gamma_raw: vec![gamma_raw_val; n_bands],
+            omega: (0..n_bands).map(|k| (k + 1) as f32 / n_bands as f32).collect(),
+            alpha, beta,
+            rk4_n_steps: rk4_steps,
+            phase_correction: vec![0.0; n_bands],
+            rk4_weights: [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0],
+            chi,
+        };
+        if chi > 0.0 {
+            eprintln!("WARNING: FWM Jacobian not yet implemented — d_input errors expected with chi={}", chi);
+        }
+        let (passed, total, max_err, details) = common::ode_backward::check_gradients(&weights);
+        println!("Gradient check: {}/{} passed, max_rel_err={:.6}", total - details.len(), total, max_err);
+        for d in &details { println!("  FAIL: {}", d); }
+        if passed { println!("PASS"); } else { println!("FAIL"); std::process::exit(1); }
+        return;
+    }
+
     // ─── Recommend mode ───
     if std::env::args().any(|a| a == "--recommend") {
         let data_path = std::env::args().skip_while(|a| a != "--recommend").nth(1)
@@ -495,7 +526,6 @@ fn main() {
         layer_scale: parse_dyn_param("--layer-scale"),
         lr_scale: parse_dyn_param("--lr-scale"),
         phase_native: std::env::args().any(|a| a == "--phase-native"),
-        mix_strength: parse_flag("--mix-strength", 0.0),
         fwm_strength: parse_flag("--fwm-strength", 0.0),
         phase_temp: parse_flag("--phase-temp", 1.0),
         pythagorean: std::env::args().any(|a| a == "--pythagorean"),

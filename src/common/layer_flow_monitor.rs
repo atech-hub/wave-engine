@@ -17,6 +17,11 @@ pub struct LayerFlowStats {
     pub ffn_ratio: f32,
     pub residual_ratio: f32,
     pub cosine_in_out: f32,
+    // Band amplitude stats (from ODE precond)
+    pub band_amp_min: f32,
+    pub band_amp_max: f32,
+    pub band_amp_mean: f32,
+    pub band_amp_std: f32,
 }
 
 fn l2_norm(v: &[f32]) -> f32 {
@@ -70,6 +75,27 @@ pub fn analyze_flow(cache: &ForwardCache, _dims: Dims) -> Vec<LayerFlowStats> {
             0.0
         };
 
+        // Band amplitude stats from ODE precond (if available)
+        let precond = if let Some(ref fc) = bc.ffn_backend_cache {
+            if !fc.precond.is_empty() { Some(&fc.precond[last]) } else { None }
+        } else if !bc.ffn_precond.is_empty() {
+            Some(&bc.ffn_precond[last])
+        } else { None };
+
+        let (band_amp_min, band_amp_max, band_amp_mean, band_amp_std) = if let Some(p) = precond {
+            let n_bands = p.len() / 2;
+            let amps: Vec<f32> = (0..n_bands).map(|k| {
+                (p[k*2]*p[k*2] + p[k*2+1]*p[k*2+1]).sqrt()
+            }).collect();
+            let min = amps.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = amps.iter().cloned().fold(0.0f32, f32::max);
+            let mean = amps.iter().sum::<f32>() / n_bands as f32;
+            let std = (amps.iter().map(|a| (a - mean) * (a - mean)).sum::<f32>() / n_bands as f32).sqrt();
+            (min, max, mean, std)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+
         stats.push(LayerFlowStats {
             layer: layer_idx,
             input_norm,
@@ -80,6 +106,7 @@ pub fn analyze_flow(cache: &ForwardCache, _dims: Dims) -> Vec<LayerFlowStats> {
             ffn_ratio,
             residual_ratio,
             cosine_in_out,
+            band_amp_min, band_amp_max, band_amp_mean, band_amp_std,
         });
     }
 
@@ -95,9 +122,10 @@ pub fn to_json(stats: &[LayerFlowStats]) -> String {
 
     let entries: Vec<String> = stats.iter().map(|s| {
         format!(
-            r#"{{"layer":{},"in_norm":{:.3},"attn_norm":{:.3},"ffn_norm":{:.3},"out_norm":{:.3},"attn_ratio":{:.3},"ffn_ratio":{:.3},"resid_ratio":{:.3},"cos_in_out":{:.4}}}"#,
+            r#"{{"layer":{},"in_norm":{:.3},"attn_norm":{:.3},"ffn_norm":{:.3},"out_norm":{:.3},"attn_ratio":{:.3},"ffn_ratio":{:.3},"resid_ratio":{:.3},"cos_in_out":{:.4},"band_amp_min":{:.4},"band_amp_max":{:.4},"band_amp_mean":{:.4},"band_amp_std":{:.4}}}"#,
             s.layer, s.input_norm, s.attn_output_norm, s.ffn_output_norm, s.output_norm,
             s.attn_ratio, s.ffn_ratio, s.residual_ratio, s.cosine_in_out,
+            s.band_amp_min, s.band_amp_max, s.band_amp_mean, s.band_amp_std,
         )
     }).collect();
 

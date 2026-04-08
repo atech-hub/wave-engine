@@ -188,9 +188,10 @@ fn maestro_forward_cpu(weights: &MaestroWeights, x: &[f32]) -> Vec<f32> {
     processed
 }
 
-/// ODE forward — RK4-8 for CPU tiers (perturbative caused NaN in CPU backward path).
-/// The Candle tier uses GPU-native perturbative with true autograd backward.
+/// ODE forward — uses canonical rk4_step_public from ode_deriv.rs.
 fn kerr_ode_forward_cpu(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
+    use super::ode_deriv::rk4_step_public;
+
     let n_bands = weights.gamma_raw.len();
     let n_embd = n_bands * 2;
     let n_steps = weights.rk4_n_steps;
@@ -202,9 +203,8 @@ fn kerr_ode_forward_cpu(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
     let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
 
     let w = &weights.rk4_weights;
-    let chi = weights.chi;
     for _ in 0..n_steps {
-        let (r_new, s_new) = rk4_step(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, chi, w);
+        let (r_new, s_new) = rk4_step_public(&r, &s, dt, &gamma, &weights.omega, weights.alpha, weights.beta, weights.chi, w);
         r = r_new;
         s = s_new;
     }
@@ -212,85 +212,4 @@ fn kerr_ode_forward_cpu(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0f32; n_embd];
     for k in 0..n_bands { out[k * 2] = r[k]; out[k * 2 + 1] = s[k]; }
     out
-}
-
-fn rk4_step(r: &[f32], s: &[f32], dt: f32, gamma: &[f32], omega: &[f32], alpha: f32, beta: f32, chi: f32, w: &[f32; 4]) -> (Vec<f32>, Vec<f32>) {
-    let n = r.len();
-
-    let mut r_tmp = vec![0.0f32; n];
-    let mut s_tmp = vec![0.0f32; n];
-    let mut k1r = vec![0.0f32; n];
-    let mut k1s = vec![0.0f32; n];
-    let mut k2r = vec![0.0f32; n];
-    let mut k2s = vec![0.0f32; n];
-    let mut k3r = vec![0.0f32; n];
-    let mut k3s = vec![0.0f32; n];
-    let mut k4r = vec![0.0f32; n];
-    let mut k4s = vec![0.0f32; n];
-
-    deriv_into(r, s, gamma, omega, alpha, beta, chi, &mut k1r, &mut k1s);
-
-    for i in 0..n { r_tmp[i] = r[i] + 0.5*dt*k1r[i]; }
-    for i in 0..n { s_tmp[i] = s[i] + 0.5*dt*k1s[i]; }
-    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, chi, &mut k2r, &mut k2s);
-
-    for i in 0..n { r_tmp[i] = r[i] + 0.5*dt*k2r[i]; }
-    for i in 0..n { s_tmp[i] = s[i] + 0.5*dt*k2s[i]; }
-    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, chi, &mut k3r, &mut k3s);
-
-    for i in 0..n { r_tmp[i] = r[i] + dt*k3r[i]; }
-    for i in 0..n { s_tmp[i] = s[i] + dt*k3s[i]; }
-    deriv_into(&r_tmp, &s_tmp, gamma, omega, alpha, beta, chi, &mut k4r, &mut k4s);
-
-    // RK4 combination: r_new = r + dt * (w0*k1 + w1*k2 + w2*k3 + w3*k4)
-    // Standard: w = [1/6, 1/3, 1/3, 1/6]. Learnable: model decides.
-    let mut r_new = vec![0.0f32; n];
-    let mut s_new = vec![0.0f32; n];
-    for i in 0..n {
-        r_new[i] = r[i] + dt * (w[0]*k1r[i] + w[1]*k2r[i] + w[2]*k3r[i] + w[3]*k4r[i]);
-        s_new[i] = s[i] + dt * (w[0]*k1s[i] + w[1]*k2s[i] + w[2]*k3s[i] + w[3]*k4s[i]);
-    }
-    (r_new, s_new)
-}
-
-/// In-place sequential derivative for block.rs RK4 — writes into pre-allocated output buffers.
-fn deriv_into(
-    r: &[f32], s: &[f32],
-    gamma: &[f32], omega: &[f32],
-    alpha: f32, beta: f32, chi: f32,
-    dr: &mut [f32], ds: &mut [f32],
-) {
-    let n = r.len();
-    for k in 0..n {
-        let mag_sq = r[k] * r[k] + s[k] * s[k];
-        let mut ns = 0.0f32;
-        if k >= 2 { ns += r[k-2]*r[k-2] + s[k-2]*s[k-2]; }
-        if k >= 1 { ns += r[k-1]*r[k-1] + s[k-1]*s[k-1]; }
-        if k+1 < n { ns += r[k+1]*r[k+1] + s[k+1]*s[k+1]; }
-        if k+2 < n { ns += r[k+2]*r[k+2] + s[k+2]*s[k+2]; }
-        let phi = omega[k] + alpha * mag_sq + beta * ns;
-        dr[k] = -gamma[k] * r[k] - phi * s[k];
-        ds[k] = -gamma[k] * s[k] + phi * r[k];
-    }
-    // Four-wave mixing: Hamiltonian energy-conserving cubic coupling
-    if chi != 0.0 && n > 4 {
-        #[inline(always)]
-        fn apply_quartet(dr: &mut [f32], ds: &mut [f32], r: &[f32], s: &[f32],
-                         chi: f32, a: usize, b: usize, c: usize, d: usize) {
-            let (ra, sa) = (r[a], s[a]); let (rb, sb) = (r[b], s[b]);
-            let (rc, sc) = (r[c], s[c]); let (rd, sd) = (r[d], s[d]);
-            let pab_re = ra*rb - sa*sb; let pab_im = ra*sb + sa*rb;
-            let pcd_re = rc*rd - sc*sd; let pcd_im = rc*sd + sc*rd;
-            dr[a] += chi * (rb*pcd_im - sb*pcd_re); ds[a] -= chi * (rb*pcd_re + sb*pcd_im);
-            dr[b] += chi * (ra*pcd_im - sa*pcd_re); ds[b] -= chi * (ra*pcd_re + sa*pcd_im);
-            dr[c] += chi * (pab_im*rd - pab_re*sd); ds[c] -= chi * (pab_re*rd + pab_im*sd);
-            dr[d] += chi * (pab_im*rc - pab_re*sc); ds[d] -= chi * (pab_re*rc + pab_im*sc);
-        }
-        for k in 2..(n - 1) {
-            apply_quartet(dr, ds, r, s, chi, k - 2, k + 1, k - 1, k);
-        }
-        for k in 1..(n - 2) {
-            apply_quartet(dr, ds, r, s, chi, k - 1, k + 2, k, k + 1);
-        }
-    }
 }

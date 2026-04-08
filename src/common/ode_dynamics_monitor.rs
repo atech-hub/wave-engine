@@ -108,7 +108,7 @@ pub fn to_json(stats: &[OdeDynamicsStats]) -> String {
 
     let entries: Vec<String> = stats.iter().map(|s| {
         format!(
-            r#"{{"layer":{},"phase_vel":{:.4},"energy_in":{:.2},"energy_out":{:.2},"energy_ratio":{:.4},"band_std":{:.4},"damping":{:.4}}}"#,
+            r#"{{"layer":{},"phase_velocity":{:.4},"energy_in":{:.2},"energy_out":{:.2},"energy_ratio":{:.4},"band_std":{:.4},"damping":{:.4}}}"#,
             s.layer, s.phase_velocity, s.energy_in, s.energy_out,
             s.energy_ratio, s.band_energy_std, s.damping_effective,
         )

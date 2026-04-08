@@ -82,7 +82,7 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
             rk4_n_steps: d.rk4_steps,
             phase_correction: vec![0.0; d.n_bands],
             rk4_weights: [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0], // standard RK4
-            coherent_matrix: vec![], mix_strength: 0.0, chi: 0.0,
+            chi: 0.0,
         };
         let (sq_w, sq_b) = init_linear(&mut rng, d.maestro_dim, d.n_embd);
         let (pr_w, pr_b) = init_linear(&mut rng, d.n_embd, d.maestro_dim);
