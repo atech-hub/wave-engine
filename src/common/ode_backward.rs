@@ -1,7 +1,7 @@
 //! ODE backward pass — gradient flow through Kerr-ODE RK4 integration.
 //!
 //! Forward: uses `ode_deriv::kerr_derivative_into` (single source of truth).
-//! Backward: analytical Jacobian via `deriv_backward` (SPM/XPM only; FWM Jacobian not yet derived).
+//! Backward: analytical Jacobian via `deriv_backward` (SPM/XPM/damping + FWM).
 
 use crate::model::KerrWeights;
 use super::ode_deriv::kerr_derivative_into;
@@ -28,6 +28,7 @@ pub struct OdeParamGrads {
     pub d_gamma_raw: Vec<f32>,  // [n_bands]
     pub d_alpha: f32,
     pub d_beta: f32,
+    pub d_chi: f32,              // gradient w.r.t. FWM strength (computed but not yet used by optimizer)
     pub d_rk4_weights: [f32; 4], // gradient w.r.t. RK4 combination weights
 }
 
@@ -150,11 +151,11 @@ fn deriv_backward(
     d_dr: &[f32], d_ds: &[f32],     // incoming gradients [n_bands]
     r: &[f32], s: &[f32],           // state at which deriv was evaluated
     gamma: &[f32], omega: &[f32],
-    alpha: f32, beta: f32,
+    alpha: f32, beta: f32, chi: f32,
     // Outputs (accumulated into):
     d_r: &mut [f32], d_s: &mut [f32],
     d_gamma: &mut [f32],
-    d_alpha: &mut f32, d_beta: &mut f32,
+    d_alpha: &mut f32, d_beta: &mut f32, d_chi: &mut f32,
 ) {
     let n = r.len();
 
@@ -216,6 +217,115 @@ fn deriv_backward(
         // d(ds_k)/d(beta) = ns * r_k
         *d_beta += ddr * (-ns * sk) + dds * (ns * rk);
     }
+
+    // FWM backward — Jacobian of the quartet coupling terms
+    // Gated on chi != 0 so chi=0 path is byte-identical to previous behavior
+    if chi != 0.0 && n > 4 {
+        // Family A: quartet (k-2, k+1, k-1, k) for k in [2, n-1)
+        for k in 2..(n - 1) {
+            fwm_quartet_backward(k - 2, k + 1, k - 1, k, chi, r, s, d_dr, d_ds, d_r, d_s, d_chi);
+        }
+        // Family B: quartet (k-1, k+2, k, k+1) for k in [1, n-2)
+        for k in 1..(n - 2) {
+            fwm_quartet_backward(k - 1, k + 2, k, k + 1, chi, r, s, d_dr, d_ds, d_r, d_s, d_chi);
+        }
+    }
+}
+
+/// Per-quartet FWM backward — accumulates gradient contributions from one quartet.
+/// Derived from the Hamiltonian H = chi * Re(z_a * z_b * z_c* * z_d*).
+#[inline]
+fn fwm_quartet_backward(
+    a: usize, b: usize, c: usize, d: usize, chi: f32,
+    r: &[f32], s: &[f32],
+    d_dr: &[f32], d_ds: &[f32],
+    d_r: &mut [f32], d_s: &mut [f32],
+    d_chi: &mut f32,
+) {
+    let (ra, sa) = (r[a], s[a]);
+    let (rb, sb) = (r[b], s[b]);
+    let (rc, sc) = (r[c], s[c]);
+    let (rd, sd) = (r[d], s[d]);
+
+    let (ddra, ddsa) = (d_dr[a], d_ds[a]);
+    let (ddrb, ddsb) = (d_dr[b], d_ds[b]);
+    let (ddrc, ddsc) = (d_dr[c], d_ds[c]);
+    let (ddrd, ddsd) = (d_dr[d], d_ds[d]);
+
+    let p_ab_re = ra*rb - sa*sb;
+    let p_ab_im = ra*sb + sa*rb;
+    let p_cd_re = rc*rd - sc*sd;
+    let p_cd_im = rc*sd + sc*rd;
+
+    // Family A: roles a, b — dr[a] += chi*(rb*pcd_im - sb*pcd_re), ds[a] -= chi*(rb*pcd_re + sb*pcd_im)
+    d_r[b] += ddra * chi * p_cd_im;
+    d_s[b] -= ddra * chi * p_cd_re;
+    d_r[c] += ddra * chi * (rb*sd - sb*rd);
+    d_s[c] += ddra * chi * (rb*rd + sb*sd);
+    d_r[d] += ddra * chi * (rb*sc - sb*rc);
+    d_s[d] += ddra * chi * (rb*rc + sb*sc);
+
+    d_r[b] -= ddsa * chi * p_cd_re;
+    d_s[b] -= ddsa * chi * p_cd_im;
+    d_r[c] -= ddsa * chi * (rb*rd + sb*sd);
+    d_s[c] += ddsa * chi * (rb*sd - sb*rd);
+    d_r[d] -= ddsa * chi * (rb*rc + sb*sc);
+    d_s[d] += ddsa * chi * (rb*sc - sb*rc);
+
+    // dr[b] += chi*(ra*pcd_im - sa*pcd_re), ds[b] -= chi*(ra*pcd_re + sa*pcd_im)
+    d_r[a] += ddrb * chi * p_cd_im;
+    d_s[a] -= ddrb * chi * p_cd_re;
+    d_r[c] += ddrb * chi * (ra*sd - sa*rd);
+    d_s[c] += ddrb * chi * (ra*rd + sa*sd);
+    d_r[d] += ddrb * chi * (ra*sc - sa*rc);
+    d_s[d] += ddrb * chi * (ra*rc + sa*sc);
+
+    d_r[a] -= ddsb * chi * p_cd_re;
+    d_s[a] -= ddsb * chi * p_cd_im;
+    d_r[c] -= ddsb * chi * (ra*rd + sa*sd);
+    d_s[c] += ddsb * chi * (ra*sd - sa*rd);
+    d_r[d] -= ddsb * chi * (ra*rc + sa*sc);
+    d_s[d] += ddsb * chi * (ra*sc - sa*rc);
+
+    // Family B: roles c, d — dr[c] += chi*(pab_im*rd - pab_re*sd), ds[c] -= chi*(pab_re*rd + pab_im*sd)
+    d_r[a] += ddrc * chi * (sb*rd - rb*sd);
+    d_s[a] += ddrc * chi * (rb*rd + sb*sd);
+    d_r[b] += ddrc * chi * (sa*rd - ra*sd);
+    d_s[b] += ddrc * chi * (ra*rd + sa*sd);
+    d_r[d] += ddrc * chi * p_ab_im;
+    d_s[d] -= ddrc * chi * p_ab_re;
+
+    d_r[a] -= ddsc * chi * (rb*rd + sb*sd);
+    d_s[a] += ddsc * chi * (sb*rd - rb*sd);
+    d_r[b] -= ddsc * chi * (ra*rd + sa*sd);
+    d_s[b] += ddsc * chi * (sa*rd - ra*sd);
+    d_r[d] -= ddsc * chi * p_ab_re;
+    d_s[d] -= ddsc * chi * p_ab_im;
+
+    // dr[d] += chi*(pab_im*rc - pab_re*sc), ds[d] -= chi*(pab_re*rc + pab_im*sc)
+    d_r[a] += ddrd * chi * (sb*rc - rb*sc);
+    d_s[a] += ddrd * chi * (rb*rc + sb*sc);
+    d_r[b] += ddrd * chi * (sa*rc - ra*sc);
+    d_s[b] += ddrd * chi * (ra*rc + sa*sc);
+    d_r[c] += ddrd * chi * p_ab_im;
+    d_s[c] -= ddrd * chi * p_ab_re;
+
+    d_r[a] -= ddsd * chi * (rb*rc + sb*sc);
+    d_s[a] += ddsd * chi * (sb*rc - rb*sc);
+    d_r[b] -= ddsd * chi * (ra*rc + sa*sc);
+    d_s[b] += ddsd * chi * (sa*rc - ra*sc);
+    d_r[c] -= ddsd * chi * p_ab_re;
+    d_s[c] -= ddsd * chi * p_ab_im;
+
+    // Chi gradient
+    *d_chi += ddra * (rb*p_cd_im - sb*p_cd_re)
+            + ddsa * (-(rb*p_cd_re + sb*p_cd_im))
+            + ddrb * (ra*p_cd_im - sa*p_cd_re)
+            + ddsb * (-(ra*p_cd_re + sa*p_cd_im))
+            + ddrc * (p_ab_im*rd - p_ab_re*sd)
+            + ddsc * (-(p_ab_re*rd + p_ab_im*sd))
+            + ddrd * (p_ab_im*rc - p_ab_re*sc)
+            + ddsd * (-(p_ab_re*rc + p_ab_im*sc));
 }
 
 // ─── Backward through full RK4 integration ─────────────────
@@ -243,6 +353,7 @@ pub fn ode_backward(
     let mut d_gamma = vec![0.0f32; n];   // gradient w.r.t. gamma (post-softplus)
     let mut d_alpha = 0.0f32;
     let mut d_beta = 0.0f32;
+    let mut d_chi = 0.0f32;
     let mut d_rk4_weights = [0.0f32; 4];
     let w = &weights.rk4_weights;
 
@@ -292,8 +403,8 @@ pub fn ode_backward(
         let mut d_s_k4 = vec![0.0f32; n];
         deriv_backward(
             &d_k4r, &d_k4s, &r_k4, &s_k4,
-            &cache.gamma, &weights.omega, weights.alpha, weights.beta,
-            &mut d_r_k4, &mut d_s_k4, &mut d_gamma, &mut d_alpha, &mut d_beta,
+            &cache.gamma, &weights.omega, weights.alpha, weights.beta, weights.chi,
+            &mut d_r_k4, &mut d_s_k4, &mut d_gamma, &mut d_alpha, &mut d_beta, &mut d_chi,
         );
         // d_r_k4, d_s_k4 are gradients w.r.t. the k4 evaluation point
         // k4 eval point = r0 + dt*k3r, so:
@@ -317,8 +428,8 @@ pub fn ode_backward(
         let mut d_s_k3 = vec![0.0f32; n];
         deriv_backward(
             &total_d_k3r, &total_d_k3s, &r_k3, &s_k3,
-            &cache.gamma, &weights.omega, weights.alpha, weights.beta,
-            &mut d_r_k3, &mut d_s_k3, &mut d_gamma, &mut d_alpha, &mut d_beta,
+            &cache.gamma, &weights.omega, weights.alpha, weights.beta, weights.chi,
+            &mut d_r_k3, &mut d_s_k3, &mut d_gamma, &mut d_alpha, &mut d_beta, &mut d_chi,
         );
         // k3 eval point = r0 + 0.5*dt*k2r, so:
         //   d_r0 += d_r_k3
@@ -340,8 +451,8 @@ pub fn ode_backward(
         let mut d_s_k2 = vec![0.0f32; n];
         deriv_backward(
             &total_d_k2r, &total_d_k2s, &r_k2, &s_k2,
-            &cache.gamma, &weights.omega, weights.alpha, weights.beta,
-            &mut d_r_k2, &mut d_s_k2, &mut d_gamma, &mut d_alpha, &mut d_beta,
+            &cache.gamma, &weights.omega, weights.alpha, weights.beta, weights.chi,
+            &mut d_r_k2, &mut d_s_k2, &mut d_gamma, &mut d_alpha, &mut d_beta, &mut d_chi,
         );
         // k2 eval point = r0 + 0.5*dt*k1r, so:
         //   d_r0 += d_r_k2
@@ -361,8 +472,8 @@ pub fn ode_backward(
         let mut d_s_k1 = vec![0.0f32; n];
         deriv_backward(
             &total_d_k1r, &total_d_k1s, r0, s0,
-            &cache.gamma, &weights.omega, weights.alpha, weights.beta,
-            &mut d_r_k1, &mut d_s_k1, &mut d_gamma, &mut d_alpha, &mut d_beta,
+            &cache.gamma, &weights.omega, weights.alpha, weights.beta, weights.chi,
+            &mut d_r_k1, &mut d_s_k1, &mut d_gamma, &mut d_alpha, &mut d_beta, &mut d_chi,
         );
         // k1 eval point = r0, so d_r0 += d_r_k1
         for i in 0..n {
@@ -384,14 +495,14 @@ pub fn ode_backward(
         d_input[k * 2 + 1] = d_s[k];
     }
 
-    (d_input, OdeParamGrads { d_gamma_raw, d_alpha, d_beta, d_rk4_weights })
+    (d_input, OdeParamGrads { d_gamma_raw, d_alpha, d_beta, d_chi, d_rk4_weights })
 }
 
 // ─── Public gradient checker ──────────────────────────────
 
 /// Run finite-difference gradient checks on a KerrWeights instance.
 /// Returns (passed, total_checks, max_rel_err, details).
-/// When chi > 0, the FWM Jacobian is not implemented — d_input errors are expected.
+/// Tests d_input, d_alpha, d_beta, d_gamma_raw[0], and d_chi (when chi > 0).
 pub fn check_gradients(weights: &KerrWeights) -> (bool, usize, f32, Vec<String>) {
     let n_bands = weights.gamma_raw.len();
     let x: Vec<f32> = (0..n_bands * 2).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
@@ -468,6 +579,22 @@ pub fn check_gradients(weights: &KerrWeights) -> (bool, usize, f32, Vec<String>)
         if rel_err > threshold {
             all_passed = false;
             details.push(format!("d_gamma_raw[0]: analytical={:.6}, fd={:.6}, rel_err={:.4}", param_grads.d_gamma_raw[0], fd, rel_err));
+        }
+    }
+
+    // Check d_chi (only meaningful when chi > 0)
+    if weights.chi != 0.0 {
+        let mut w_plus = weights.clone(); let mut w_minus = weights.clone();
+        w_plus.chi += eps; w_minus.chi -= eps;
+        let (out_plus, _) = ode_forward_with_cache(&x, &w_plus);
+        let (out_minus, _) = ode_forward_with_cache(&x, &w_minus);
+        let fd: f32 = out_plus.iter().zip(&out_minus).map(|(a, b)| a - b).sum::<f32>() / (2.0 * eps);
+        let rel_err = if fd.abs() > 1e-6 { (param_grads.d_chi - fd).abs() / fd.abs() } else { (param_grads.d_chi - fd).abs() };
+        if rel_err > max_rel_err { max_rel_err = rel_err; }
+        total_checks += 1;
+        if rel_err > threshold {
+            all_passed = false;
+            details.push(format!("d_chi: analytical={:.6}, fd={:.6}, rel_err={:.4}", param_grads.d_chi, fd, rel_err));
         }
     }
 

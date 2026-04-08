@@ -119,7 +119,7 @@ fn main() {
             chi,
         };
         if chi > 0.0 {
-            eprintln!("WARNING: FWM Jacobian not yet implemented — d_input errors expected with chi={}", chi);
+            eprintln!("Testing with FWM chi={} (FWM Jacobian included)", chi);
         }
         let (passed, total, max_err, details) = common::ode_backward::check_gradients(&weights);
         println!("Gradient check: {}/{} passed, max_rel_err={:.6}", total - details.len(), total, max_err);
