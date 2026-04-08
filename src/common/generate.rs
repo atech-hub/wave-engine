@@ -26,7 +26,7 @@ pub fn run_generate(config: GenerateConfig) {
     let n_embd = config.n_bands * 2;
 
     // Load checkpoint
-    let (params, ck_vocab, ck_iter, _lr, _rng, _at, _am, _av, _groups, ck_flags) =
+    let (params, ck_vocab, ck_iter, _lr, _rng, _at, _am, _av, _groups, ck_flags, _chi) =
         wave_checkpoint::load_checkpoint(&config.resume_path);
 
     // Tokenize prompt

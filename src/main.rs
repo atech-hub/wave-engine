@@ -259,7 +259,7 @@ fn main() {
         let data_path = std::env::args().skip_while(|a| a != "--data").nth(1)
             .unwrap_or("data/arithmetic_single.txt".to_string());
 
-        let (params, ck_vocab, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&resume_path);
+        let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&resume_path);
         // Load model (try ext+ls, ext, base)
         let dims_ext_ls = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true).with_layer_scale(true);
         let mut model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_ext_ls, alpha, beta);
@@ -326,7 +326,7 @@ fn main() {
         let data_path = std::env::args().skip_while(|a| a != "--data").nth(1)
             .unwrap_or("data/arithmetic_single.txt".to_string());
 
-        let (params, ck_vocab, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&resume_path);
+        let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&resume_path);
         let dims_ext = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true).with_layer_scale(true);
         let mut model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_ext, alpha, beta);
         let ext_ls = common::wave_model::count_trainable_ex(&model, false);
@@ -436,7 +436,7 @@ fn main() {
 
         // Load checkpoint
         println!("Loading checkpoint: {resume_path}");
-        let (params, ck_vocab, ck_iter, _lr, _rng, _at, _am, _av, _groups, _flags) =
+        let (params, ck_vocab, ck_iter, _lr, _rng, _at, _am, _av, _groups, _flags, _chi) =
             wave_checkpoint::load_checkpoint(&resume_path);
 
         // Build model

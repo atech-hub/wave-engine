@@ -108,7 +108,7 @@ pub mod train {
                 varmap.load(ckpt)?;
             } else if ckpt.ends_with(".bin") {
                 // CPU/wgpu WCHK checkpoint — load and populate VarMap
-                let (params, _ck_vocab, ck_iter, _lr, _rng, _at, _am, _av, _groups, ck_flags) =
+                let (params, _ck_vocab, ck_iter, _lr, _rng, _at, _am, _av, _groups, ck_flags, _chi) =
                     crate::wave_checkpoint::load_checkpoint(ckpt);
                 start_iter = ck_iter;
                 // Map flat params into VarMap keys (reverse of extract_wchk_params)

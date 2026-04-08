@@ -69,7 +69,7 @@ impl ProbeCfg {
 fn load_checkpoint_to_kerr(
     path: &str, n_bands: usize, n_head: usize, n_layers: usize, chi: f32,
 ) -> Result<Vec<ProbeCfg>, String> {
-    let (params, vocab_size, _iter, _lr, _rng, _adam_t, _adam_m, _adam_v, out_proj_groups, flags)
+    let (params, vocab_size, _iter, _lr, _rng, _adam_t, _adam_m, _adam_v, out_proj_groups, flags, ck_chi)
         = load_checkpoint(path);
 
     let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);

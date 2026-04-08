@@ -3,13 +3,13 @@
 //! v1: 6 config fields (n_bands, n_head, n_layers, maestro_dim, block_size, rk4_steps)
 //! v2: adds out_proj_groups (7th config field) — enables Dense or BlockDiagonal
 //! v3: adds feature_flags u32 — disambiguates param layouts that have same size
+//! v4: adds chi f32 — FWM strength persisted in checkpoint (first-class feature)
 //!
-//! Feature flags (v3):
+//! Feature flags (v3+):
 //!   bit 0: learnable_ode (gamma/alpha/beta/corrector in param vector)
 //!   bit 1: layer_scale (per-layer residual scaling)
 //!   bit 2: rk4_weights (per-layer RK4 combination weights)
 //!   bit 3: dyn_harmonics (per-head harmonic numbers)
-//!   bit 4: phase_native (no lm_head, output corrector instead)
 //!
 //! Param layout for out_proj depends on groups:
 //!   groups=1 (Dense): n_embd×n_embd weight + n_embd bias
@@ -34,9 +34,9 @@ pub fn save_checkpoint(
     use std::io::Write;
     let mut f = std::fs::File::create(path).expect("Failed to create checkpoint file");
 
-    // Magic + version (v3 = has feature flags)
+    // Magic + version (v4 = has chi field)
     f.write_all(b"WCHK").unwrap();
-    f.write_all(&3u32.to_le_bytes()).unwrap();
+    f.write_all(&4u32.to_le_bytes()).unwrap();
 
     // Config (7 fields) — uses runtime Dims, not compile-time constants
     f.write_all(&(dims.n_bands as u32).to_le_bytes()).unwrap();
@@ -57,6 +57,9 @@ pub fn save_checkpoint(
     // We check if the save was phase_native by seeing if params count is smaller than non-phase
     f.write_all(&flags.to_le_bytes()).unwrap();
 
+    // FWM strength (v4) — persisted so resume doesn't lose chi
+    f.write_all(&dims.fwm_strength.to_le_bytes()).unwrap();
+
     // Metadata
     f.write_all(&(vocab_size as u64).to_le_bytes()).unwrap();
     f.write_all(&(iter as u64).to_le_bytes()).unwrap();
@@ -73,15 +76,16 @@ pub fn save_checkpoint(
     let n = params.len();
     for &v in params { f.write_all(&v.to_le_bytes()).unwrap(); }
 
-    println!("  WCHK v3: {n} params, {n_layers} layers, {out_proj_groups} groups, flags=0x{flags:02x}, {:.1}MB",
+    println!("  WCHK v4: {n} params, {n_layers} layers, {out_proj_groups} groups, flags=0x{flags:02x}, chi={:.3}, {:.1}MB",
+        dims.fwm_strength,
         (4+4+8*4+8+8+4+8+8+n*4*2+n*4) as f64 / 1e6);
 }
 
 /// Load checkpoint for resume.
-/// Returns (params, vocab_size, iter, lr, rng_state, adam_t, adam_m, adam_v, out_proj_groups, feature_flags).
+/// Returns (params, vocab_size, iter, lr, rng_state, adam_t, adam_m, adam_v, out_proj_groups, feature_flags, chi).
 /// Feature flags (v3+): bit0=learnable_ode, bit1=layer_scale, bit2=rk4_weights, bit3=dyn_harmonics.
-/// v1/v2 checkpoints return flags=0.
-pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, Vec<f32>, Vec<f32>, usize, u32) {
+/// v1/v2 checkpoints return flags=0, chi=0.0.
+pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, Vec<f32>, Vec<f32>, usize, u32, f32) {
     use std::io::Read;
     let mut f = std::fs::File::open(path).unwrap_or_else(|e| panic!("Failed to open {path}: {e}"));
 
@@ -94,7 +98,7 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let read_f32_single = |f: &mut std::fs::File| -> f32 { let mut b = [0u8; 4]; f.read_exact(&mut b).unwrap(); f32::from_le_bytes(b) };
 
     let version = read_u32(&mut f);
-    assert!(version >= 1 && version <= 3, "Unknown WCHK version {version}");
+    assert!(version >= 1 && version <= 4, "Unknown WCHK version {version}");
 
     // Config
     let ck_bands = read_u32(&mut f) as usize;
@@ -121,6 +125,13 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let has_layer_scale   = feature_flags & (1 << 1) != 0;
     let has_rk4_weights   = feature_flags & (1 << 2) != 0;
     let has_dyn_harmonics = feature_flags & (1 << 3) != 0;
+
+    // v4: chi (FWM strength) persisted in checkpoint
+    let chi = if version >= 4 { read_f32_single(&mut f) } else { 0.0 };
+    if version < 4 && chi == 0.0 {
+        // v3 and earlier: FWM was not persisted. chi defaults to 0.0.
+        // If the user passes --fwm-strength on the CLI, that takes effect on resume.
+    }
 
     // Use config from checkpoint header — no compile-time constant assertions
     let n_embd = ck_bands * 2;
@@ -196,7 +207,8 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
         if has_rk4_weights { n += ck_layers * 4; }
         if has_dyn_harmonics { n += ck_layers * ck_head; }
         // Detect phase-native from file size (lm_head present or not)
-        let header_size_v3 = 4 + 4 + 8*4 + 8 + 8 + 4 + 8 + 8; // magic+ver+config(7)+flags+meta+adam_t
+        // magic(4) + ver(4) + config(7×4=28) + flags(4) + chi_if_v4(4) + vocab(8) + iter(8) + lr(4) + rng(8) + adam_t(8)
+        let header_size_v3 = 4 + 4 + 8*4 + 8 + 8 + 4 + 8 + 8 + if version >= 4 { 4 } else { 0 };
         let file_len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
         let data_bytes = file_len.saturating_sub(header_size_v3);
         let n_with_lm = n + lm_head_params;
@@ -221,10 +233,12 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let adam_v = read_f32_vec(&mut f, n_params);
     let params = read_f32_vec(&mut f, n_params);
 
-    if version >= 3 {
+    if version >= 4 {
+        println!("  WCHK v{version}: iter {iter}, lr {lr:.6}, {n_params} params, {ck_layers} layers, {out_proj_groups} groups, flags=0x{feature_flags:02x}, chi={chi:.3}");
+    } else if version >= 3 {
         println!("  WCHK v{version}: iter {iter}, lr {lr:.6}, {n_params} params, {ck_layers} layers, {out_proj_groups} groups, flags=0x{feature_flags:02x}");
     } else {
         println!("  WCHK v{version}: iter {iter}, lr {lr:.6}, {n_params} params, {ck_layers} layers, {out_proj_groups} groups");
     }
-    (params, vocab_size, iter, lr, rng_state, adam_t, adam_m, adam_v, out_proj_groups, feature_flags)
+    (params, vocab_size, iter, lr, rng_state, adam_t, adam_m, adam_v, out_proj_groups, feature_flags, chi)
 }
