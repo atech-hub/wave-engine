@@ -587,7 +587,7 @@ impl ComputeBackend for GpuBackend {
         d_outputs: &[Vec<f32>],
         inputs: &[Vec<f32>],
         weights: &KerrWeights,
-    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32) {
+    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32, f32) {
         dispatch_backward::kerr_ode_backward_batch(self, d_outputs, inputs, weights)
     }
 

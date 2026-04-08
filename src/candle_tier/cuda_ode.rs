@@ -17,6 +17,200 @@ pub mod cuda_ode {
     use cudarc::driver::PushKernelArg;
     use std::sync::{Arc, Mutex, OnceLock};
 
+    /// FWM backward device helper — per-band gradient accumulation from FWM quartets.
+    /// For each of the 8 quartet-role memberships this band participates in, accumulates
+    /// contributions to this band's d_r, d_s, and d_chi. Translated mechanically from
+    /// CPU fwm_quartet_backward in ode_backward.rs.
+    /// Convention: only role a accumulates d_chi per quartet to avoid double-counting.
+    const CUDA_FWM_BACKWARD_DEVICE_FN: &str = r#"
+__device__ inline void compute_fwm_band_backward(
+    int band, int n, float chi,
+    const float* __restrict__ sr, const float* __restrict__ ss,
+    const float* __restrict__ sddr, const float* __restrict__ sdds,
+    float* fwm_dr_out, float* fwm_ds_out, float* fwm_dchi_out
+) {
+    float fdr = 0.0f, fds = 0.0f, fdchi = 0.0f;
+
+    // ════════ Family A: quartet (k-2, k+1, k-1, k) for k in [2, n-1) ════════
+
+    // Role a (band == k-2): k = band+2, valid when band+2 in [2, n-1)
+    if (band + 2 >= 2 && band + 2 < n - 1) {
+        int kv = band + 2;
+        int a = band, b = kv+1, c = kv-1, d = kv;
+        float ra=sr[a],sa=ss[a], rb=sr[b],sb=ss[b], rc=sr[c],sc=ss[c], rd=sr[d],sd=ss[d];
+        float ddra=sddr[a],ddsa=sdds[a], ddrb=sddr[b],ddsb=sdds[b];
+        float ddrc=sddr[c],ddsc=sdds[c], ddrd=sddr[d],ddsd=sdds[d];
+        float p_cd_re = rc*rd - sc*sd;
+        float p_cd_im = rc*sd + sc*rd;
+        float p_ab_re = ra*rb - sa*sb;
+        float p_ab_im = ra*sb + sa*rb;
+        // d_r[a]
+        fdr += ddrb*chi*p_cd_im - ddsb*chi*p_cd_re;
+        fdr += ddrc*chi*(sb*rd - rb*sd) - ddsc*chi*(rb*rd + sb*sd);
+        fdr += ddrd*chi*(sb*rc - rb*sc) - ddsd*chi*(rb*rc + sb*sc);
+        // d_s[a]
+        fds -= ddrb*chi*p_cd_re + ddsb*chi*p_cd_im;
+        fds += ddrc*chi*(rb*rd + sb*sd) + ddsc*chi*(sb*rd - rb*sd);
+        fds += ddrd*chi*(rb*rc + sb*sc) + ddsd*chi*(sb*rc - rb*sc);
+        // d_chi — role a accumulates full quartet contribution
+        fdchi += ddra*(rb*p_cd_im - sb*p_cd_re) + ddsa*(-(rb*p_cd_re + sb*p_cd_im));
+        fdchi += ddrb*(ra*p_cd_im - sa*p_cd_re) + ddsb*(-(ra*p_cd_re + sa*p_cd_im));
+        fdchi += ddrc*(p_ab_im*rd - p_ab_re*sd) + ddsc*(-(p_ab_re*rd + p_ab_im*sd));
+        fdchi += ddrd*(p_ab_im*rc - p_ab_re*sc) + ddsd*(-(p_ab_re*rc + p_ab_im*sc));
+    }
+
+    // Role b (band == k+1): k = band-1, valid when band-1 in [2, n-1)
+    if (band - 1 >= 2 && band - 1 < n - 1) {
+        int kv = band - 1;
+        int a = kv-2, b = band, c = kv-1, d = kv;
+        float ra=sr[a],sa=ss[a], rb=sr[b],sb=ss[b], rc=sr[c],sc=ss[c], rd=sr[d],sd=ss[d];
+        float ddra=sddr[a],ddsa=sdds[a], ddrb=sddr[b],ddsb=sdds[b];
+        float ddrc=sddr[c],ddsc=sdds[c], ddrd=sddr[d],ddsd=sdds[d];
+        float p_cd_re = rc*rd - sc*sd;
+        float p_cd_im = rc*sd + sc*rd;
+        // d_r[b]
+        fdr += ddra*chi*p_cd_im - ddsa*chi*p_cd_re;
+        fdr += ddrc*chi*(sa*rd - ra*sd) - ddsc*chi*(ra*rd + sa*sd);
+        fdr += ddrd*chi*(sa*rc - ra*sc) - ddsd*chi*(ra*rc + sa*sc);
+        // d_s[b]
+        fds -= ddra*chi*p_cd_re + ddsa*chi*p_cd_im;
+        fds += ddrc*chi*(ra*rd + sa*sd) + ddsc*chi*(sa*rd - ra*sd);
+        fds += ddrd*chi*(ra*rc + sa*sc) + ddsd*chi*(sa*rc - ra*sc);
+        // d_chi: skip — role a already counted this quartet
+    }
+
+    // Role c (band == k-1): k = band+1, valid when band+1 in [2, n-1)
+    if (band + 1 >= 2 && band + 1 < n - 1) {
+        int kv = band + 1;
+        int a = kv-2, b = kv+1, c = band, d = kv;
+        float ra=sr[a],sa=ss[a], rb=sr[b],sb=ss[b], rc=sr[c],sc=ss[c], rd=sr[d],sd=ss[d];
+        float ddra=sddr[a],ddsa=sdds[a], ddrb=sddr[b],ddsb=sdds[b];
+        float ddrd=sddr[d],ddsd=sdds[d];
+        float p_ab_re = ra*rb - sa*sb;
+        float p_ab_im = ra*sb + sa*rb;
+        // d_r[c]
+        fdr += ddra*chi*(rb*sd - sb*rd) - ddsa*chi*(rb*rd + sb*sd);
+        fdr += ddrb*chi*(ra*sd - sa*rd) - ddsb*chi*(ra*rd + sa*sd);
+        fdr += ddrd*chi*p_ab_im - ddsd*chi*p_ab_re;
+        // d_s[c]
+        fds += ddra*chi*(rb*rd + sb*sd) + ddsa*chi*(rb*sd - sb*rd);
+        fds += ddrb*chi*(ra*rd + sa*sd) + ddsb*chi*(ra*sd - sa*rd);
+        fds -= ddrd*chi*p_ab_re + ddsd*chi*p_ab_im;
+        // d_chi: skip
+    }
+
+    // Role d (band == k): k = band, valid when band in [2, n-1)
+    if (band >= 2 && band < n - 1) {
+        int kv = band;
+        int a = kv-2, b = kv+1, c = kv-1, d = band;
+        float ra=sr[a],sa=ss[a], rb=sr[b],sb=ss[b], rc=sr[c],sc=ss[c], rd=sr[d],sd=ss[d];
+        float ddra=sddr[a],ddsa=sdds[a], ddrb=sddr[b],ddsb=sdds[b];
+        float ddrc=sddr[c],ddsc=sdds[c];
+        float p_ab_re = ra*rb - sa*sb;
+        float p_ab_im = ra*sb + sa*rb;
+        // d_r[d]
+        fdr += ddra*chi*(rb*sc - sb*rc) - ddsa*chi*(rb*rc + sb*sc);
+        fdr += ddrb*chi*(ra*sc - sa*rc) - ddsb*chi*(ra*rc + sa*sc);
+        fdr += ddrc*chi*p_ab_im - ddsc*chi*p_ab_re;
+        // d_s[d]
+        fds += ddra*chi*(rb*rc + sb*sc) + ddsa*chi*(rb*sc - sb*rc);
+        fds += ddrb*chi*(ra*rc + sa*sc) + ddsb*chi*(ra*sc - sa*rc);
+        fds -= ddrc*chi*p_ab_re + ddsc*chi*p_ab_im;
+        // d_chi: skip
+    }
+
+    // ════════ Family B: quartet (k-1, k+2, k, k+1) for k in [1, n-2) ════════
+
+    // Role a (band == k-1): k = band+1, valid when band+1 in [1, n-2)
+    if (band + 1 >= 1 && band + 1 < n - 2) {
+        int kv = band + 1;
+        int a = band, b = kv+2, c = kv, d = kv+1;
+        float ra=sr[a],sa=ss[a], rb=sr[b],sb=ss[b], rc=sr[c],sc=ss[c], rd=sr[d],sd=ss[d];
+        float ddra=sddr[a],ddsa=sdds[a], ddrb=sddr[b],ddsb=sdds[b];
+        float ddrc=sddr[c],ddsc=sdds[c], ddrd=sddr[d],ddsd=sdds[d];
+        float p_cd_re = rc*rd - sc*sd;
+        float p_cd_im = rc*sd + sc*rd;
+        float p_ab_re = ra*rb - sa*sb;
+        float p_ab_im = ra*sb + sa*rb;
+        // d_r[a]
+        fdr += ddrb*chi*p_cd_im - ddsb*chi*p_cd_re;
+        fdr += ddrc*chi*(sb*rd - rb*sd) - ddsc*chi*(rb*rd + sb*sd);
+        fdr += ddrd*chi*(sb*rc - rb*sc) - ddsd*chi*(rb*rc + sb*sc);
+        // d_s[a]
+        fds -= ddrb*chi*p_cd_re + ddsb*chi*p_cd_im;
+        fds += ddrc*chi*(rb*rd + sb*sd) + ddsc*chi*(sb*rd - rb*sd);
+        fds += ddrd*chi*(rb*rc + sb*sc) + ddsd*chi*(sb*rc - rb*sc);
+        // d_chi — role a accumulates full quartet contribution
+        fdchi += ddra*(rb*p_cd_im - sb*p_cd_re) + ddsa*(-(rb*p_cd_re + sb*p_cd_im));
+        fdchi += ddrb*(ra*p_cd_im - sa*p_cd_re) + ddsb*(-(ra*p_cd_re + sa*p_cd_im));
+        fdchi += ddrc*(p_ab_im*rd - p_ab_re*sd) + ddsc*(-(p_ab_re*rd + p_ab_im*sd));
+        fdchi += ddrd*(p_ab_im*rc - p_ab_re*sc) + ddsd*(-(p_ab_re*rc + p_ab_im*sc));
+    }
+
+    // Role b (band == k+2): k = band-2, valid when band-2 in [1, n-2)
+    if (band - 2 >= 1 && band - 2 < n - 2) {
+        int kv = band - 2;
+        int a = kv-1, b = band, c = kv, d = kv+1;
+        float ra=sr[a],sa=ss[a], rb=sr[b],sb=ss[b], rc=sr[c],sc=ss[c], rd=sr[d],sd=ss[d];
+        float ddra=sddr[a],ddsa=sdds[a], ddrb=sddr[b],ddsb=sdds[b];
+        float ddrc=sddr[c],ddsc=sdds[c], ddrd=sddr[d],ddsd=sdds[d];
+        float p_cd_re = rc*rd - sc*sd;
+        float p_cd_im = rc*sd + sc*rd;
+        // d_r[b]
+        fdr += ddra*chi*p_cd_im - ddsa*chi*p_cd_re;
+        fdr += ddrc*chi*(sa*rd - ra*sd) - ddsc*chi*(ra*rd + sa*sd);
+        fdr += ddrd*chi*(sa*rc - ra*sc) - ddsd*chi*(ra*rc + sa*sc);
+        // d_s[b]
+        fds -= ddra*chi*p_cd_re + ddsa*chi*p_cd_im;
+        fds += ddrc*chi*(ra*rd + sa*sd) + ddsc*chi*(sa*rd - ra*sd);
+        fds += ddrd*chi*(ra*rc + sa*sc) + ddsd*chi*(sa*rc - ra*sc);
+        // d_chi: skip
+    }
+
+    // Role c (band == k): k = band, valid when band in [1, n-2)
+    if (band >= 1 && band < n - 2) {
+        int kv = band;
+        int a = kv-1, b = kv+2, c = band, d = kv+1;
+        float ra=sr[a],sa=ss[a], rb=sr[b],sb=ss[b], rc=sr[c],sc=ss[c], rd=sr[d],sd=ss[d];
+        float ddra=sddr[a],ddsa=sdds[a], ddrb=sddr[b],ddsb=sdds[b];
+        float ddrd=sddr[d],ddsd=sdds[d];
+        float p_ab_re = ra*rb - sa*sb;
+        float p_ab_im = ra*sb + sa*rb;
+        // d_r[c]
+        fdr += ddra*chi*(rb*sd - sb*rd) - ddsa*chi*(rb*rd + sb*sd);
+        fdr += ddrb*chi*(ra*sd - sa*rd) - ddsb*chi*(ra*rd + sa*sd);
+        fdr += ddrd*chi*p_ab_im - ddsd*chi*p_ab_re;
+        // d_s[c]
+        fds += ddra*chi*(rb*rd + sb*sd) + ddsa*chi*(rb*sd - sb*rd);
+        fds += ddrb*chi*(ra*rd + sa*sd) + ddsb*chi*(ra*sd - sa*rd);
+        fds -= ddrd*chi*p_ab_re + ddsd*chi*p_ab_im;
+        // d_chi: skip
+    }
+
+    // Role d (band == k+1): k = band-1, valid when band-1 in [1, n-2)
+    if (band - 1 >= 1 && band - 1 < n - 2) {
+        int kv = band - 1;
+        int a = kv-1, b = kv+2, c = kv, d = band;
+        float ra=sr[a],sa=ss[a], rb=sr[b],sb=ss[b], rc=sr[c],sc=ss[c], rd=sr[d],sd=ss[d];
+        float ddra=sddr[a],ddsa=sdds[a], ddrb=sddr[b],ddsb=sdds[b];
+        float ddrc=sddr[c],ddsc=sdds[c];
+        float p_ab_re = ra*rb - sa*sb;
+        float p_ab_im = ra*sb + sa*rb;
+        // d_r[d]
+        fdr += ddra*chi*(rb*sc - sb*rc) - ddsa*chi*(rb*rc + sb*sc);
+        fdr += ddrb*chi*(ra*sc - sa*rc) - ddsb*chi*(ra*rc + sa*sc);
+        fdr += ddrc*chi*p_ab_im - ddsc*chi*p_ab_re;
+        // d_s[d]
+        fds += ddra*chi*(rb*rc + sb*sc) + ddsa*chi*(rb*sc - sb*rc);
+        fds += ddrb*chi*(ra*rc + sa*sc) + ddsb*chi*(ra*sc - sa*rc);
+        fds -= ddrc*chi*p_ab_re + ddsc*chi*p_ab_im;
+        // d_chi: skip
+    }
+
+    *fwm_dr_out = fdr; *fwm_ds_out = fds; *fwm_dchi_out = fdchi;
+}
+"#;
+
     /// FWM device helper — shared between forward and backward kernel sources.
     /// Each band accumulates up to 8 quartet-role memberships (4 roles x 2 families).
     const CUDA_FWM_DEVICE_FN: &str = r#"
@@ -199,6 +393,7 @@ extern "C" __global__ void kerr_ode_bwd(
     float* __restrict__ d_gamma_out,         // [n_pos, n_bands]
     float* __restrict__ d_alpha_out,         // [n_pos]
     float* __restrict__ d_beta_out,          // [n_pos]
+    float* __restrict__ d_chi_out,           // [n_pos]
     float* __restrict__ d_rk4w_out,          // [n_pos, 4]
     const float* __restrict__ gamma,         // [n_bands]
     const float* __restrict__ omega,         // [n_bands]
@@ -232,6 +427,7 @@ extern "C" __global__ void kerr_ode_bwd(
     float d_gamma_k = 0.0f;
     float d_alpha_k = 0.0f;
     float d_beta_k  = 0.0f;
+    float d_chi_k   = 0.0f;
     float d_rk4w_0 = 0, d_rk4w_1 = 0, d_rk4w_2 = 0, d_rk4w_3 = 0;
 
     // Walk backward through RK4 steps
@@ -329,6 +525,14 @@ extern "C" __global__ void kerr_ode_bwd(
                             eval_ds4 += s_ddr[k+1]*(-2.0f*beta*s4*s_s[k+1]) + s_dds[k+1]*(2.0f*beta*s4*s_r[k+1]); }
         if (k+2<n_bands) { eval_dr4 += s_ddr[k+2]*(-2.0f*beta*r4*s_s[k+2]) + s_dds[k+2]*(2.0f*beta*r4*s_r[k+2]);
                             eval_ds4 += s_ddr[k+2]*(-2.0f*beta*s4*s_s[k+2]) + s_dds[k+2]*(2.0f*beta*s4*s_r[k+2]); }
+        // FWM backward for k4
+        if (chi != 0.0f && n_bands > 4) {
+            float fwm_dr4, fwm_ds4, fwm_dchi4;
+            compute_fwm_band_backward(k, n_bands, chi, s_r, s_s, s_ddr, s_dds, &fwm_dr4, &fwm_ds4, &fwm_dchi4);
+            eval_dr4 += fwm_dr4;
+            eval_ds4 += fwm_ds4;
+            d_chi_k += fwm_dchi4;
+        }
         // Param grads from k4
         d_gamma_k += dk4r*(-r4) + dk4s*(-s4);
         d_alpha_k += dk4r*(-(r4*r4+s4*s4)*s4) + dk4s*((r4*r4+s4*s4)*r4);
@@ -354,6 +558,14 @@ extern "C" __global__ void kerr_ode_bwd(
                             eval_ds3 += s_ddr[k+1]*(-2.0f*beta*s3*s_s[k+1]) + s_dds[k+1]*(2.0f*beta*s3*s_r[k+1]); }
         if (k+2<n_bands) { eval_dr3 += s_ddr[k+2]*(-2.0f*beta*r3*s_s[k+2]) + s_dds[k+2]*(2.0f*beta*r3*s_r[k+2]);
                             eval_ds3 += s_ddr[k+2]*(-2.0f*beta*s3*s_s[k+2]) + s_dds[k+2]*(2.0f*beta*s3*s_r[k+2]); }
+        // FWM backward for k3
+        if (chi != 0.0f && n_bands > 4) {
+            float fwm_dr3, fwm_ds3, fwm_dchi3;
+            compute_fwm_band_backward(k, n_bands, chi, s_r, s_s, s_ddr, s_dds, &fwm_dr3, &fwm_ds3, &fwm_dchi3);
+            eval_dr3 += fwm_dr3;
+            eval_ds3 += fwm_ds3;
+            d_chi_k += fwm_dchi3;
+        }
         d_gamma_k += dk3r*(-r3) + dk3s*(-s3);
         d_alpha_k += dk3r*(-(r3*r3+s3*s3)*s3) + dk3s*((r3*r3+s3*s3)*r3);
         d_beta_k  += dk3r*(-ns3*s3) + dk3s*(ns3*r3);
@@ -377,6 +589,14 @@ extern "C" __global__ void kerr_ode_bwd(
                             eval_ds2 += s_ddr[k+1]*(-2.0f*beta*s2*s_s[k+1]) + s_dds[k+1]*(2.0f*beta*s2*s_r[k+1]); }
         if (k+2<n_bands) { eval_dr2 += s_ddr[k+2]*(-2.0f*beta*r2*s_s[k+2]) + s_dds[k+2]*(2.0f*beta*r2*s_r[k+2]);
                             eval_ds2 += s_ddr[k+2]*(-2.0f*beta*s2*s_s[k+2]) + s_dds[k+2]*(2.0f*beta*s2*s_r[k+2]); }
+        // FWM backward for k2
+        if (chi != 0.0f && n_bands > 4) {
+            float fwm_dr2, fwm_ds2, fwm_dchi2;
+            compute_fwm_band_backward(k, n_bands, chi, s_r, s_s, s_ddr, s_dds, &fwm_dr2, &fwm_ds2, &fwm_dchi2);
+            eval_dr2 += fwm_dr2;
+            eval_ds2 += fwm_ds2;
+            d_chi_k += fwm_dchi2;
+        }
         d_gamma_k += dk2r*(-r2) + dk2s*(-s2);
         d_alpha_k += dk2r*(-(r2*r2+s2*s2)*s2) + dk2s*((r2*r2+s2*s2)*r2);
         d_beta_k  += dk2r*(-ns2*s2) + dk2s*(ns2*r2);
@@ -400,6 +620,14 @@ extern "C" __global__ void kerr_ode_bwd(
                             eval_ds1 += s_ddr[k+1]*(-2.0f*beta*s0*s_s[k+1]) + s_dds[k+1]*(2.0f*beta*s0*s_r[k+1]); }
         if (k+2<n_bands) { eval_dr1 += s_ddr[k+2]*(-2.0f*beta*r0*s_s[k+2]) + s_dds[k+2]*(2.0f*beta*r0*s_r[k+2]);
                             eval_ds1 += s_ddr[k+2]*(-2.0f*beta*s0*s_s[k+2]) + s_dds[k+2]*(2.0f*beta*s0*s_r[k+2]); }
+        // FWM backward for k1
+        if (chi != 0.0f && n_bands > 4) {
+            float fwm_dr1, fwm_ds1, fwm_dchi1;
+            compute_fwm_band_backward(k, n_bands, chi, s_r, s_s, s_ddr, s_dds, &fwm_dr1, &fwm_ds1, &fwm_dchi1);
+            eval_dr1 += fwm_dr1;
+            eval_ds1 += fwm_ds1;
+            d_chi_k += fwm_dchi1;
+        }
         d_gamma_k += dk1r*(-r0) + dk1s*(-s0);
         d_alpha_k += dk1r*(-(r0*r0+s0*s0)*s0) + dk1s*((r0*r0+s0*s0)*r0);
         d_beta_k  += dk1r*(-ns1*s0) + dk1s*(ns1*r0);
@@ -432,6 +660,13 @@ extern "C" __global__ void kerr_ode_bwd(
     if (k == 0) d_beta_out[pos] = s_mag[0];
     __syncthreads();
 
+    if (k == 0) { s_mag[0] = 0.0f; }
+    __syncthreads();
+    atomicAdd(&s_mag[0], d_chi_k);
+    __syncthreads();
+    if (k == 0) d_chi_out[pos] = s_mag[0];
+    __syncthreads();
+
     // RK4 weights: 4 reductions
     float d_ws[4] = {d_rk4w_0, d_rk4w_1, d_rk4w_2, d_rk4w_3};
     for (int wi = 0; wi < 4; wi++) {
@@ -461,7 +696,7 @@ extern "C" __global__ void kerr_ode_bwd(
 
     fn get_bwd_ptx() -> &'static str {
         COMPILED_BWD_PTX.get_or_init(|| {
-            let src = format!("{}{}", CUDA_FWM_DEVICE_FN, CUDA_ODE_BWD_KERNEL);
+            let src = format!("{}{}{}", CUDA_FWM_BACKWARD_DEVICE_FN, CUDA_FWM_DEVICE_FN, CUDA_ODE_BWD_KERNEL);
             let ptx = cudarc::nvrtc::compile_ptx(&src)
                 .expect("CUDA ODE backward kernel compilation failed");
             ptx.to_src()
@@ -685,6 +920,7 @@ extern "C" __global__ void kerr_ode_bwd(
             let d_gamma_out = dev.alloc_zeros::<f32>(n_pos * self.n_bands)?;
             let d_alpha_out = dev.alloc_zeros::<f32>(n_pos)?;
             let d_beta_out = dev.alloc_zeros::<f32>(n_pos)?;
+            let d_chi_out = dev.alloc_zeros::<f32>(n_pos)?;
             let d_rk4w_out = dev.alloc_zeros::<f32>(n_pos * 4)?;
 
             // Launch backward kernel
@@ -700,6 +936,7 @@ extern "C" __global__ void kerr_ode_bwd(
             builder.arg(&d_gamma_out);
             builder.arg(&d_alpha_out);
             builder.arg(&d_beta_out);
+            builder.arg(&d_chi_out);
             builder.arg(&d_rk4w_out);
             builder.arg(&d_gamma);
             builder.arg(&d_omega);
@@ -721,6 +958,7 @@ extern "C" __global__ void kerr_ode_bwd(
             let gamma_grads: Vec<f32> = dev.clone_dtoh(&d_gamma_out)?;
             let alpha_grads: Vec<f32> = dev.clone_dtoh(&d_alpha_out)?;
             let beta_grads: Vec<f32> = dev.clone_dtoh(&d_beta_out)?;
+            let chi_grads: Vec<f32> = dev.clone_dtoh(&d_chi_out)?;
             let rk4w_grads: Vec<f32> = dev.clone_dtoh(&d_rk4w_out)?;
 
             // Reduce: sum across positions
@@ -732,6 +970,7 @@ extern "C" __global__ void kerr_ode_bwd(
             }
             let total_d_alpha: f32 = alpha_grads.iter().sum();
             let total_d_beta: f32 = beta_grads.iter().sum();
+            let total_d_chi: f32 = chi_grads.iter().sum();
             let mut total_d_rk4_weights = [0.0f32; 4];
             for pos in 0..n_pos {
                 for w in 0..4 {
@@ -747,6 +986,7 @@ extern "C" __global__ void kerr_ode_bwd(
                         d_gamma_raw: total_d_gamma_raw,
                         d_alpha: total_d_alpha,
                         d_beta: total_d_beta,
+                        d_chi: total_d_chi,
                         d_rk4_weights: total_d_rk4_weights,
                     });
                 }
@@ -771,6 +1011,7 @@ extern "C" __global__ void kerr_ode_bwd(
             let mut total_d_gamma_raw = vec![0.0f32; self.n_bands];
             let mut total_d_alpha = 0.0f32;
             let mut total_d_beta = 0.0f32;
+            let mut total_d_chi = 0.0f32;
             let mut total_d_rk4_weights = [0.0f32; 4];
 
             for pos in 0..n_pos {
@@ -782,6 +1023,7 @@ extern "C" __global__ void kerr_ode_bwd(
                 for k in 0..self.n_bands { total_d_gamma_raw[k] += pg.d_gamma_raw[k]; }
                 total_d_alpha += pg.d_alpha;
                 total_d_beta += pg.d_beta;
+                total_d_chi += pg.d_chi;
                 for w in 0..4 { total_d_rk4_weights[w] += pg.d_rk4_weights[w]; }
             }
 
@@ -792,6 +1034,7 @@ extern "C" __global__ void kerr_ode_bwd(
                         d_gamma_raw: total_d_gamma_raw,
                         d_alpha: total_d_alpha,
                         d_beta: total_d_beta,
+                        d_chi: total_d_chi,
                         d_rk4_weights: total_d_rk4_weights,
                     });
                 }

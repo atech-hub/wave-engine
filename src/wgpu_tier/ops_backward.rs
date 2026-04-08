@@ -14,9 +14,9 @@ impl GpuBackend {
         d_dr_flat: &[f32], d_ds_flat: &[f32],  // upstream gradients [n_pos * n_bands]
         r_flat: &[f32], s_flat: &[f32],          // cached forward state [n_pos * n_bands]
         gamma: &[f32], omega: &[f32],            // shared params [n_bands]
-        alpha: f32, beta: f32,
+        alpha: f32, beta: f32, chi: f32,
         n_bands: usize, n_pos: usize,
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, f32, f32) {
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, f32, f32, f32) {
         let total = n_pos * n_bands;
 
         let r_buf = self.storage_buf("kbb_r", r_flat);
@@ -31,9 +31,11 @@ impl GpuBackend {
         let dom_buf = self.output_buf("kbb_dom", total);
         let da_buf = self.output_buf("kbb_da", total);
         let db_buf = self.output_buf("kbb_db", total);
+        let dchi_buf = self.output_buf("kbb_dchi", total);
 
         let params = KerrBwdBatchParams {
             n_bands: n_bands as u32, n_pos: n_pos as u32, alpha, beta,
+            chi, _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
         };
         let params_buf = self.uniform_buf("kbb_params", &params);
 
@@ -54,6 +56,7 @@ impl GpuBackend {
                 wgpu::BindGroupEntry { binding: 10, resource: da_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: db_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: dchi_buf.as_entire_binding() },
             ],
         });
 
@@ -72,12 +75,14 @@ impl GpuBackend {
         let d_omega = self.readback(&dom_buf, total);
         let da_partials = self.readback(&da_buf, total);
         let db_partials = self.readback(&db_buf, total);
+        let dchi_partials = self.readback(&dchi_buf, total);
 
-        // CPU reduction for d_alpha and d_beta
+        // CPU reduction for d_alpha, d_beta, and d_chi
         let d_alpha: f32 = da_partials.iter().sum();
         let d_beta: f32 = db_partials.iter().sum();
+        let d_chi: f32 = dchi_partials.iter().sum();
 
-        (d_r, d_s, d_gamma, d_omega, d_alpha, d_beta)
+        (d_r, d_s, d_gamma, d_omega, d_alpha, d_beta, d_chi)
     }
 
     /// Fused Kerr-ODE backward: full RK4 forward+backward in ONE command encoder.
@@ -88,7 +93,7 @@ impl GpuBackend {
         d_outputs: &[Vec<f32>],
         inputs: &[Vec<f32>],
         weights: &KerrWeights,
-    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32) {
+    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32, f32) {
         let n_pos = d_outputs.len();
         let n_bands = weights.gamma_raw.len();
         let n_embd = n_bands * 2;
@@ -158,9 +163,11 @@ impl GpuBackend {
         // Parameter gradient outputs (per dispatch) and accumulators
         let dg_step = make_rw("dg_step"); let dom_step = make_rw("dom_step");
         let da_step = make_rw("da_step"); let db_step = make_rw("db_step");
+        let dchi_step = make_rw("dchi_step");
         let dg_acc = make_init("dg_acc", &vec![0.0f32; total]);
         let da_acc = make_init("da_acc", &vec![0.0f32; total]);
         let db_acc = make_init("db_acc", &vec![0.0f32; total]);
+        let dchi_acc = make_init("dchi_acc", &vec![0.0f32; total]);
         let zero_buf = make_init("zero", &vec![0.0f32; total]);
 
         // Shared weight buffers
@@ -173,7 +180,7 @@ impl GpuBackend {
         let deriv_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bwd_deriv_u"), contents: bytemuck::bytes_of(&deriv_params), usage: wgpu::BufferUsages::UNIFORM,
         });
-        let bwd_params = KerrBwdBatchParams { n_bands: n_bands as u32, n_pos: n_pos as u32, alpha: weights.alpha, beta: weights.beta };
+        let bwd_params = KerrBwdBatchParams { n_bands: n_bands as u32, n_pos: n_pos as u32, alpha: weights.alpha, beta: weights.beta, chi: weights.chi, _pad0: 0.0, _pad1: 0.0, _pad2: 0.0 };
         let bwd_u = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bwd_bwd_u"), contents: bytemuck::bytes_of(&bwd_params), usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -252,6 +259,7 @@ impl GpuBackend {
                     wgpu::BindGroupEntry { binding: 10, resource: da_step.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 11, resource: db_step.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 12, resource: bwd_u.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 13, resource: dchi_step.as_entire_binding() },
                 ],
             })
         };
@@ -319,6 +327,7 @@ impl GpuBackend {
         let bg_acc_dg = acc_bg(&dg_acc, &dg_step);
         let bg_acc_da = acc_bg(&da_acc, &da_step);
         let bg_acc_db = acc_bg(&db_acc, &db_step);
+        let bg_acc_dchi = acc_bg(&dchi_acc, &dchi_step);
 
         // Midpoint reconstruction for backward (reuses r_mid/s_mid)
         let bg_bwd_mid_k3_r = vsa_bg(&r_buf, &k2r, &r_mid, &u_half_dt);
@@ -397,6 +406,7 @@ impl GpuBackend {
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dchi);
             // d_extra = 0 + dt * d_eval (chain: k4 depends on k3)
             dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_dt_r);
             dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_dt_s);
@@ -414,6 +424,7 @@ impl GpuBackend {
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dchi);
             // d_extra = 0 + 0.5*dt * d_eval
             dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_hdt_r);
             dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_hdt_s);
@@ -431,6 +442,7 @@ impl GpuBackend {
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dchi);
             // d_extra = 0 + 0.5*dt * d_eval
             dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_hdt_r);
             dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_hdt_s);
@@ -446,6 +458,7 @@ impl GpuBackend {
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dchi);
         }
 
         // ═══ ONE SUBMIT ═══
@@ -457,8 +470,9 @@ impl GpuBackend {
         let dg_out = self.readback(&dg_acc, total);
         let da_out = self.readback(&da_acc, total);
         let db_out = self.readback(&db_acc, total);
+        let dchi_out = self.readback(&dchi_acc, total);
 
-        // CPU reduction: sum across positions for d_gamma, d_alpha, d_beta
+        // CPU reduction: sum across positions for d_gamma, d_alpha, d_beta, d_chi
         let mut d_gamma_acc = vec![0.0f32; n_bands];
         for pos in 0..n_pos {
             for k in 0..n_bands {
@@ -467,6 +481,7 @@ impl GpuBackend {
         }
         let d_alpha: f32 = da_out.iter().sum();
         let d_beta: f32 = db_out.iter().sum();
+        let d_chi: f32 = dchi_out.iter().sum();
 
         // Softplus chain rule for gamma_raw
         let d_gamma_raw: Vec<f32> = (0..n_bands)
@@ -485,6 +500,6 @@ impl GpuBackend {
             d_input
         }).collect();
 
-        (d_inputs, d_gamma_raw, d_gamma_acc, d_alpha, d_beta)
+        (d_inputs, d_gamma_raw, d_gamma_acc, d_alpha, d_beta, d_chi)
     }
 }

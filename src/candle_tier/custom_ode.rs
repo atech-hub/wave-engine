@@ -16,6 +16,7 @@ pub mod custom_ode {
         pub d_gamma_raw: Vec<f32>,
         pub d_alpha: f32,
         pub d_beta: f32,
+        pub d_chi: f32,
         pub d_rk4_weights: [f32; 4],
     }
 
@@ -134,6 +135,7 @@ pub mod custom_ode {
             let mut total_d_gamma_raw = vec![0.0f32; self.n_bands];
             let mut total_d_alpha = 0.0f32;
             let mut total_d_beta = 0.0f32;
+            let mut total_d_chi = 0.0f32;
             let mut total_d_rk4_weights = [0.0f32; 4];
 
             for pos in 0..n_pos {
@@ -146,6 +148,7 @@ pub mod custom_ode {
                 for k in 0..self.n_bands { total_d_gamma_raw[k] += pg.d_gamma_raw[k]; }
                 total_d_alpha += pg.d_alpha;
                 total_d_beta += pg.d_beta;
+                total_d_chi += pg.d_chi;
                 for w in 0..4 { total_d_rk4_weights[w] += pg.d_rk4_weights[w]; }
             }
 
@@ -157,6 +160,7 @@ pub mod custom_ode {
                         d_gamma_raw: total_d_gamma_raw,
                         d_alpha: total_d_alpha,
                         d_beta: total_d_beta,
+                        d_chi: total_d_chi,
                         d_rk4_weights: total_d_rk4_weights,
                     });
                 }

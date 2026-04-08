@@ -256,7 +256,7 @@ pub fn ffn_backward_via_backend(
     if cache.gpu_ode_backward {
         // GPU ODE backward — recomputes forward internally, returns reduced gradients
         let gpu_be = ping_pong.unwrap().1;
-        let (d_inputs, d_gamma_raw, _d_omega, d_alpha, d_beta) =
+        let (d_inputs, d_gamma_raw, _d_omega, d_alpha, d_beta, d_chi) =
             gpu_be.gpu_kerr_ode_backward_batch(&d_kerr_out, &cache.precond, &weights.kerr);
         // Convert to per-position OdeParamGrads format (already summed across positions by GPU)
         // Create one synthetic OdeParamGrads with the full sum, rest zero
@@ -266,7 +266,7 @@ pub fn ffn_backward_via_backend(
                 d_gamma_raw: if pos == 0 { d_gamma_raw.clone() } else { vec![0.0; n_bands] },
                 d_alpha: if pos == 0 { d_alpha } else { 0.0 },
                 d_beta: if pos == 0 { d_beta } else { 0.0 },
-                d_chi: 0.0, // GPU backward doesn't compute chi grads yet
+                d_chi: if pos == 0 { d_chi } else { 0.0 },
                 d_rk4_weights: [0.0; 4], // GPU backward doesn't compute RK4 weight grads yet
             });
         }

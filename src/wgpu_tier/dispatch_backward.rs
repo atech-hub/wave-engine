@@ -13,7 +13,7 @@ pub(crate) fn kerr_ode_backward_batch(
     d_outputs: &[Vec<f32>],
     inputs: &[Vec<f32>],
     weights: &KerrWeights,
-) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32) {
+) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32, f32) {
     backend.gpu_kerr_ode_backward_batch(d_outputs, inputs, weights)
 }
 

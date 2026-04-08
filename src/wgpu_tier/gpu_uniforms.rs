@@ -172,6 +172,10 @@ pub(crate) struct KerrBwdBatchParams {
     pub n_pos: u32,
     pub alpha: f32,
     pub beta: f32,
+    pub chi: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
 }
 
 #[repr(C)]

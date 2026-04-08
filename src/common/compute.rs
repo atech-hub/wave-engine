@@ -69,13 +69,13 @@ pub trait ComputeBackend {
 
     /// Batched Kerr-ODE backward: all positions in one call.
     /// d_outputs: [n_pos][n_embd], inputs: [n_pos][n_embd].
-    /// Returns (d_inputs, d_gamma_raw, d_omega, d_alpha, d_beta).
+    /// Returns (d_inputs, d_gamma_raw, d_omega, d_alpha, d_beta, d_chi).
     fn kerr_ode_backward_batch(
         &self,
         d_outputs: &[Vec<f32>],
         inputs: &[Vec<f32>],
         weights: &KerrWeights,
-    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32) {
+    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>, f32, f32, f32) {
         // Default: loop per-position calling CPU backward
         let n_pos = d_outputs.len();
         let n_bands = weights.gamma_raw.len();
@@ -98,7 +98,7 @@ pub trait ComputeBackend {
             d_beta += d_be;
         }
 
-        (d_inputs, d_gamma_raw, d_omega, d_alpha, d_beta)
+        (d_inputs, d_gamma_raw, d_omega, d_alpha, d_beta, 0.0)
     }
 
     // ─── Backward operations ─────────────────────────────────────

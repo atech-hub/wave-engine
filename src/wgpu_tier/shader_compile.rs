@@ -196,7 +196,7 @@ pub(crate) fn compile_all(device: &wgpu::Device) -> CompiledShaders {
           storage_ro(4), storage_ro(5), uniform_entry(6), storage_ro(7)],
     );
 
-    // batched Kerr backward (13 bindings)
+    // batched Kerr backward (14 bindings)
     let kerr_bwd_batch_layout_entries = [
         storage_ro(0), storage_ro(1), storage_ro(2), storage_ro(3),  // r, s, gamma, omega
         storage_ro(4), storage_ro(5),                                 // d_dr, d_ds
@@ -204,6 +204,7 @@ pub(crate) fn compile_all(device: &wgpu::Device) -> CompiledShaders {
         storage_rw(8), storage_rw(9),                                 // d_gamma, d_omega
         storage_rw(10), storage_rw(11),                               // d_alpha_partial, d_beta_partial
         uniform_entry(12),                                            // params
+        storage_rw(13),                                               // d_chi_partial
     ];
     let (kerr_bwd_batch_pipeline, kerr_bwd_batch_layout) = compile_pipeline(
         device, "kerr_backward_batch",
