@@ -545,6 +545,176 @@ fn run_energy_conservation(cfg: &ProbeCfg) {
         if ratio < 1.0 { "PASS (damping reduces energy)" } else { "UNEXPECTED (energy grew)" });
 }
 
+// ─── Mode 9: Four-wave mixing phase-matching test ───
+
+fn run_four_wave_mixing(cfg: &ProbeCfg) {
+    print_header("four-wave-mixing", cfg);
+    let n = cfg.n_bands;
+    if n < 40 { println!("  SKIP: need at least 40 bands for FWM test"); return; }
+
+    // Test 1: Degenerate FWM — pump at band 30, look for idlers at 28 and 32
+    // (within the [1,1,0,1,1] kernel neighbourhood, δ=2)
+    println!("  [test 1: degenerate FWM (pump=30, δ=2)]");
+    {
+        let mut r = vec![0.0f32; n]; let s = vec![0.0f32; n];
+        r[30] = cfg.input_magnitude;
+        let (r_out, s_out, decomp) = run_ode_with_decomposition(&r, &s, cfg);
+        let e = energy(&r_out, &s_out);
+        let pump_e = e[30];
+        let idler_m = e[28];
+        let idler_p = e[32];
+        let max_other = e.iter().enumerate()
+            .filter(|&(k, _)| k != 28 && k != 30 && k != 32)
+            .map(|(_, &v)| v).fold(0.0f32, f32::max);
+        let ratio = (idler_m + idler_p) / pump_e.max(1e-10);
+        println!("    pump (30): energy={:.6}", pump_e);
+        println!("    idler- (28): energy={:.6}", idler_m);
+        println!("    idler+ (32): energy={:.6}", idler_p);
+        println!("    max other band: energy={:.6}", max_other);
+        println!("    degenerate_fwm_ratio={:.6} (idler/pump)", ratio);
+        decomp.print("    ");
+    }
+
+    // Test 2: Adjacent quartet — bands 28,31,29,30 form family A quartet (k=30: a=28,b=31,c=29,d=30)
+    // These are within the [1,1,0,1,1] kernel so FWM fires.
+    println!("  [test 2: adjacent matching quartet (28,31,29,30)]");
+    let matching_extra = {
+        let amp = cfg.input_magnitude * 0.5;
+        let mut r = vec![0.0f32; n]; let s = vec![0.0f32; n];
+        r[28] = amp; r[31] = amp; r[29] = amp; r[30] = amp;
+        let (r_out, s_out, decomp) = run_ode_with_decomposition(&r, &s, cfg);
+        let e = energy(&r_out, &s_out);
+        let quartet_bands = [28, 29, 30, 31];
+        let intra: f32 = quartet_bands.iter().map(|&k| e[k]).sum();
+        let total: f32 = e.iter().sum();
+        let extra = total - intra;
+        println!("    intra-quartet energy: {:.6} ({:.1}%)", intra, 100.0 * intra / total);
+        println!("    extra-quartet energy: {:.6} ({:.1}%)", extra, 100.0 * extra / total);
+        decomp.print("    ");
+        extra
+    };
+
+    // Test 3: Non-adjacent control — bands 10,30,12,25 (far apart, no shared quartets)
+    println!("  [test 3: non-adjacent bands (10,30,12,25) — no shared quartets]");
+    let nonmatching_extra = {
+        let amp = cfg.input_magnitude * 0.5;
+        let mut r = vec![0.0f32; n]; let s = vec![0.0f32; n];
+        r[10] = amp; r[30] = amp; r[12] = amp; r[25] = amp;
+        let (r_out, s_out, decomp) = run_ode_with_decomposition(&r, &s, cfg);
+        let e = energy(&r_out, &s_out);
+        let quartet_bands = [10, 12, 25, 30];
+        let intra: f32 = quartet_bands.iter().map(|&k| e[k]).sum();
+        let total: f32 = e.iter().sum();
+        let extra = total - intra;
+        println!("    intra-quartet energy: {:.6} ({:.1}%)", intra, 100.0 * intra / total);
+        println!("    extra-quartet energy: {:.6} ({:.1}%)", extra, 100.0 * extra / total);
+        decomp.print("    ");
+        extra
+    };
+
+    let pm_ratio = if nonmatching_extra > 1e-10 { matching_extra / nonmatching_extra } else { f32::INFINITY };
+    println!("  phase-matching ratio: {:.2} (matching/non-matching extra-quartet energy)", pm_ratio);
+    if pm_ratio > 1.5 { println!("    → FWM prefers matched quartets (correct physics)"); }
+    else if pm_ratio > 1.0 { println!("    → weak preference for matched quartets"); }
+    else { println!("    → no matching preference (investigate)"); }
+}
+
+// ─── Mode 10: Parameter sweep ───
+
+fn run_sweep(cfg: &ProbeCfg, sweep_param: &str, range_start: f32, range_end: f32, range_step: f32) {
+    println!("\n=== Mode: sweep (param={}, range=[{:.3}, {:.3}], step={:.3}) ===",
+        sweep_param, range_start, range_end, range_step);
+    println!("  n_bands={}  input_mag={:.2}  rk4_steps={}", cfg.n_bands, cfg.input_magnitude, cfg.rk4_steps);
+    println!();
+    println!("  {:>8}  {:>9}  {:>9}  {:>13}  {:>11}  {:>7}",
+        sweep_param, "fwm_frac", "phase_fr", "e_conserv_err", "max_amp_out", "stable");
+
+    let n = cfg.n_bands;
+    let mut rng = SimpleRng::new(cfg.seed);
+    let mut r_base = vec![0.0f32; n]; let mut s_base = vec![0.0f32; n];
+    for k in 0..n { r_base[k] = rng.next_f32(); s_base[k] = rng.next_f32(); }
+    let norm = total_energy(&r_base, &s_base).sqrt();
+    for k in 0..n { r_base[k] /= norm; s_base[k] /= norm; }
+    scale_input(&mut r_base, &mut s_base, cfg.input_magnitude);
+
+    let mut val = range_start;
+    while val <= range_end + 1e-6 {
+        // Build modified config for this sweep point
+        let mut sweep_cfg = ProbeCfg {
+            n_bands: cfg.n_bands,
+            alpha: cfg.alpha,
+            beta: cfg.beta,
+            chi: cfg.chi,
+            rk4_steps: cfg.rk4_steps,
+            seed: cfg.seed,
+            input_magnitude: cfg.input_magnitude,
+            gamma_raw: cfg.gamma_raw.clone(),
+            omega: cfg.omega.clone(),
+            rk4_weights: cfg.rk4_weights,
+            phase_correction: cfg.phase_correction.clone(),
+        };
+        match sweep_param {
+            "chi" => sweep_cfg.chi = val,
+            "alpha" => sweep_cfg.alpha = val,
+            "beta" => sweep_cfg.beta = val,
+            "gamma" => {
+                let raw = ((val).exp() - 1.0).ln();
+                sweep_cfg.gamma_raw = vec![raw; n];
+            }
+            "input_magnitude" => {
+                // Re-scale input for this magnitude
+                let mut r_s = r_base.clone(); let mut s_s = s_base.clone();
+                let rescale = val / cfg.input_magnitude;
+                for v in r_s.iter_mut() { *v *= rescale; }
+                for v in s_s.iter_mut() { *v *= rescale; }
+                let (_, _, decomp) = run_ode_with_decomposition(&r_s, &s_s, &sweep_cfg);
+                let (r_out, s_out) = run_ode(&r_s, &s_s, &sweep_cfg);
+                let max_amp = (0..n).map(|k| (r_out[k]*r_out[k] + s_out[k]*s_out[k]).sqrt())
+                    .fold(0.0f32, f32::max);
+                // Energy conservation (gamma=0 test)
+                let gamma_zero = vec![0.0f32; n];
+                let w = sweep_cfg.rk4_w();
+                let dt = sweep_cfg.dt();
+                let e_in = total_energy(&r_s, &s_s);
+                let mut r_t = r_s.clone(); let mut s_t = s_s.clone();
+                for _ in 0..sweep_cfg.rk4_steps {
+                    let (rn, sn) = rk4_step_public(&r_t, &s_t, dt, &gamma_zero, &sweep_cfg.omega, sweep_cfg.alpha, sweep_cfg.beta, sweep_cfg.chi, &w);
+                    r_t = rn; s_t = sn;
+                }
+                let e_err = (total_energy(&r_t, &s_t) - e_in).abs() / e_in;
+                let stable = decomp.fwm_frac < 0.5 && max_amp < 50.0 && !e_err.is_nan();
+                println!("  {:>8.3}  {:>9.4}  {:>9.4}  {:>13.2e}  {:>11.4}  {:>7}",
+                    val, decomp.fwm_frac, decomp.phase_frac, e_err, max_amp,
+                    if stable { "yes" } else { "UNSTABLE" });
+                val += range_step;
+                continue;
+            }
+            _ => { eprintln!("  Unknown sweep param: {}. Use: chi, alpha, beta, gamma, input_magnitude", sweep_param); return; }
+        }
+
+        let (_, _, decomp) = run_ode_with_decomposition(&r_base, &s_base, &sweep_cfg);
+        let (r_out, s_out) = run_ode(&r_base, &s_base, &sweep_cfg);
+        let max_amp = (0..n).map(|k| (r_out[k]*r_out[k] + s_out[k]*s_out[k]).sqrt())
+            .fold(0.0f32, f32::max);
+        // Energy conservation check (gamma=0)
+        let gamma_zero = vec![0.0f32; n];
+        let w = sweep_cfg.rk4_w();
+        let dt = sweep_cfg.dt();
+        let e_in = total_energy(&r_base, &s_base);
+        let mut r_t = r_base.clone(); let mut s_t = s_base.clone();
+        for _ in 0..sweep_cfg.rk4_steps {
+            let (rn, sn) = rk4_step_public(&r_t, &s_t, dt, &gamma_zero, &sweep_cfg.omega, sweep_cfg.alpha, sweep_cfg.beta, sweep_cfg.chi, &w);
+            r_t = rn; s_t = sn;
+        }
+        let e_err = (total_energy(&r_t, &s_t) - e_in).abs() / e_in;
+        let stable = decomp.fwm_frac < 0.5 && max_amp < 50.0 && !e_err.is_nan();
+        println!("  {:>8.3}  {:>9.4}  {:>9.4}  {:>13.2e}  {:>11.4}  {:>7}",
+            val, decomp.fwm_frac, decomp.phase_frac, e_err, max_amp,
+            if stable { "yes" } else { "UNSTABLE" });
+        val += range_step;
+    }
+}
+
 // ─── Run modes on a config ───
 
 fn run_mode(mode: &str, cfg: &ProbeCfg) {
@@ -557,6 +727,8 @@ fn run_mode(mode: &str, cfg: &ProbeCfg) {
         "spectral" => run_spectral(cfg),
         "determinism" => run_determinism(cfg),
         "energy-conservation" => run_energy_conservation(cfg),
+        "four-wave-mixing" => run_four_wave_mixing(cfg),
+        // sweep handled separately in main (needs extra args)
         "all" => {
             run_determinism(cfg);
             run_single_band(cfg);
@@ -566,8 +738,9 @@ fn run_mode(mode: &str, cfg: &ProbeCfg) {
             run_magnitude_sweep(cfg);
             run_spectral(cfg);
             run_energy_conservation(cfg);
+            run_four_wave_mixing(cfg);
         }
-        _ => eprintln!("Unknown mode: {}. Use: single-band, two-band-constructive, two-band-destructive, linearity-check, magnitude-sweep, spectral, determinism, energy-conservation, all", mode),
+        _ => eprintln!("Unknown mode: {}. Use: single-band, two-band-constructive, two-band-destructive, linearity-check, magnitude-sweep, spectral, determinism, energy-conservation, four-wave-mixing, sweep, all", mode),
     }
 }
 
@@ -634,6 +807,19 @@ fn main() {
         seed,
         input_magnitude,
     );
+
+    // Sweep mode needs extra args
+    if mode == "sweep" {
+        let sweep_param = parse_str("--sweep-param").unwrap_or("chi".to_string());
+        let sweep_range = parse_str("--sweep-range").unwrap_or("0.0,0.5,0.05".to_string());
+        let parts: Vec<f32> = sweep_range.split(',').filter_map(|s| s.parse().ok()).collect();
+        if parts.len() != 3 {
+            eprintln!("--sweep-range needs start,end,step (e.g. 0.0,0.5,0.05)");
+            std::process::exit(1);
+        }
+        run_sweep(&cfg, &sweep_param, parts[0], parts[1], parts[2]);
+        return;
+    }
 
     run_mode(&mode, &cfg);
 }
