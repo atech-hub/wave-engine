@@ -146,7 +146,9 @@ pub fn run_analyze(
     // Load model from checkpoint
     let (params, ck_vocab, _ck_iter, _ck_lr, _ck_rng, _adam_t, _adam_m, _adam_v, _ck_groups, _ck_flags, _ck_chi) =
         wave_checkpoint::load_checkpoint(resume_path);
-    let effective_vocab = vocab_size.max(ck_vocab);
+    // Use checkpoint vocab — the model was trained with this vocab size.
+    // The test text may have more chars but the model can only handle what it was trained on.
+    let effective_vocab = ck_vocab;
     // Try extended params first (new checkpoints with ODE/corrector)
     let dims_base = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_learnable_ode(false).with_corrector(false);
     let dims_ext = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true);
@@ -154,12 +156,30 @@ pub fn run_analyze(
     let ext_count = count_trainable_ex(&model, false);
     let dims;
     if params.len() == ext_count {
-        // New checkpoint: load ODE+corrector params, run forward with corrector active
+        // New checkpoint with lm_head: load ODE+corrector params
         unflatten_params_ex(&mut model, &params, false);
-        // ODE backward not needed for analysis, but corrector forward must run
         model.learnable_ode = false;
         dims = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_learnable_ode(false).with_corrector(true);
         println!("  Loaded {} params (with ODE/corrector) from {}", params.len(), resume_path);
+    } else if params.len() < ext_count {
+        // Likely phase-native (no lm_head, has output_corrector)
+        model.phase_native = true;
+        model.output_corrector = vec![0.0; n_bands];
+        let pn_count = count_trainable_ex(&model, false);
+        if params.len() == pn_count {
+            unflatten_params_ex(&mut model, &params, false);
+            model.learnable_ode = false;
+            dims = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_learnable_ode(false).with_corrector(true);
+            println!("  Loaded {} params (phase-native + ODE/corrector) from {}", params.len(), resume_path);
+        } else {
+            // Try base without ODE
+            model = init_model(effective_vocab, 42, n_layers, out_proj_groups, dims_base, alpha, beta);
+            model.phase_native = true;
+            model.output_corrector = vec![0.0; n_bands];
+            unflatten_params(&mut model, &params);
+            dims = dims_base;
+            println!("  Loaded {} params (phase-native base) from {}", params.len(), resume_path);
+        }
     } else {
         // Old checkpoint without ODE/corrector params
         model = init_model(effective_vocab, 42, n_layers, out_proj_groups, dims_base, alpha, beta);
@@ -169,6 +189,8 @@ pub fn run_analyze(
     }
     println!("  Loaded {} params from {}", params.len(), resume_path);
 
+    // Clamp token IDs to vocab range (test text may have chars not in checkpoint's vocab)
+    let token_ids: Vec<usize> = token_ids.iter().map(|&t| t.min(effective_vocab - 1)).collect();
     // Truncate to block_size if needed (char-level can exceed positional table)
     let max_tokens = dims.block_size.min(token_ids.len());
     let token_ids = token_ids[..max_tokens].to_vec();
