@@ -375,18 +375,21 @@ Three tiers, same model, compatible checkpoints. GPU tiers earn their keep at 25
 
 ### Health suite (`--health-interval N`)
 
-10 diagnostic monitors captured every N iterations into JSONL:
+13 diagnostic monitors captured every N iterations into JSONL:
 
 1. **Attention heads** — per-head entropy, max_weight, harmonic values
-2. **Layer signal flow** — input/output norms, attention/FFN ratios, cosine similarity
+2. **Layer signal flow** — input/output norms, attention/FFN ratios, cosine, band amplitudes
 3. **Gradient breakdown** — per-component gradient norms (ODE, maestro, out_proj, lm_head)
-4. **Embedding space** — band utilisation, token separation, active/dead band census
+4. **Embedding space** — band utilisation, token separation (iter 0 only for frozen embeddings)
 5. **Output distribution** — correct rank, top-k accuracy, entropy
 6. **ODE dynamics** — energy ratio, phase velocity, damping, band energy std
-7. **Dynamic param trajectories** — α/β/γ per layer, RK4 weights, harmonics, layer scale
-8. **Curriculum transitions** — band activation schedule, mask values
-9. **Checkpoint drift** — weight distance from previous checkpoint
-10. **Throughput** — tokens/sec, iters/sec, forward time, VRAM
+7. **ODE forward decomposition** — damping/phase/FWM fractions per layer (what ODE did)
+8. **ODE backward decomposition** — gradient flow per physics term, d_chi norm (what optimizer cares about)
+9. **I/Q analysis** — I/Q channel discrimination, phase statistics
+10. **Dynamic param trajectories** — α/β/γ per layer, RK4 weights, harmonics, layer scale
+11. **Curriculum transitions** — band activation schedule, loss jumps
+12. **Checkpoint drift** — weight distance from previous checkpoint
+13. **Throughput** — tokens/sec, iters/sec, forward time, VRAM
 
 ## Architecture Calculator
 
@@ -407,16 +410,21 @@ Proven: fixing attention alone without fixing bands gives zero accuracy gain (va
 | Feature | Status | Description |
 |---------|--------|-------------|
 | Three training tiers | ✓ | CPU, wgpu (any GPU), Candle/CUDA (NVIDIA) |
+| Four-wave mixing (FWM) | ✓ | Hamiltonian cubic coupling (`--fwm-strength`). All 3 tiers. Analytical Jacobian. |
+| FWM CUDA kernel | ✓ | Fused AGC+RK4+FWM forward+backward — zero overhead vs chi=0 |
 | Phase-native loss | ✓ | Dot product against embeddings — no lm_head. 55/55 arithmetic. |
 | Learnable ODE | ✓ | Per-layer α/β/γ self-organise (loss 3.18, all-time best) |
 | Corrector plate | ✓ | Per-band phase correction after ODE (336 params, THD drops 4x) |
 | Architecture calculator | ✓ | `--recommend` analyzes data and suggests configuration |
 | 7 dynamic parameters | ✓ | Self-configuring with spring regulation |
-| 10 diagnostic monitors | ✓ | Full health suite via `--health-interval` |
+| 13 diagnostic monitors | ✓ | Full health suite via `--health-interval` (forward + backward decomposition) |
+| Wave-probe | ✓ | ODE scattering analysis binary: 10 modes, physics decomposition, checkpoint loading |
+| Parity test battery | ✓ | 15 test cases validating CPU/wgpu/candle produce identical physics |
+| Gradient checker | ✓ | `--check-gradients` validates analytical Jacobian (172/172 with FWM) |
 | CustomOp ODE backward | ✓ | Manual backward through RK4 — fastest at 384-dim (902ms) |
 | GPU duty cycle | ✓ | `--gpu-duty 50` for thermal/power management |
 | BPE tokenizer | ✓ | HuggingFace tokenizer.json format with disk caching |
-| Checkpoint save/load | ✓ | WCHK format with optimizer state, resume support |
+| Checkpoint save/load | ✓ | WCHK v4 format — persists chi, optimizer state, resume on any tier |
 | Asymmetric coupling | ✓ | Independent `--alpha` and `--beta` for cross/self coupling |
 | Progressive dim scaling | ✓ | Scale trained checkpoints to larger dimensions (`--scale`) |
 | Curriculum training | ✓ | Soft-mask band unlocking, LN-safe at 24 layers |
@@ -439,7 +447,7 @@ x = x + attention(LN(x)) + FFN(LN(x))
 input → maestro_in (768→16→768) → [AGC] → ODE (RK4-16) → [corrector] → maestro_out (768→16→768) → out_proj
 ```
 
-The maestro layers are learned bottleneck coordinators (dim=16, a universal constant validated across 128-dim to 1536-dim). The ODE evolves coupled oscillator bands through nonlinear Kerr dynamics — self-phase modulation (α), cross-phase modulation (β), and nearest-neighbour coupling. The corrector plate applies per-band phase corrections after the ODE (336 params, zero-init, magnitude-preserving).
+The maestro layers are learned bottleneck coordinators (dim=16, a universal constant validated across 128-dim to 1536-dim). The ODE evolves coupled oscillator bands through nonlinear Kerr dynamics — self-phase modulation (α), cross-phase modulation (β), nearest-neighbour coupling, and four-wave mixing (χ) for Hamiltonian energy-conserving cubic band interactions. The corrector plate applies per-band phase corrections after the ODE (336 params, zero-init, magnitude-preserving).
 
 With learnable ODE, each layer self-organises its own coupling: L0 as per-band specialist (high α), L1-L3 as cross-band specialists (low α, high β). No load balancer needed — the model IS its own load balancer.
 
@@ -480,11 +488,12 @@ src/
 │   ├── generate.rs          Text generation (--generate)
 │   ├── analyze.rs           Wave structure diagnostics (--analyze)
 │   ├── scale.rs             Progressive dimension scaling (--scale)
-│   ├── checkpoint.rs        WCHK v3 checkpoint save/load (feature flags)
+│   ├── checkpoint.rs        WCHK v4 checkpoint save/load (persists chi)
+│   ├── ode_parity.rs        Parity test battery (15 cases, all tiers)
 │   ├── data_loader.rs       Text, JSONL, directory loading
 │   ├── dims.rs              Dimension constants + Dims struct
 │   ├── help.rs              CLI help text
-│   └── *_monitor.rs         10 diagnostic monitors
+│   └── *_monitor.rs         13 diagnostic monitors
 ├── cpu/
 │   ├── forward.rs           Forward pass with cache
 │   ├── model_backward.rs    Backward pass, gradient computation
@@ -500,6 +509,9 @@ src/
 │   ├── ops_backward.rs      Backward ops (analytical gradients)
 │   ├── diagnostics.rs       GPU diagnostic + validation
 │   └── ...                  buffers, resident, ffn_gpu, ffn_full_gpu
+├── bin/
+│   └── wave_probe.rs        ODE scattering analysis (10 modes, physics decomposition)
+├── lib.rs                   Library target (shared module tree for binaries)
 ├── candle_tier/             NVIDIA CUDA backend
 │   ├── engine.rs            Module re-exports
 │   ├── candle_model.rs      Model struct + constructor
@@ -509,6 +521,7 @@ src/
 │   ├── candle_checkpoint.rs WCHK ↔ safetensors conversion
 │   ├── candle_monitors.rs   Monitor data extraction
 │   ├── custom_ode.rs        CustomOp1 — manual backward, no graph
+│   ├── cuda_ode.rs          Fused CUDA kernel — AGC+RK4+FWM forward+backward
 │   ├── ode.rs               GPU-native RK4 ODE (autograd path)
 │   └── block_diag.rs        Block-diagonal linear
 ├── serve_tier/              OpenAI-compatible API server
@@ -527,6 +540,8 @@ Validated through testing and documented honestly (12 corrections + 1 null):
 - **Two-bottleneck model.** Architecture needs BOTH sufficient bands AND sufficient attention heads. Fixing one without the other gives zero improvement (proven by 8H8L grammar test).
 - **The model self-organises per task.** Arithmetic: sharp β/α split, early-binding. Words: gradual ramp, late-binding. Grammar: weak coupling, capacity-limited.
 - **Dead bands are coupling relays.** Can't remove them — 70 bands → 42/55 accuracy.
+- **Four-wave mixing works.** Hamiltonian energy-conserving cubic coupling between band quartets. FWM is 8-10% of the ODE derivative at chi=0.03 and grows during training. Top FWM flux bands migrate as the model learns — goal-directed band mixing, not passive coupling.
+- **FWM accelerates alpha-collapse.** Both FWM and non-FWM models converge to the same structural pattern (deep layers suppress alpha, amplify beta), but FWM models differentiate layers more aggressively.
 - **Corrector plate.** 336 params (0.1% of model) of per-band phase rotation after ODE reduces THD 4x. Inspired by Schmidt corrector optics.
 - **7 architectural invariants** confirmed across all configurations.
 
