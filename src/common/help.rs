@@ -84,9 +84,10 @@ pub fn print_help() {
     println!("    --monitor         Enable per-section pipeline timing (forward profiling)");
     println!("    --debug-nan       Enable per-layer NaN detection (Candle only, ~6x slower)");
     println!("    --health-interval N  Full diagnostic suite every N iters (0=off)    [default: 0]");
-    println!("                        12 monitors: attention heads, layer flow, gradient breakdown,");
+    println!("                        13 monitors: attention heads, layer flow, gradient breakdown,");
     println!("                        embedding space (iter 0 only), output distribution, ODE dynamics,");
-    println!("                        ODE decomposition (damping/phase/FWM per layer), I/Q analysis,");
+    println!("                        ODE forward decomposition (damping/phase/FWM per layer),");
+    println!("                        ODE backward decomposition (gradient flow per physics term),");
     println!("                        dynamic param trajectories, curriculum transitions,");
     println!("                        checkpoint drift, throughput. All in JSONL.");
     println!("    --freeze-ode        Freeze ODE params (identity backward — legacy behaviour)");
@@ -185,7 +186,8 @@ pub fn print_help() {
     println!();
     println!("    --check-gradients   Finite-difference gradient checker for ODE backward pass.");
     println!("                        Runs at given config, reports PASS/FAIL per parameter.");
-    println!("                        171/171 at 84 bands. Warns if chi>0 (FWM Jacobian is zero).");
+    println!("                        Includes FWM Jacobian: tests d_input, d_alpha, d_beta,");
+    println!("                        d_gamma, d_chi. 172/172 at 84 bands with chi=0.03.");
     println!("    --sub-harmonic      Include sub-harmonic diagnostics (with --analyze)");
     println!("    --ode-monitor       Show raw per-band ODE data for a prompt");
     println!("    --compare TEXT      Compare two prompts in ODE monitor mode");
