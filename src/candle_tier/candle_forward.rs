@@ -151,7 +151,7 @@ pub mod forward {
                     let param_grads = self.ode_param_grads.as_ref()
                         .expect("CUDA kernel requires ode_param_grads on model").clone();
                     let op = crate::candle_tier::cuda_ode::cuda_ode::KerrOdeCudaOp::new(
-                        gamma_raw, omega, alpha_v, beta_v, rk4_w,
+                        gamma_raw, omega, alpha_v, beta_v, block.gpu_ode_params.chi, rk4_w,
                         block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
                         f32::MAX, // AGC disabled — differentiable AGC already applied above
                         param_grads,
@@ -446,7 +446,7 @@ pub mod forward {
                     let param_grads = self.ode_param_grads.as_ref()
                         .expect("CUDA kernel requires ode_param_grads on model").clone();
                     let op = crate::candle_tier::cuda_ode::cuda_ode::KerrOdeCudaOp::new(
-                        gamma_raw, omega, alpha_v, beta_v, rk4_w,
+                        gamma_raw, omega, alpha_v, beta_v, block.gpu_ode_params.chi, rk4_w,
                         block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
                         f32::MAX, // AGC disabled — differentiable AGC already applied above
                         param_grads,

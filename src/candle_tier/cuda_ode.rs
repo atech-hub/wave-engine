@@ -17,8 +17,79 @@ pub mod cuda_ode {
     use cudarc::driver::PushKernelArg;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    /// Forward CUDA kernel — fused AGC + RK4 integration.
-    const CUDA_ODE_FWD_SRC: &str = r#"
+    /// FWM device helper — shared between forward and backward kernel sources.
+    /// Each band accumulates up to 8 quartet-role memberships (4 roles x 2 families).
+    const CUDA_FWM_DEVICE_FN: &str = r#"
+__device__ inline void compute_fwm_band(
+    int band, int n, float chi,
+    const float* __restrict__ sr, const float* __restrict__ ss,
+    float* fwm_dr_out, float* fwm_ds_out
+) {
+    float fdr = 0.0f, fds = 0.0f;
+    // Family A: quartet (k-2, k+1, k-1, k)
+    // Role a (band == k-2): k = band+2
+    if (band + 2 >= 2 && band + 2 < n - 1) {
+        int kv = band + 2; int b = kv+1, c = kv-1, d = kv;
+        float rb=sr[b],sb=ss[b],rc=sr[c],sc=ss[c],rd=sr[d],sd=ss[d];
+        float pcr=rc*rd-sc*sd, pci=rc*sd+sc*rd;
+        fdr += chi*(rb*pci - sb*pcr); fds -= chi*(rb*pcr + sb*pci);
+    }
+    // Role b (band == k+1): k = band-1
+    if (band - 1 >= 2 && band - 1 < n - 1) {
+        int kv = band - 1; int a = kv-2, c = kv-1, d = kv;
+        float ra=sr[a],sa=ss[a],rc=sr[c],sc=ss[c],rd=sr[d],sd=ss[d];
+        float pcr=rc*rd-sc*sd, pci=rc*sd+sc*rd;
+        fdr += chi*(ra*pci - sa*pcr); fds -= chi*(ra*pcr + sa*pci);
+    }
+    // Role c (band == k-1): k = band+1
+    if (band + 1 >= 2 && band + 1 < n - 1) {
+        int kv = band + 1; int a = kv-2, b = kv+1, d = kv;
+        float ra=sr[a],sa=ss[a],rb=sr[b],sb=ss[b],rd=sr[d],sd=ss[d];
+        float par=ra*rb-sa*sb, pai=ra*sb+sa*rb;
+        fdr += chi*(pai*rd - par*sd); fds -= chi*(par*rd + pai*sd);
+    }
+    // Role d (band == k): k = band
+    if (band >= 2 && band < n - 1) {
+        int kv = band; int a = kv-2, b = kv+1, c = kv-1;
+        float ra=sr[a],sa=ss[a],rb=sr[b],sb=ss[b],rc=sr[c],sc=ss[c];
+        float par=ra*rb-sa*sb, pai=ra*sb+sa*rb;
+        fdr += chi*(pai*rc - par*sc); fds -= chi*(par*rc + pai*sc);
+    }
+    // Family B: quartet (k-1, k+2, k, k+1)
+    // Role a (band == k-1): k = band+1
+    if (band + 1 >= 1 && band + 1 < n - 2) {
+        int kv = band + 1; int b = kv+2, c = kv, d = kv+1;
+        float rb=sr[b],sb=ss[b],rc=sr[c],sc=ss[c],rd=sr[d],sd=ss[d];
+        float pcr=rc*rd-sc*sd, pci=rc*sd+sc*rd;
+        fdr += chi*(rb*pci - sb*pcr); fds -= chi*(rb*pcr + sb*pci);
+    }
+    // Role b (band == k+2): k = band-2
+    if (band - 2 >= 1 && band - 2 < n - 2) {
+        int kv = band - 2; int a = kv-1, c = kv, d = kv+1;
+        float ra=sr[a],sa=ss[a],rc=sr[c],sc=ss[c],rd=sr[d],sd=ss[d];
+        float pcr=rc*rd-sc*sd, pci=rc*sd+sc*rd;
+        fdr += chi*(ra*pci - sa*pcr); fds -= chi*(ra*pcr + sa*pci);
+    }
+    // Role c (band == k): k = band
+    if (band >= 1 && band < n - 2) {
+        int kv = band; int a = kv-1, b = kv+2, d = kv+1;
+        float ra=sr[a],sa=ss[a],rb=sr[b],sb=ss[b],rd=sr[d],sd=ss[d];
+        float par=ra*rb-sa*sb, pai=ra*sb+sa*rb;
+        fdr += chi*(pai*rd - par*sd); fds -= chi*(par*rd + pai*sd);
+    }
+    // Role d (band == k+1): k = band-1
+    if (band - 1 >= 1 && band - 1 < n - 2) {
+        int kv = band - 1; int a = kv-1, b = kv+2, c = kv;
+        float ra=sr[a],sa=ss[a],rb=sr[b],sb=ss[b],rc=sr[c],sc=ss[c];
+        float par=ra*rb-sa*sb, pai=ra*sb+sa*rb;
+        fdr += chi*(pai*rc - par*sc); fds -= chi*(par*rc + pai*sc);
+    }
+    *fwm_dr_out = fdr; *fwm_ds_out = fds;
+}
+"#;
+
+    /// Forward CUDA kernel — fused AGC + RK4 integration with FWM.
+    const CUDA_ODE_FWD_KERNEL: &str = r#"
 extern "C" __global__ void kerr_ode_fwd(
     const float* __restrict__ input,
     float* __restrict__ output,
@@ -26,7 +97,7 @@ extern "C" __global__ void kerr_ode_fwd(
     const float* __restrict__ gamma,
     const float* __restrict__ omega,
     const float* __restrict__ rk4_w,
-    float agc_ceiling, float alpha, float beta,
+    float agc_ceiling, float alpha, float beta, float chi,
     int n_bands, int n_steps
 ) {
     const int pos = blockIdx.x;
@@ -46,48 +117,67 @@ extern "C" __global__ void kerr_ode_fwd(
     const float g = gamma[k], w = omega[k];
     const float w0 = rk4_w[0], w1 = rk4_w[1], w2 = rk4_w[2], w3 = rk4_w[3];
     extern __shared__ float smem[];
+    float* smem_mag = smem;
+    float* smem_r = smem + n_bands;
+    float* smem_s = smem + 2 * n_bands;
 
     for (int step = 0; step < n_steps; step++) {
         state_cache[(pos * n_steps + step) * embd + k * 2]     = r;
         state_cache[(pos * n_steps + step) * embd + k * 2 + 1] = s;
 
         // k1
-        smem[k] = r*r + s*s; __syncthreads();
+        smem_mag[k] = r*r + s*s; smem_r[k] = r; smem_s[k] = s; __syncthreads();
         float ns = 0.0f;
-        if (k>=2) ns += smem[k-2]; if (k>=1) ns += smem[k-1];
-        if (k+1<n_bands) ns += smem[k+1]; if (k+2<n_bands) ns += smem[k+2];
-        float phi = w + alpha*smem[k] + beta*ns;
+        if (k>=2) ns += smem_mag[k-2]; if (k>=1) ns += smem_mag[k-1];
+        if (k+1<n_bands) ns += smem_mag[k+1]; if (k+2<n_bands) ns += smem_mag[k+2];
+        float phi = w + alpha*smem_mag[k] + beta*ns;
         float k1r = -g*r - phi*s, k1s = -g*s + phi*r;
+        if (chi != 0.0f && n_bands > 4) {
+            float fdr, fds; compute_fwm_band(k, n_bands, chi, smem_r, smem_s, &fdr, &fds);
+            k1r += fdr; k1s += fds;
+        }
         __syncthreads();
 
         // k2
         float r2=r+0.5f*dt*k1r, s2=s+0.5f*dt*k1s;
-        smem[k] = r2*r2+s2*s2; __syncthreads();
+        smem_mag[k] = r2*r2+s2*s2; smem_r[k] = r2; smem_s[k] = s2; __syncthreads();
         ns=0.0f;
-        if (k>=2) ns+=smem[k-2]; if (k>=1) ns+=smem[k-1];
-        if (k+1<n_bands) ns+=smem[k+1]; if (k+2<n_bands) ns+=smem[k+2];
-        phi = w+alpha*smem[k]+beta*ns;
+        if (k>=2) ns+=smem_mag[k-2]; if (k>=1) ns+=smem_mag[k-1];
+        if (k+1<n_bands) ns+=smem_mag[k+1]; if (k+2<n_bands) ns+=smem_mag[k+2];
+        phi = w+alpha*smem_mag[k]+beta*ns;
         float k2r=-g*r2-phi*s2, k2s=-g*s2+phi*r2;
+        if (chi != 0.0f && n_bands > 4) {
+            float fdr, fds; compute_fwm_band(k, n_bands, chi, smem_r, smem_s, &fdr, &fds);
+            k2r += fdr; k2s += fds;
+        }
         __syncthreads();
 
         // k3
         float r3=r+0.5f*dt*k2r, s3=s+0.5f*dt*k2s;
-        smem[k] = r3*r3+s3*s3; __syncthreads();
+        smem_mag[k] = r3*r3+s3*s3; smem_r[k] = r3; smem_s[k] = s3; __syncthreads();
         ns=0.0f;
-        if (k>=2) ns+=smem[k-2]; if (k>=1) ns+=smem[k-1];
-        if (k+1<n_bands) ns+=smem[k+1]; if (k+2<n_bands) ns+=smem[k+2];
-        phi = w+alpha*smem[k]+beta*ns;
+        if (k>=2) ns+=smem_mag[k-2]; if (k>=1) ns+=smem_mag[k-1];
+        if (k+1<n_bands) ns+=smem_mag[k+1]; if (k+2<n_bands) ns+=smem_mag[k+2];
+        phi = w+alpha*smem_mag[k]+beta*ns;
         float k3r=-g*r3-phi*s3, k3s=-g*s3+phi*r3;
+        if (chi != 0.0f && n_bands > 4) {
+            float fdr, fds; compute_fwm_band(k, n_bands, chi, smem_r, smem_s, &fdr, &fds);
+            k3r += fdr; k3s += fds;
+        }
         __syncthreads();
 
         // k4
         float r4=r+dt*k3r, s4=s+dt*k3s;
-        smem[k] = r4*r4+s4*s4; __syncthreads();
+        smem_mag[k] = r4*r4+s4*s4; smem_r[k] = r4; smem_s[k] = s4; __syncthreads();
         ns=0.0f;
-        if (k>=2) ns+=smem[k-2]; if (k>=1) ns+=smem[k-1];
-        if (k+1<n_bands) ns+=smem[k+1]; if (k+2<n_bands) ns+=smem[k+2];
-        phi = w+alpha*smem[k]+beta*ns;
+        if (k>=2) ns+=smem_mag[k-2]; if (k>=1) ns+=smem_mag[k-1];
+        if (k+1<n_bands) ns+=smem_mag[k+1]; if (k+2<n_bands) ns+=smem_mag[k+2];
+        phi = w+alpha*smem_mag[k]+beta*ns;
         float k4r=-g*r4-phi*s4, k4s=-g*s4+phi*r4;
+        if (chi != 0.0f && n_bands > 4) {
+            float fdr, fds; compute_fwm_band(k, n_bands, chi, smem_r, smem_s, &fdr, &fds);
+            k4r += fdr; k4s += fds;
+        }
         __syncthreads();
 
         r += dt*(w0*k1r + w1*k2r + w2*k3r + w3*k4r);
@@ -101,7 +191,7 @@ extern "C" __global__ void kerr_ode_fwd(
     /// Backward CUDA kernel — gather-pattern deriv_backward through RK4.
     /// Recomputes k-values from cached states (no extra memory from forward).
     /// Shared memory: 5 × n_bands floats (s_mag, s_ddr, s_dds, s_r, s_s).
-    const CUDA_ODE_BWD_SRC: &str = r#"
+    const CUDA_ODE_BWD_KERNEL: &str = r#"
 extern "C" __global__ void kerr_ode_bwd(
     const float* __restrict__ d_output,      // [n_pos, n_embd]
     const float* __restrict__ state_cache,   // [n_pos, n_steps, n_embd]
@@ -114,7 +204,7 @@ extern "C" __global__ void kerr_ode_bwd(
     const float* __restrict__ omega,         // [n_bands]
     const float* __restrict__ gamma_raw,     // [n_bands] for softplus derivative
     const float* __restrict__ rk4_w,         // [4]
-    float alpha, float beta,
+    float alpha, float beta, float chi,
     int n_bands, int n_steps
 ) {
     const int pos = blockIdx.x;
@@ -153,42 +243,58 @@ extern "C" __global__ void kerr_ode_bwd(
         // ════════ Recompute k1, k2, k3, k4 from (r0, s0) ════════
 
         // k1 at (r0, s0)
-        s_mag[k] = r0*r0 + s0*s0; __syncthreads();
+        s_mag[k] = r0*r0 + s0*s0; s_r[k] = r0; s_s[k] = s0; __syncthreads();
         float ns1 = 0.0f;
         if (k>=2) ns1 += s_mag[k-2]; if (k>=1) ns1 += s_mag[k-1];
         if (k+1<n_bands) ns1 += s_mag[k+1]; if (k+2<n_bands) ns1 += s_mag[k+2];
         float phi1 = w_k + alpha*s_mag[k] + beta*ns1;
         float k1r = -g*r0 - phi1*s0, k1s = -g*s0 + phi1*r0;
+        if (chi != 0.0f && n_bands > 4) {
+            float fdr, fds; compute_fwm_band(k, n_bands, chi, s_r, s_s, &fdr, &fds);
+            k1r += fdr; k1s += fds;
+        }
         __syncthreads();
 
         // k2 at (r0 + 0.5*dt*k1)
         float r2 = r0+0.5f*dt*k1r, s2 = s0+0.5f*dt*k1s;
-        s_mag[k] = r2*r2+s2*s2; __syncthreads();
+        s_mag[k] = r2*r2+s2*s2; s_r[k] = r2; s_s[k] = s2; __syncthreads();
         float ns2 = 0.0f;
         if (k>=2) ns2 += s_mag[k-2]; if (k>=1) ns2 += s_mag[k-1];
         if (k+1<n_bands) ns2 += s_mag[k+1]; if (k+2<n_bands) ns2 += s_mag[k+2];
         float phi2 = w_k+alpha*s_mag[k]+beta*ns2;
         float k2r = -g*r2-phi2*s2, k2s = -g*s2+phi2*r2;
+        if (chi != 0.0f && n_bands > 4) {
+            float fdr, fds; compute_fwm_band(k, n_bands, chi, s_r, s_s, &fdr, &fds);
+            k2r += fdr; k2s += fds;
+        }
         __syncthreads();
 
         // k3 at (r0 + 0.5*dt*k2)
         float r3 = r0+0.5f*dt*k2r, s3 = s0+0.5f*dt*k2s;
-        s_mag[k] = r3*r3+s3*s3; __syncthreads();
+        s_mag[k] = r3*r3+s3*s3; s_r[k] = r3; s_s[k] = s3; __syncthreads();
         float ns3 = 0.0f;
         if (k>=2) ns3 += s_mag[k-2]; if (k>=1) ns3 += s_mag[k-1];
         if (k+1<n_bands) ns3 += s_mag[k+1]; if (k+2<n_bands) ns3 += s_mag[k+2];
         float phi3 = w_k+alpha*s_mag[k]+beta*ns3;
         float k3r = -g*r3-phi3*s3, k3s = -g*s3+phi3*r3;
+        if (chi != 0.0f && n_bands > 4) {
+            float fdr, fds; compute_fwm_band(k, n_bands, chi, s_r, s_s, &fdr, &fds);
+            k3r += fdr; k3s += fds;
+        }
         __syncthreads();
 
         // k4 at (r0 + dt*k3)
         float r4 = r0+dt*k3r, s4 = s0+dt*k3s;
-        s_mag[k] = r4*r4+s4*s4; __syncthreads();
+        s_mag[k] = r4*r4+s4*s4; s_r[k] = r4; s_s[k] = s4; __syncthreads();
         float ns4 = 0.0f;
         if (k>=2) ns4 += s_mag[k-2]; if (k>=1) ns4 += s_mag[k-1];
         if (k+1<n_bands) ns4 += s_mag[k+1]; if (k+2<n_bands) ns4 += s_mag[k+2];
         float phi4 = w_k+alpha*s_mag[k]+beta*ns4;
         float k4r = -g*r4-phi4*s4, k4s = -g*s4+phi4*r4;
+        if (chi != 0.0f && n_bands > 4) {
+            float fdr, fds; compute_fwm_band(k, n_bands, chi, s_r, s_s, &fdr, &fds);
+            k4r += fdr; k4s += fds;
+        }
         __syncthreads();
 
         // ════════ RK4 backward ════════
@@ -346,7 +452,8 @@ extern "C" __global__ void kerr_ode_bwd(
 
     fn get_fwd_ptx() -> &'static str {
         COMPILED_FWD_PTX.get_or_init(|| {
-            let ptx = cudarc::nvrtc::compile_ptx(CUDA_ODE_FWD_SRC)
+            let src = format!("{}{}", CUDA_FWM_DEVICE_FN, CUDA_ODE_FWD_KERNEL);
+            let ptx = cudarc::nvrtc::compile_ptx(&src)
                 .expect("CUDA ODE forward kernel compilation failed");
             ptx.to_src()
         })
@@ -354,7 +461,8 @@ extern "C" __global__ void kerr_ode_bwd(
 
     fn get_bwd_ptx() -> &'static str {
         COMPILED_BWD_PTX.get_or_init(|| {
-            let ptx = cudarc::nvrtc::compile_ptx(CUDA_ODE_BWD_SRC)
+            let src = format!("{}{}", CUDA_FWM_DEVICE_FN, CUDA_ODE_BWD_KERNEL);
+            let ptx = cudarc::nvrtc::compile_ptx(&src)
                 .expect("CUDA ODE backward kernel compilation failed");
             ptx.to_src()
         })
@@ -393,6 +501,7 @@ extern "C" __global__ void kerr_ode_bwd(
         omega: Vec<f32>,         // [n_bands]
         alpha: f32,
         beta: f32,
+        chi: f32,                // four-wave mixing strength (0.0 = off)
         rk4_weights: [f32; 4],
         rk4_steps: usize,
         n_bands: usize,
@@ -405,13 +514,13 @@ extern "C" __global__ void kerr_ode_bwd(
     impl KerrOdeCudaOp {
         pub fn new(
             gamma_raw: Vec<f32>, omega: Vec<f32>,
-            alpha: f32, beta: f32, rk4_weights: [f32; 4],
+            alpha: f32, beta: f32, chi: f32, rk4_weights: [f32; 4],
             rk4_steps: usize, n_bands: usize, layer_idx: usize,
             agc_ceiling: f32, param_grads: SharedParamGrads,
         ) -> Self {
             let gamma = gamma_raw.iter().map(|&g| crate::common::math::softplus(g)).collect();
             Self {
-                gamma, gamma_raw, omega, alpha, beta, rk4_weights,
+                gamma, gamma_raw, omega, alpha, beta, chi, rk4_weights,
                 rk4_steps, n_bands, layer_idx, agc_ceiling,
                 cache: Arc::new(Mutex::new(None)),
                 param_grads,
@@ -427,7 +536,7 @@ extern "C" __global__ void kerr_ode_bwd(
                 rk4_n_steps: self.rk4_steps,
                 phase_correction: vec![0.0; self.n_bands],
                 rk4_weights: self.rk4_weights,
-                chi: 0.0,
+                chi: self.chi,
             }
         }
     }
@@ -489,7 +598,7 @@ extern "C" __global__ void kerr_ode_bwd(
             let cfg = cudarc::driver::LaunchConfig {
                 grid_dim: (n_pos as u32, 1, 1),
                 block_dim: (self.n_bands as u32, 1, 1),
-                shared_mem_bytes: (self.n_bands * std::mem::size_of::<f32>()) as u32,
+                shared_mem_bytes: (3 * self.n_bands * std::mem::size_of::<f32>()) as u32,
             };
             let mut builder = func.builder();
             builder.arg(input_slice);
@@ -501,6 +610,7 @@ extern "C" __global__ void kerr_ode_bwd(
             builder.arg(&self.agc_ceiling);
             builder.arg(&self.alpha);
             builder.arg(&self.beta);
+            builder.arg(&self.chi);
             let n_bands_i32 = self.n_bands as i32;
             let n_steps_i32 = self.rk4_steps as i32;
             builder.arg(&n_bands_i32);
@@ -597,6 +707,7 @@ extern "C" __global__ void kerr_ode_bwd(
             builder.arg(&d_rk4_w);
             builder.arg(&self.alpha);
             builder.arg(&self.beta);
+            builder.arg(&self.chi);
             let n_bands_i32 = self.n_bands as i32;
             let n_steps_i32 = self.rk4_steps as i32;
             builder.arg(&n_bands_i32);
