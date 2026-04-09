@@ -236,6 +236,16 @@ pub fn run_training(config: TrainConfig) {
     // Tier identification for monitor tagging
     let compute_tier = if config.use_gpu { "wgpu" } else { "cpu" };
 
+    // Framework monitor — build canonical pairs once (reused at every health interval)
+    let fw_test_tokens = {
+        let (ids, _vs) = crate::common::framework_monitor::tokenize_test_text(vocab_size);
+        ids
+    };
+    let fw_test_strings: Vec<String> = crate::common::framework_monitor::FRAMEWORK_TEST_TEXT
+        .chars().map(|c| c.to_string()).collect();
+    let (fw_related, fw_random, fw_labels) =
+        crate::common::framework_monitor::build_canonical_pairs(&fw_test_strings);
+
     // JSONL telemetry — derive from checkpoint name or use explicit --log-name
     let log_name = config.log_name.clone().unwrap_or_else(|| {
         let tier = if config.use_gpu { "wgpu" } else { "cpu" };
@@ -592,6 +602,41 @@ pub fn run_training(config: TrainConfig) {
             let bwd_json = crate::common::ode_backward_monitor::to_json(&bwd_stats, compute_tier);
             let _ = writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, bwd_json);
             let _ = log_writer.flush();
+
+            // Framework monitor — harmonic coherence + band census + phase clustering
+            // Uses training data sample positions (works for any task/vocab)
+            {
+                let all_layer_hidden: Vec<Vec<Vec<f32>>> = sample_cache.block_caches.iter()
+                    .map(|bc| bc.input.clone()).collect();
+                let t = sample_cache.post_ln_f.len();
+                // Adjacent positions as "related", distant as "random"
+                let mut rel = Vec::new();
+                let mut labs = Vec::new();
+                for i in (0..t.min(10)).step_by(2) {
+                    if i + 1 < t {
+                        rel.push((vec![i], vec![i + 1]));
+                        labs.push(format!("pos{}/{}", i, i + 1));
+                    }
+                }
+                let mut rand = Vec::new();
+                for i in 0..t.min(5) {
+                    let j = (i + t / 2) % t;
+                    if j != i { rand.push((vec![i], vec![j])); }
+                }
+
+                let fw_report = crate::common::framework_monitor::run_framework_scan(
+                    &all_layer_hidden, &sample_cache.post_ln_f,
+                    config.n_bands, &rel, &rand, &labs,
+                );
+                let fw_json = crate::common::framework_monitor::to_json(&fw_report);
+                let _ = writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, fw_json);
+                let _ = log_writer.flush();
+                if let Some(final_stats) = fw_report.per_layer.last() {
+                    eprintln!("  [FW] disc={:.1}x clustering={:.3} peak_layer={}",
+                        final_stats.discrimination_ratio, final_stats.phase_clustering,
+                        fw_report.dominant_depth_peak);
+                }
+            }
         }
 
         // NaN skip with post-mortem: discard batch, diagnose cause

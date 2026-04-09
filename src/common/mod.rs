@@ -49,3 +49,5 @@ pub mod data_loader;
 pub mod ode_backward;
 pub mod ode_backward_monitor;
 pub mod ode_parity;
+pub mod framework_monitor;
+pub mod galaxy_scan;
