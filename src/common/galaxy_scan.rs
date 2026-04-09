@@ -103,7 +103,12 @@ pub struct LayerSummary {
     pub total_pairs: usize,
     pub significant_by_type: Vec<(String, usize)>,
     pub triadic_count: usize,
-    pub fwm_quartet_count: usize,
+    pub fwm_quartet_total: usize,
+    pub fwm_quartet_preserved: usize,   // |deviation| < 0.1
+    pub fwm_quartet_created: usize,     // deviation > 0.1 (training added coherence)
+    pub fwm_quartet_broken: usize,      // deviation < -0.1 (training removed coherence)
+    pub fwm_quartet_significant: usize, // stored quartets (|dev| > 0.15)
+    pub fwm_mean_deviation: f32,
     pub sphere_fill_fraction: f32,
     pub sphere_center_fraction: f32,
     pub grid1_frac: f32,
@@ -302,37 +307,61 @@ fn scan_layer(
         }
     }
 
-    // Layer 3: FWM quartets (a+b=c+d constraint)
+    // Layer 3: FWM quartets (a+b=c+d constraint) with deviation from embedding baseline
+    //
+    // The multi-grid embedding provides structural coherence for some quartets
+    // (37% at default grids m1=5,m2=7). Training can increase or decrease
+    // coherence from this baseline. We measure SIGNED deviation:
+    //   positive = training created coherence (moved toward matching)
+    //   negative = training broke coherence (moved away from matching)
+    //
+    // Compute embedding baseline: phase_sum_diff for each quartet from the
+    // multi-grid embedding (deterministic, depends only on n_bands, m1, m2).
+    let half = n_bands / 2;
+    let embed_phases: Vec<f32> = (0..n_bands).map(|k| {
+        if k < half {
+            2.0 * std::f32::consts::PI * ((k + 1) % m1) as f32 / m1 as f32
+        } else {
+            2.0 * std::f32::consts::PI * (((k - half) + 1) % m2) as f32 / m2 as f32
+        }
+    }).collect();
+
     let mut fwm_quartets = Vec::new();
+    let mut fwm_total = 0usize;
+    let mut fwm_preserved = 0usize;  // |deviation| < 0.1
+    let mut fwm_created = 0usize;    // deviation > 0.1 (training added coherence)
+    let mut fwm_broken = 0usize;     // deviation < -0.1 (training removed coherence)
+    let mut fwm_dev_sum = 0.0f32;
+
     for a in 0..n_bands {
         for b in (a+1)..n_bands {
             let sum = a + b;
             for c in 0..n_bands {
                 let d = sum.wrapping_sub(c);
                 if d < n_bands && d > c && c != a && c != b && d != a && d != b {
-                    let pa: Vec<f32> = phases.iter().map(|p| p[a]).collect();
-                    let pb: Vec<f32> = phases.iter().map(|p| p[b]).collect();
-                    let pc: Vec<f32> = phases.iter().map(|p| p[c]).collect();
-                    let pd: Vec<f32> = phases.iter().map(|p| p[d]).collect();
-                    // Coherence at n=1 measures how well the quartet's phase
-                    // relationship is preserved. The embedding structurally gives
-                    // coherence=1.0 for all FWM quartets (omega is linear, so
-                    // a+b=c+d implies omega_a+omega_b=omega_c+omega_d exactly).
-                    // Training perturbs phases, so coherence < 1.0 means the ODE
-                    // moved this quartet away from the structural baseline.
-                    // We store all quartets and let the summary filter.
-                    let spec_ab = wa::harmonic_spectrum(&pa, &pb, 12);
-                    let spec_cd = wa::harmonic_spectrum(&pc, &pd, 12);
-                    let c1 = spec_ab[0].abs(); // n=1 coherence
-                    let c2 = spec_cd[0].abs();
-                    let mean_coh = (c1 + c2) / 2.0;
-                    // Store quartets where training perturbed the structure
-                    // (coherence dropped from the embedding's structural 1.0)
-                    if mean_coh < 0.95 {
+                    // Embedding baseline coherence for this quartet
+                    let base_diff = (embed_phases[a] + embed_phases[b]) - (embed_phases[c] + embed_phases[d]);
+                    let base_coh = base_diff.cos().abs();
+
+                    // Trained coherence: mean phase difference across positions
+                    let trained_diffs: Vec<f32> = phases.iter().map(|p| {
+                        ((p[a] + p[b]) - (p[c] + p[d])).cos()
+                    }).collect();
+                    let trained_coh = (trained_diffs.iter().sum::<f32>() / n_positions as f32).abs();
+
+                    let deviation = trained_coh - base_coh;
+                    fwm_total += 1;
+                    fwm_dev_sum += deviation;
+                    if deviation.abs() < 0.1 { fwm_preserved += 1; }
+                    else if deviation > 0.0 { fwm_created += 1; }
+                    else { fwm_broken += 1; }
+
+                    // Only store quartets with significant deviation (either direction)
+                    if deviation.abs() > 0.15 {
                         fwm_quartets.push(QuartetConstellation {
                             bands: [a, b, c, d],
                             fwm_index_sum: sum,
-                            mean_coherence_n4: mean_coh,
+                            mean_coherence_n4: trained_coh,
                         });
                     }
                 }
@@ -346,11 +375,18 @@ fn scan_layer(
     let center_frac = bands.iter().filter(|b| b.mean_magnitude < 0.1 * ceiling).count() as f32 / n_bands as f32;
     let total = grid_counts.iter().sum::<usize>().max(1) as f32;
 
+    let fwm_mean_dev = if fwm_total > 0 { fwm_dev_sum / fwm_total as f32 } else { 0.0 };
+
     let summary = LayerSummary {
         total_pairs: n_pairs,
         significant_by_type: sig_by_type,
         triadic_count: triads.len(),
-        fwm_quartet_count: fwm_quartets.len(),
+        fwm_quartet_total: fwm_total,
+        fwm_quartet_preserved: fwm_preserved,
+        fwm_quartet_created: fwm_created,
+        fwm_quartet_broken: fwm_broken,
+        fwm_quartet_significant: fwm_quartets.len(),
+        fwm_mean_deviation: fwm_mean_dev,
         sphere_fill_fraction: fill_frac,
         sphere_center_fraction: center_frac,
         grid1_frac: grid_counts[0] as f32 / total,
@@ -415,12 +451,14 @@ pub fn write_galaxy_map_json(scan: &GalaxyScan, path: &Path) -> std::io::Result<
         }
         write!(f, "],")?;
 
-        // Summary (includes full-matrix catalog counts)
+        // Summary (includes full-matrix catalog counts + FWM deviation stats)
         let sig: Vec<String> = layer.summary.significant_by_type.iter()
             .map(|(k, v)| format!(r#""{}":{}""#, k, v)).collect();
-        write!(f, r#""summary":{{"pairs":{},"triads":{},"quartets":{},"fill":{:.3},"center":{:.3},"catalog":{{{}}}, "grid":{{"g1":{:.3},"g2":{:.3},"comp":{:.3},"approx":{:.3}}}}}"#,
+        write!(f, r#""summary":{{"pairs":{},"triads":{},"fwm":{{"total":{},"preserved":{},"created":{},"broken":{},"significant":{},"mean_dev":{:.4}}},"fill":{:.3},"center":{:.3},"catalog":{{{}}}, "grid":{{"g1":{:.3},"g2":{:.3},"comp":{:.3},"approx":{:.3}}}}}"#,
             layer.summary.total_pairs, layer.summary.triadic_count,
-            layer.summary.fwm_quartet_count,
+            layer.summary.fwm_quartet_total, layer.summary.fwm_quartet_preserved,
+            layer.summary.fwm_quartet_created, layer.summary.fwm_quartet_broken,
+            layer.summary.fwm_quartet_significant, layer.summary.fwm_mean_deviation,
             layer.summary.sphere_fill_fraction, layer.summary.sphere_center_fraction,
             sig.join(","),
             layer.summary.grid1_frac, layer.summary.grid2_frac,
@@ -503,10 +541,13 @@ pub fn run_and_write_full_scan(
 pub fn print_summary(scan: &GalaxyScan) {
     if let Some(final_layer) = scan.layers.last() {
         let total_sig: usize = final_layer.summary.significant_by_type.iter().map(|(_, v)| v).sum();
-        eprintln!("  Galaxy map: {} sig pairs, {} triads, {} FWM quartets",
-            total_sig, final_layer.summary.triadic_count, final_layer.summary.fwm_quartet_count);
+        let s = &final_layer.summary;
+        eprintln!("  Galaxy: {} sig pairs, {} triads", total_sig, s.triadic_count);
+        eprintln!("  FWM quartets: {}/{} preserved, {} created, {} broken, mean_dev={:.4}",
+            s.fwm_quartet_preserved, s.fwm_quartet_total,
+            s.fwm_quartet_created, s.fwm_quartet_broken, s.fwm_mean_deviation);
         eprintln!("  Grid: g1={:.1}% g2={:.1}% comp={:.1}% approx={:.1}%",
-            final_layer.summary.grid1_frac * 100.0, final_layer.summary.grid2_frac * 100.0,
-            final_layer.summary.composite_frac * 100.0, final_layer.summary.approximate_frac * 100.0);
+            s.grid1_frac * 100.0, s.grid2_frac * 100.0,
+            s.composite_frac * 100.0, s.approximate_frac * 100.0);
     }
 }
