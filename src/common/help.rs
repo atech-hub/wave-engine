@@ -188,6 +188,13 @@ pub fn print_help() {
     println!("                        Runs at given config, reports PASS/FAIL per parameter.");
     println!("                        Includes FWM Jacobian: tests d_input, d_alpha, d_beta,");
     println!("                        d_gamma, d_chi. 172/172 at 84 bands with chi=0.03.");
+    println!("    --galaxy-scan       Generate a galaxy map of the learned harmonic structure.");
+    println!("                        Requires --resume <checkpoint>. Pure-band geometric scan:");
+    println!("                        per-band 3D positions, pairwise angular geometry with catalog");
+    println!("                        matching (11 relationship types), triads, FWM quartets,");
+    println!("                        multi-grid decomposition. Auto-runs at end of training.");
+    println!("                        Output: <checkpoint>_galaxy/ with galaxy_map.json,");
+    println!("                        galaxy_matrix.bin, phases.bin.");
     println!("    --sub-harmonic      Include sub-harmonic diagnostics (with --analyze)");
     println!("    --ode-monitor       Show raw per-band ODE data for a prompt");
     println!("    --compare TEXT      Compare two prompts in ODE monitor mode");
