@@ -111,6 +111,7 @@ pub struct LayerSummary {
     pub fwm_partial: usize,      // middle cases
     pub fwm_significant: usize,  // stored quartets
     pub fwm_mean_deviation: f32,
+    pub fwm_hist_2d: [[u32; 10]; 10], // [baseline_bin][trained_bin]
     pub sphere_fill_fraction: f32,
     pub sphere_center_fraction: f32,
     pub grid1_frac: f32,
@@ -340,6 +341,8 @@ fn scan_layer(
     let mut fwm_noise = 0usize;      // was-low, still-low
     let mut fwm_partial = 0usize;    // middle cases
     let mut fwm_dev_sum = 0.0f32;
+    // 2D histogram: (baseline_coh, trained_coh) in 10x10 bins [0,0.1),[0.1,0.2),...,[0.9,1.0]
+    let mut fwm_hist_2d = [[0u32; 10]; 10];
 
     for a in 0..n_bands {
         for b in (a+1)..n_bands {
@@ -360,6 +363,11 @@ fn scan_layer(
                     let deviation = trained_coh - base_coh;
                     fwm_total += 1;
                     fwm_dev_sum += deviation;
+
+                    // 2D histogram bin
+                    let bi = (base_coh * 10.0).min(9.0) as usize;
+                    let ti = (trained_coh * 10.0).min(9.0) as usize;
+                    fwm_hist_2d[bi][ti] += 1;
 
                     // 4-category: (baseline high/low) x (trained high/low)
                     if base_coh >= coh_high && trained_coh >= coh_high { fwm_preserved += 1; }
@@ -400,6 +408,7 @@ fn scan_layer(
         fwm_noise,
         fwm_partial,
         fwm_significant: fwm_quartets.len(),
+        fwm_hist_2d,
         fwm_mean_deviation: fwm_mean_dev,
         sphere_fill_fraction: fill_frac,
         sphere_center_fraction: center_frac,
@@ -467,7 +476,7 @@ pub fn write_galaxy_map_json(scan: &GalaxyScan, path: &Path) -> std::io::Result<
 
         // Summary (includes full-matrix catalog counts + FWM deviation stats)
         let sig: Vec<String> = layer.summary.significant_by_type.iter()
-            .map(|(k, v)| format!(r#""{}":{}""#, k, v)).collect();
+            .map(|(k, v)| format!("\"{}\":{}", k, v)).collect();
         write!(f, r#""summary":{{"pairs":{},"triads":{},"fwm":{{"total":{},"preserved":{},"destroyed":{},"created":{},"noise":{},"partial":{},"significant":{},"mean_dev":{:.4}}},"fill":{:.3},"center":{:.3},"catalog":{{{}}}, "grid":{{"g1":{:.3},"g2":{:.3},"comp":{:.3},"approx":{:.3}}}}}"#,
             layer.summary.total_pairs, layer.summary.triadic_count,
             layer.summary.fwm_quartet_total, layer.summary.fwm_preserved,
@@ -478,6 +487,19 @@ pub fn write_galaxy_map_json(scan: &GalaxyScan, path: &Path) -> std::io::Result<
             sig.join(","),
             layer.summary.grid1_frac, layer.summary.grid2_frac,
             layer.summary.composite_frac, layer.summary.approximate_frac)?;
+
+        // 2D histogram: [baseline_bin][trained_bin], 10x10
+        write!(f, r#","fwm_hist_2d":["#)?;
+        for (ri, row) in layer.summary.fwm_hist_2d.iter().enumerate() {
+            if ri > 0 { write!(f, ",")?; }
+            write!(f, "[")?;
+            for (ci, &val) in row.iter().enumerate() {
+                if ci > 0 { write!(f, ",")?; }
+                write!(f, "{}", val)?;
+            }
+            write!(f, "]")?;
+        }
+        write!(f, "]")?;
 
         write!(f, "}}")?;
     }
