@@ -86,3 +86,7 @@ analysis/
 results/
 data/corpus_expansion/
 CLAUDE.md
+
+# Galaxy scan output
+*_galaxy/
+galaxy_diff.*
