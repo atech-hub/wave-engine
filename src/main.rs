@@ -140,10 +140,13 @@ fn main() {
         );
         let all_hidden: Vec<Vec<Vec<f32>>> = cache.block_caches.iter()
             .map(|bc| bc.input.clone()).collect();
-        let agc_ceil = (std::f32::consts::FRAC_PI_2 / (alpha + 4.0 * beta)).sqrt().max(0.5);
+        // Per-layer AGC ceilings from learned alpha/beta
+        let per_layer_ceilings: Vec<f32> = model.blocks.iter()
+            .map(|b| (std::f32::consts::FRAC_PI_2 / (b.ffn.kerr.alpha + 4.0 * b.ffn.kerr.beta)).sqrt().max(0.5))
+            .collect();
         let galaxy_dir = std::path::PathBuf::from(resume.replace(".bin", "_galaxy"));
         match common::galaxy_scan::run_and_write_full_scan(
-            &all_hidden, &cache.post_ln_f, n_bands, agc_ceil, m1, m2, &galaxy_dir,
+            &all_hidden, &cache.post_ln_f, n_bands, &per_layer_ceilings, m1, m2, &galaxy_dir,
         ) {
             Ok(scan) => {
                 println!("Galaxy map written to: {}", galaxy_dir.display());

@@ -811,12 +811,15 @@ pub fn run_training(config: TrainConfig) {
         );
         let all_layer_hidden: Vec<Vec<Vec<f32>>> = scan_cache.block_caches.iter()
             .map(|bc| bc.input.clone()).collect();
-        let agc_ceil = (std::f32::consts::FRAC_PI_2 / (config.alpha + 4.0 * config.beta)).sqrt().max(0.5);
+        // Per-layer AGC ceilings from learned alpha/beta
+        let per_layer_ceilings: Vec<f32> = model.blocks.iter()
+            .map(|b| (std::f32::consts::FRAC_PI_2 / (b.ffn.kerr.alpha + 4.0 * b.ffn.kerr.beta)).sqrt().max(0.5))
+            .collect();
         let m1 = config.m1.unwrap_or(5);
         let m2 = config.m2.unwrap_or(7);
         match crate::common::galaxy_scan::run_and_write_full_scan(
             &all_layer_hidden, &scan_cache.post_ln_f,
-            config.n_bands, agc_ceil, m1, m2, &galaxy_dir,
+            config.n_bands, &per_layer_ceilings, m1, m2, &galaxy_dir,
         ) {
             Ok(scan) => {
                 eprintln!("Galaxy map: {}", galaxy_dir.display());

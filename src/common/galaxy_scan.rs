@@ -145,7 +145,7 @@ pub fn run_galaxy_scan(
     hidden_states: &[Vec<Vec<f32>>],  // per-layer [n_positions][n_embd]
     post_ln_f: &[Vec<f32>],
     n_bands: usize,
-    agc_ceiling: f32,
+    per_layer_ceilings: &[f32],  // one per layer + one for post_ln_f (use last layer's)
     m1: usize,
     m2: usize,
 ) -> GalaxyScan {
@@ -161,10 +161,15 @@ pub fn run_galaxy_scan(
 
     let mut layers = Vec::new();
     for (li, phases) in all_phases.iter().enumerate() {
-        layers.push(scan_layer(li, phases, all_hidden[li], n_bands, n_positions, agc_ceiling, m1, m2));
+        // Use per-layer ceiling, fallback to last available for post_ln_f layer
+        let ceiling = per_layer_ceilings.get(li)
+            .or_else(|| per_layer_ceilings.last())
+            .copied().unwrap_or(1.0);
+        layers.push(scan_layer(li, phases, all_hidden[li], n_bands, n_positions, ceiling, m1, m2));
     }
 
-    GalaxyScan { layers, n_bands, n_positions, agc_ceiling, m1, m2 }
+    let global_ceiling = per_layer_ceilings.first().copied().unwrap_or(1.0);
+    GalaxyScan { layers, n_bands, n_positions, agc_ceiling: global_ceiling, m1, m2 }
 }
 
 fn scan_layer(
@@ -553,12 +558,12 @@ pub fn run_and_write_full_scan(
     hidden_states: &[Vec<Vec<f32>>],
     post_ln_f: &[Vec<f32>],
     n_bands: usize,
-    agc_ceiling: f32,
+    per_layer_ceilings: &[f32],
     m1: usize,
     m2: usize,
     output_dir: &Path,
 ) -> std::io::Result<GalaxyScan> {
-    let scan = run_galaxy_scan(hidden_states, post_ln_f, n_bands, agc_ceiling, m1, m2);
+    let scan = run_galaxy_scan(hidden_states, post_ln_f, n_bands, per_layer_ceilings, m1, m2);
     std::fs::create_dir_all(output_dir)?;
     write_galaxy_map_json(&scan, &output_dir.join("galaxy_map.json"))?;
     write_galaxy_matrix_bin(&scan, &output_dir.join("galaxy_matrix.bin"))?;
