@@ -143,33 +143,48 @@ pub fn run_galaxy_scan(
 ) -> GalaxyScan {
     let n_positions = post_ln_f.len();
     let mut all_phases: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut all_hidden: Vec<&[Vec<f32>]> = Vec::new();
     for layer_hidden in hidden_states {
         all_phases.push(wa::extract_all_phases(layer_hidden, n_bands));
+        all_hidden.push(layer_hidden);
     }
     all_phases.push(wa::extract_all_phases(post_ln_f, n_bands));
+    all_hidden.push(post_ln_f);
 
     let mut layers = Vec::new();
     for (li, phases) in all_phases.iter().enumerate() {
-        layers.push(scan_layer(li, phases, n_bands, n_positions, agc_ceiling, m1, m2));
+        layers.push(scan_layer(li, phases, all_hidden[li], n_bands, n_positions, agc_ceiling, m1, m2));
     }
 
     GalaxyScan { layers, n_bands, n_positions, agc_ceiling, m1, m2 }
 }
 
 fn scan_layer(
-    layer: usize, phases: &[Vec<f32>], n_bands: usize, n_positions: usize,
+    layer: usize, phases: &[Vec<f32>], hidden: &[Vec<f32>],
+    n_bands: usize, n_positions: usize,
     ceiling: f32, m1: usize, m2: usize,
 ) -> LayerScan {
-    // Layer 0: Per-band profiles
+    // Layer 0: Per-band profiles with real magnitudes
     let mut bands = Vec::with_capacity(n_bands);
     for k in 0..n_bands {
         let band_phases: Vec<f32> = phases.iter().map(|p| p[k]).collect();
         let cv = wa::circular_variance(&band_phases);
         let mean_phase = band_phases.iter().map(|&p| p.sin()).sum::<f32>()
             .atan2(band_phases.iter().map(|&p| p.cos()).sum::<f32>());
-        // For magnitude, we'd need r,s not just phases. Use 1.0 as placeholder.
-        let mean_mag = 1.0 - cv * 0.5; // approximate: low CV = high effective magnitude
-        let boundary_dist = if ceiling > 0.0 { (ceiling - mean_mag) / ceiling } else { 1.0 };
+        // Real magnitude from hidden states: sqrt(r^2 + s^2) per position
+        let band_mags: Vec<f32> = hidden.iter().map(|h| {
+            if k * 2 + 1 < h.len() {
+                (h[k * 2] * h[k * 2] + h[k * 2 + 1] * h[k * 2 + 1]).sqrt()
+            } else { 0.0 }
+        }).collect();
+        let mean_mag = band_mags.iter().sum::<f32>() / band_mags.len().max(1) as f32;
+        let mag_min = band_mags.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mag_max = band_mags.iter().cloned().fold(0.0f32, f32::max);
+        let mag_std = {
+            let var = band_mags.iter().map(|&m| (m - mean_mag) * (m - mean_mag)).sum::<f32>() / band_mags.len().max(1) as f32;
+            var.sqrt()
+        };
+        let boundary_dist = if ceiling > 0.0 { (ceiling - mean_mag).max(0.0) / ceiling } else { 1.0 };
         let grid = if k < n_bands / 2 { "grid1" } else { "grid2" };
         let x = mean_mag * mean_phase.cos();
         let y = mean_mag * mean_phase.sin();
@@ -177,7 +192,7 @@ fn scan_layer(
         bands.push(BandProfile {
             index: k, position_3d: [x, y, z], mean_phase, mean_magnitude: mean_mag,
             circular_variance: cv, boundary_distance: boundary_dist,
-            grid_assignment: grid, mag_min: mean_mag * 0.8, mag_max: mean_mag * 1.2, mag_std: cv * 0.3,
+            grid_assignment: grid, mag_min, mag_max, mag_std,
         });
     }
 
@@ -299,11 +314,21 @@ fn scan_layer(
                     let pb: Vec<f32> = phases.iter().map(|p| p[b]).collect();
                     let pc: Vec<f32> = phases.iter().map(|p| p[c]).collect();
                     let pd: Vec<f32> = phases.iter().map(|p| p[d]).collect();
-                    let c1 = wa::best_harmonic_coherence(&pa, &pb, 12).0;
-                    let c2 = wa::best_harmonic_coherence(&pc, &pd, 12).0;
-                    let c3 = wa::best_harmonic_coherence(&pa, &pc, 12).0;
-                    let mean_coh = (c1 + c2 + c3) / 3.0;
-                    if mean_coh > 0.5 {
+                    // Coherence at n=1 measures how well the quartet's phase
+                    // relationship is preserved. The embedding structurally gives
+                    // coherence=1.0 for all FWM quartets (omega is linear, so
+                    // a+b=c+d implies omega_a+omega_b=omega_c+omega_d exactly).
+                    // Training perturbs phases, so coherence < 1.0 means the ODE
+                    // moved this quartet away from the structural baseline.
+                    // We store all quartets and let the summary filter.
+                    let spec_ab = wa::harmonic_spectrum(&pa, &pb, 12);
+                    let spec_cd = wa::harmonic_spectrum(&pc, &pd, 12);
+                    let c1 = spec_ab[0].abs(); // n=1 coherence
+                    let c2 = spec_cd[0].abs();
+                    let mean_coh = (c1 + c2) / 2.0;
+                    // Store quartets where training perturbed the structure
+                    // (coherence dropped from the embedding's structural 1.0)
+                    if mean_coh < 0.95 {
                         fwm_quartets.push(QuartetConstellation {
                             bands: [a, b, c, d],
                             fwm_index_sum: sum,
@@ -390,13 +415,14 @@ pub fn write_galaxy_map_json(scan: &GalaxyScan, path: &Path) -> std::io::Result<
         }
         write!(f, "],")?;
 
-        // Summary
+        // Summary (includes full-matrix catalog counts)
         let sig: Vec<String> = layer.summary.significant_by_type.iter()
             .map(|(k, v)| format!(r#""{}":{}""#, k, v)).collect();
-        write!(f, r#""summary":{{"pairs":{},"triads":{},"quartets":{},"fill":{:.3},"center":{:.3},"grid":{{"g1":{:.3},"g2":{:.3},"comp":{:.3},"approx":{:.3}}}}}"#,
+        write!(f, r#""summary":{{"pairs":{},"triads":{},"quartets":{},"fill":{:.3},"center":{:.3},"catalog":{{{}}}, "grid":{{"g1":{:.3},"g2":{:.3},"comp":{:.3},"approx":{:.3}}}}}"#,
             layer.summary.total_pairs, layer.summary.triadic_count,
             layer.summary.fwm_quartet_count,
             layer.summary.sphere_fill_fraction, layer.summary.sphere_center_fraction,
+            sig.join(","),
             layer.summary.grid1_frac, layer.summary.grid2_frac,
             layer.summary.composite_frac, layer.summary.approximate_frac)?;
 

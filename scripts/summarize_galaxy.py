@@ -44,7 +44,9 @@ def summarize_layer(layer_data, top_k=20, fwm_threshold=0.5):
         idx = min(int(cv * 10), 9)
         cv_hist[idx] += 1
 
-    # Relationship counts by catalog type
+    # Relationship counts by catalog type — from top_pairs (subset of full matrix)
+    # The full matrix counts are in summary.significant_by_type but that field
+    # uses a different format. Count from what we have in the JSON.
     cat_counts = {}
     no_match = 0
     for p in top_pairs:
@@ -53,6 +55,7 @@ def summarize_layer(layer_data, top_k=20, fwm_threshold=0.5):
             no_match += 1
         else:
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    # Note: these counts are from top-100 pairs only, not the full 3486
 
     # Grid distribution from summary
     grid = summary.get("grid", {})
