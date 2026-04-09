@@ -543,7 +543,47 @@ Validated through testing and documented honestly (12 corrections + 1 null):
 - **Four-wave mixing works.** Hamiltonian energy-conserving cubic coupling between band quartets. FWM is 8-10% of the ODE derivative at chi=0.03 and grows during training. Top FWM flux bands migrate as the model learns — goal-directed band mixing, not passive coupling.
 - **FWM accelerates alpha-collapse.** Both FWM and non-FWM models converge to the same structural pattern (deep layers suppress alpha, amplify beta), but FWM models differentiate layers more aggressively.
 - **Corrector plate.** 336 params (0.1% of model) of per-band phase rotation after ODE reduces THD 4x. Inspired by Schmidt corrector optics.
+- **Decoder determines learned geometry.** Phase-native preserves 5,866 FWM quartets and creates 1,404 novel ones from the embedding baseline. lm_head preserves zero and creates zero. The decoder choice — not the physics, not the data — is the dominant lever on what geometric structure survives training. Phase-native builds primary catalog relationships (squares, trines, oppositions); lm_head builds secondary aspects.
+- **Training is subtractive against the embedding.** The multi-grid harmonic embedding provides structural FWM quartet coherence at initialisation. Training selectively removes this structure, with the decoder controlling what survives. This is inverted from standard ML where models learn representations from scratch.
 - **7 architectural invariants** confirmed across all configurations.
+
+## Galaxy Scan
+
+Every training run automatically generates a **galaxy map** — a pure-band geometric inventory of the model's learned harmonic structure. The scan maps all 3,486 band pairs across 12 harmonics, detects triadic constellations and FWM quartets, classifies relationships against a [catalog of 11 geometric types](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive/blob/main/docs/geometric-relationship-catalog.md) drawn from the framework's mathematical foundations, and places every band in 3D coordinates within the AGC-bounded sphere.
+
+**What it measures:**
+
+The framework's core operator — `cos(n * (θ_a - θ_b))` — detects different relationship types at each harmonic `n`. The galaxy scan applies this systematically to every band pair at every layer, producing a complete map of the learned phase geometry. Relationships that the framework predicts (triads at n=3, squares at n=4, oppositions at n=2) appear organically in trained models without being explicitly encoded.
+
+**What it found:**
+
+Phase-native models build rich geometric structure at the output layer: 984 triads, 42,218 coherent FWM quartets, and catalog-matched relationships including squares (90°), trines (120°), and oppositions (180°). lm_head models on the same data build 9x fewer triads and a qualitatively different geometric vocabulary. The decoder choice shapes the entire model's learned geometry through backward gradient flow — a finding that connects directly to the framework's Proposition 3.5 (Cosine Similarity Blindness), which proves mathematically that aggregating harmonic channels into a single scalar destroys detectable relationships.
+
+**Output files** (in `<checkpoint>_galaxy/`):
+
+| File | Size | Contents |
+|------|------|----------|
+| `galaxy_map.json` | ~20 MB | Full scan: per-band profiles, top pairs, triads, FWM quartets, catalog matches, 3D coordinates |
+| `galaxy_matrix.bin` | ~650 KB | Complete pair coherence matrix at all 12 harmonics (GALX format) |
+| `phases.bin` | ~260 KB | Raw per-band per-position phases for retrospective analysis (PHAS format) |
+
+**Usage:**
+
+```bash
+# Auto-generates at end of every training run (no extra flags needed)
+wave-engine data/input.txt --iters 10000
+
+# Scan an existing checkpoint retrospectively
+wave-engine --galaxy-scan --resume checkpoint.bin --n-bands 84 --layers 4
+
+# Summarize a scan (Python, stdlib only)
+python scripts/summarize_galaxy.py checkpoint_galaxy/
+
+# Compare two scans
+python scripts/summarize_galaxy.py --compare model_a_galaxy/ model_b_galaxy/
+```
+
+The galaxy scan is the first instrument that makes the [Wave Coherence framework's](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive) harmonic relationships visible inside a trained neural network. The geometric relationship catalog used by the scan draws on angular mathematics formalised across multiple civilisations over thousands of years — the same circle divisions and relationship types independently discovered by traditions spanning continents and millennia, now appearing organically in the learned state of a wave-based neural architecture.
 
 ## Requirements
 
