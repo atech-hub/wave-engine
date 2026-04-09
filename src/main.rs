@@ -97,6 +97,63 @@ fn main() {
         return;
     }
 
+    // ─── Galaxy scan mode (retrospective on existing checkpoint) ───
+    if std::env::args().any(|a| a == "--galaxy-scan") {
+        fn pflag_gs<T: std::str::FromStr>(name: &str, default: T) -> T {
+            std::env::args().skip_while(|a| a != name).nth(1)
+                .and_then(|s| s.parse().ok()).unwrap_or(default)
+        }
+        let resume = std::env::args().skip_while(|a| a != "--resume").nth(1)
+            .expect("--galaxy-scan requires --resume <checkpoint>");
+        let data_path = std::env::args().skip_while(|a| a != "--scan-corpus").nth(1)
+            .or_else(|| {
+                // Try first positional arg that isn't a flag
+                std::env::args().skip(1).find(|a| !a.starts_with("--") && !a.starts_with('-'))
+            })
+            .unwrap_or_else(|| "data/input.txt".to_string());
+        let n_bands: usize = pflag_gs("--n-bands", 84);
+        let n_head: usize = pflag_gs("--n-head", 4);
+        let n_layers: usize = pflag_gs("--layers", 4);
+        let alpha: f32 = pflag_gs("--alpha", 0.1);
+        let beta: f32 = pflag_gs("--beta", 0.2);
+        let out_proj_groups: usize = pflag_gs("--out-proj-groups", 1);
+        let m1: usize = pflag_gs("--m1", 5);
+        let m2: usize = pflag_gs("--m2", 7);
+
+        let (params, ck_vocab, _, _, _, _, _, _, _, _, _ck_chi) = wave_checkpoint::load_checkpoint(&resume);
+        let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
+        let mut model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims, alpha, beta);
+        // Phase-native detection
+        let ext_count = count_trainable_ex(&model, false);
+        if params.len() < ext_count {
+            model.phase_native = true;
+            model.output_corrector = vec![0.0; n_bands];
+        }
+        unflatten_params_ex(&mut model, &params, false);
+
+        // Load test corpus (first 200 tokens of data file)
+        let (tokens, _vs) = common::data_loader::load_data(&data_path, false, None);
+        let scan_len = tokens.len().min(200).min(128); // clamp to block_size
+        let stencil = fft_ode::StencilFft::new(n_bands * 2);
+        let cache = crate::cpu::forward::forward_with_cache(
+            &model, &tokens[..scan_len], dims, None, None, None, Some(&stencil), None, None,
+        );
+        let all_hidden: Vec<Vec<Vec<f32>>> = cache.block_caches.iter()
+            .map(|bc| bc.input.clone()).collect();
+        let agc_ceil = (std::f32::consts::FRAC_PI_2 / (alpha + 4.0 * beta)).sqrt().max(0.5);
+        let galaxy_dir = std::path::PathBuf::from(resume.replace(".bin", "_galaxy"));
+        match common::galaxy_scan::run_and_write_full_scan(
+            &all_hidden, &cache.post_ln_f, n_bands, agc_ceil, m1, m2, &galaxy_dir,
+        ) {
+            Ok(scan) => {
+                println!("Galaxy map written to: {}", galaxy_dir.display());
+                common::galaxy_scan::print_summary(&scan);
+            }
+            Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+        }
+        return;
+    }
+
     // ─── Check gradients mode ───
     fn parse_flag_gradients<T: std::str::FromStr>(name: &str, default: T) -> T {
         std::env::args().skip_while(|a| a != name).nth(1)

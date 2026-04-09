@@ -796,4 +796,35 @@ pub fn run_training(config: TrainConfig) {
         wave_checkpoint::save_checkpoint(&save_params, vocab_size, model.blocks.len(), groups, total_iters, lr, &optimizer, rng.state(), &config.checkpoint_name, dims);
     }
     println!("Checkpoint saved to {}", config.checkpoint_name);
+
+    // Auto-trigger galaxy map scan on final checkpoint
+    {
+        let galaxy_dir = std::path::PathBuf::from(
+            config.checkpoint_name.replace(".bin", "_galaxy")
+        );
+        // Use first N tokens of training data as test corpus
+        let scan_len = train_data.len().min(200);
+        let scan_tokens = &train_data[..scan_len];
+        // Forward pass on CPU for phase extraction
+        let scan_cache = crate::cpu::forward::forward_with_cache(
+            &model, scan_tokens, dims, None, None, None, Some(&stencil), None, None,
+        );
+        let all_layer_hidden: Vec<Vec<Vec<f32>>> = scan_cache.block_caches.iter()
+            .map(|bc| bc.input.clone()).collect();
+        let agc_ceil = (std::f32::consts::FRAC_PI_2 / (config.alpha + 4.0 * config.beta)).sqrt().max(0.5);
+        let m1 = config.m1.unwrap_or(5);
+        let m2 = config.m2.unwrap_or(7);
+        match crate::common::galaxy_scan::run_and_write_full_scan(
+            &all_layer_hidden, &scan_cache.post_ln_f,
+            config.n_bands, agc_ceil, m1, m2, &galaxy_dir,
+        ) {
+            Ok(scan) => {
+                eprintln!("Galaxy map: {}", galaxy_dir.display());
+                crate::common::galaxy_scan::print_summary(&scan);
+            }
+            Err(e) => {
+                eprintln!("Warning: galaxy scan failed: {}. Training output is unaffected.", e);
+            }
+        }
+    }
 }
