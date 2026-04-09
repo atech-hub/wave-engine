@@ -104,10 +104,12 @@ pub struct LayerSummary {
     pub significant_by_type: Vec<(String, usize)>,
     pub triadic_count: usize,
     pub fwm_quartet_total: usize,
-    pub fwm_quartet_preserved: usize,   // |deviation| < 0.1
-    pub fwm_quartet_created: usize,     // deviation > 0.1 (training added coherence)
-    pub fwm_quartet_broken: usize,      // deviation < -0.1 (training removed coherence)
-    pub fwm_quartet_significant: usize, // stored quartets (|dev| > 0.15)
+    pub fwm_preserved: usize,    // was-high, still-high (genuine scaffolding kept)
+    pub fwm_destroyed: usize,    // was-high, now-low (structure actively removed)
+    pub fwm_created: usize,      // was-low, now-high (novel structure training built)
+    pub fwm_noise: usize,        // was-low, still-low (never coherent)
+    pub fwm_partial: usize,      // middle cases
+    pub fwm_significant: usize,  // stored quartets
     pub fwm_mean_deviation: f32,
     pub sphere_fill_fraction: f32,
     pub sphere_center_fraction: f32,
@@ -328,9 +330,15 @@ fn scan_layer(
 
     let mut fwm_quartets = Vec::new();
     let mut fwm_total = 0usize;
-    let mut fwm_preserved = 0usize;  // |deviation| < 0.1
-    let mut fwm_created = 0usize;    // deviation > 0.1 (training added coherence)
-    let mut fwm_broken = 0usize;     // deviation < -0.1 (training removed coherence)
+    // 4-category classification based on (baseline, trained) coherence
+    // Thresholds: high >= 0.7, low < 0.3, middle = 0.3..0.7
+    let coh_high = 0.7f32;
+    let coh_low = 0.3f32;
+    let mut fwm_preserved = 0usize;  // was-high, still-high
+    let mut fwm_destroyed = 0usize;  // was-high, now-low
+    let mut fwm_created = 0usize;    // was-low, now-high
+    let mut fwm_noise = 0usize;      // was-low, still-low
+    let mut fwm_partial = 0usize;    // middle cases
     let mut fwm_dev_sum = 0.0f32;
 
     for a in 0..n_bands {
@@ -352,12 +360,16 @@ fn scan_layer(
                     let deviation = trained_coh - base_coh;
                     fwm_total += 1;
                     fwm_dev_sum += deviation;
-                    if deviation.abs() < 0.1 { fwm_preserved += 1; }
-                    else if deviation > 0.0 { fwm_created += 1; }
-                    else { fwm_broken += 1; }
 
-                    // Only store quartets with significant deviation (either direction)
-                    if deviation.abs() > 0.15 {
+                    // 4-category: (baseline high/low) x (trained high/low)
+                    if base_coh >= coh_high && trained_coh >= coh_high { fwm_preserved += 1; }
+                    else if base_coh >= coh_high && trained_coh < coh_low { fwm_destroyed += 1; }
+                    else if base_coh < coh_low && trained_coh >= coh_high { fwm_created += 1; }
+                    else if base_coh < coh_low && trained_coh < coh_low { fwm_noise += 1; }
+                    else { fwm_partial += 1; }
+
+                    // Store quartets with significant deviation or novel creation
+                    if deviation.abs() > 0.15 || (base_coh < coh_low && trained_coh >= coh_high) {
                         fwm_quartets.push(QuartetConstellation {
                             bands: [a, b, c, d],
                             fwm_index_sum: sum,
@@ -382,10 +394,12 @@ fn scan_layer(
         significant_by_type: sig_by_type,
         triadic_count: triads.len(),
         fwm_quartet_total: fwm_total,
-        fwm_quartet_preserved: fwm_preserved,
-        fwm_quartet_created: fwm_created,
-        fwm_quartet_broken: fwm_broken,
-        fwm_quartet_significant: fwm_quartets.len(),
+        fwm_preserved,
+        fwm_destroyed,
+        fwm_created,
+        fwm_noise,
+        fwm_partial,
+        fwm_significant: fwm_quartets.len(),
         fwm_mean_deviation: fwm_mean_dev,
         sphere_fill_fraction: fill_frac,
         sphere_center_fraction: center_frac,
@@ -454,11 +468,12 @@ pub fn write_galaxy_map_json(scan: &GalaxyScan, path: &Path) -> std::io::Result<
         // Summary (includes full-matrix catalog counts + FWM deviation stats)
         let sig: Vec<String> = layer.summary.significant_by_type.iter()
             .map(|(k, v)| format!(r#""{}":{}""#, k, v)).collect();
-        write!(f, r#""summary":{{"pairs":{},"triads":{},"fwm":{{"total":{},"preserved":{},"created":{},"broken":{},"significant":{},"mean_dev":{:.4}}},"fill":{:.3},"center":{:.3},"catalog":{{{}}}, "grid":{{"g1":{:.3},"g2":{:.3},"comp":{:.3},"approx":{:.3}}}}}"#,
+        write!(f, r#""summary":{{"pairs":{},"triads":{},"fwm":{{"total":{},"preserved":{},"destroyed":{},"created":{},"noise":{},"partial":{},"significant":{},"mean_dev":{:.4}}},"fill":{:.3},"center":{:.3},"catalog":{{{}}}, "grid":{{"g1":{:.3},"g2":{:.3},"comp":{:.3},"approx":{:.3}}}}}"#,
             layer.summary.total_pairs, layer.summary.triadic_count,
-            layer.summary.fwm_quartet_total, layer.summary.fwm_quartet_preserved,
-            layer.summary.fwm_quartet_created, layer.summary.fwm_quartet_broken,
-            layer.summary.fwm_quartet_significant, layer.summary.fwm_mean_deviation,
+            layer.summary.fwm_quartet_total, layer.summary.fwm_preserved,
+            layer.summary.fwm_destroyed, layer.summary.fwm_created,
+            layer.summary.fwm_noise, layer.summary.fwm_partial,
+            layer.summary.fwm_significant, layer.summary.fwm_mean_deviation,
             layer.summary.sphere_fill_fraction, layer.summary.sphere_center_fraction,
             sig.join(","),
             layer.summary.grid1_frac, layer.summary.grid2_frac,
@@ -543,9 +558,10 @@ pub fn print_summary(scan: &GalaxyScan) {
         let total_sig: usize = final_layer.summary.significant_by_type.iter().map(|(_, v)| v).sum();
         let s = &final_layer.summary;
         eprintln!("  Galaxy: {} sig pairs, {} triads", total_sig, s.triadic_count);
-        eprintln!("  FWM quartets: {}/{} preserved, {} created, {} broken, mean_dev={:.4}",
-            s.fwm_quartet_preserved, s.fwm_quartet_total,
-            s.fwm_quartet_created, s.fwm_quartet_broken, s.fwm_mean_deviation);
+        eprintln!("  FWM quartets ({} total): preserved={}, destroyed={}, created={}, noise={}, partial={}",
+            s.fwm_quartet_total, s.fwm_preserved, s.fwm_destroyed,
+            s.fwm_created, s.fwm_noise, s.fwm_partial);
+        eprintln!("    mean_dev={:.4}, significant={}", s.fwm_mean_deviation, s.fwm_significant);
         eprintln!("  Grid: g1={:.1}% g2={:.1}% comp={:.1}% approx={:.1}%",
             s.grid1_frac * 100.0, s.grid2_frac * 100.0,
             s.composite_frac * 100.0, s.approximate_frac * 100.0);
