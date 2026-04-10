@@ -38,7 +38,8 @@ No Python. No pip. No CUDA toolkit. Build once, run anywhere.
 |------|----------|--------|---------|
 | Arithmetic | **55/55 (100%)** | 168-dim, 4H, 4L, phase-native | Data presentation was the bottleneck, not architecture |
 | Word classification | **46/51 (90.2%)** | 168-dim, 4H, 4L, phase-native | ODE composes characters into word meaning |
-| Grammar | plateau 3.1 | 168-dim, 4H, 4L | Capacity limit — bands full (94%), attention dead |
+| Grammar (char) | **best 2.34** | 168-dim, 4H, 4L, PN+FWM | L3 regime shift, 4,766 locked quartets |
+| Grammar (BPE) | *in progress* | 168-dim, 4H, 4L, PN+FWM, BPE-512 | Training for relate-vocab semantic test |
 
 The architecture self-organises differently per task: arithmetic uses sharp β/α coupling splits with early-binding, words use gradual ramps with late-binding, grammar needs more bands (384-dim test next).
 
@@ -155,6 +156,45 @@ MONITORS:
                         embedding space, output distribution, ODE dynamics,
                         dynamic param trajectories, curriculum transitions,
                         checkpoint drift, throughput. All in JSONL.
+
+FOUR-WAVE MIXING:
+    --fwm-strength F    Chi parameter for four-wave mixing (0=off)  [default: 0.0]
+                        Hamiltonian quartets: phase-matched a+b=c+d coupling.
+                        Recommended: 0.03. Full Jacobian backward on all tiers.
+
+WAVE MEMORY:
+    --memory FILE       Wave memory file (.kwmf). Created if not found.
+                        Nudges ODE initial conditions based on accumulated
+                        conversation experience. Model weights stay frozen.
+
+GALAXY SCAN:
+    --galaxy-scan       Generate galaxy map of learned harmonic structure.
+                        Requires --resume <checkpoint>. Five-layer scan:
+                        per-band profiles, pairwise geometry with catalog matching,
+                        triads, FWM quartets, multi-grid decomposition.
+                        Output: <checkpoint>_galaxy/ with galaxy_map.json,
+                        galaxy_matrix.bin, phases.bin.
+                        Auto-runs at end of training.
+    --scan-corpus FILE  Data file for galaxy scan tokens (default: positional arg)
+
+PHASE ENCODE (direct phase injection into model):
+    --encode TEXT        Encode text through embedding, observe ODE evolution
+    --encode-number N    Encode integer via multi-grid phases
+    --encode-catalog S   Encode catalog config: "trine:35,63", "opposition:12,54"
+                         Compound: "trine:35,63+opposition:12,54"
+    --encode-phases S    Raw band:radian pairs: "10:1.047,20:2.094"
+    --inject-layer N     Inject at layer N input (default: 0 = full model)
+    --blank              Use untrained model (see what physics alone does)
+    --scan               Run full galaxy scan on encode output
+    --data FILE          Data file for char vocab (needed for text encode)
+
+RELATE (harmonic coherence profiles between encodings):
+    --relate A           Pairwise profile. Repeat for multiple items.
+    --relate-number N    Add a number to relate comparison
+    --relate-catalog S   Add a catalog config to relate comparison
+    --relate-vocab       Full vocabulary pairwise relationship matrix
+                         Includes energy deformation signatures (mag_out/mag_in).
+    --output FILE        Output path for relate-vocab JSON
 
 DIAGNOSTICS:
     --ode-monitor       Show raw per-band ODE data for a prompt
@@ -306,6 +346,40 @@ Phase-native mode uses dot product against frozen embeddings instead of a learne
 ./target/release/wave-engine data/input.txt --resume model_256_from_168.bin \
     --layers 4 --n-bands 128 --n-head 8 --out-proj-groups 1 \
     --alpha 0.1 --beta 0.2 --phase-native --iters 20000
+```
+
+### Phase encode — inject geometry into the model
+
+```bash
+# What does a trained model do to a trine?
+./target/release/wave-engine --encode-catalog "trine:35,63" --resume checkpoint.bin \
+    --layers 4 --n-bands 84 --data data/input.txt
+
+# Compare blank (untrained physics) vs trained model
+./target/release/wave-engine --encode-catalog "opposition:20,60" --blank --n-bands 84
+./target/release/wave-engine --encode-catalog "opposition:20,60" --resume checkpoint.bin
+
+# Relationship between tokens after ODE processing
+./target/release/wave-engine --relate "3" --relate "+" --relate "=" \
+    --resume checkpoint.bin --data data/arithmetic.txt
+
+# Full vocabulary relationship matrix with energy signatures
+./target/release/wave-engine --relate-vocab --resume checkpoint.bin \
+    --data data/input.txt --output vocab_relations.json
+```
+
+### Galaxy scan — geometric inventory of learned structure
+
+```bash
+# Scan an existing checkpoint
+./target/release/wave-engine --galaxy-scan --resume checkpoint.bin \
+    --layers 4 --n-bands 84 --scan-corpus data/input.txt
+
+# Summarise the scan (Python, stdlib only)
+python scripts/summarize_galaxy.py checkpoint_galaxy/galaxy_map.json
+
+# Compare two scans
+python scripts/summarize_galaxy.py scan_a/galaxy_map.json scan_b/galaxy_map.json
 ```
 
 ### Generate text
