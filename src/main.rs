@@ -173,7 +173,7 @@ fn main() {
         // ─── Relate-vocab mode ───
         if std::env::args().any(|a| a == "--relate-vocab") {
             let output: String = pflag_enc("--output", "vocab_relations.json".to_string());
-            let (labels, reports, dist) = common::phase_encode::run_relate_vocab(&model, n_bands, Some(&char_map));
+            let (labels, reports, dist, profiles) = common::phase_encode::run_relate_vocab(&model, n_bands, Some(&char_map));
             println!("\n=== Vocabulary Relationship Map ===");
             println!("  {} tokens, {} pairs", labels.len(), reports.len());
             println!("\n  Catalog distribution:");
@@ -182,7 +182,15 @@ fn main() {
             for (name, count) in &entries {
                 println!("    {:20} {:5}", name, count);
             }
-            if let Err(e) = common::phase_encode::write_vocab_relations_json(&output, &labels, &reports, &dist) {
+            // Energy profile summary
+            println!("\n  Energy signatures (top amplifiers / dampeners):");
+            let mut sorted_profiles: Vec<&common::phase_encode::EnergyProfile> = profiles.iter().collect();
+            sorted_profiles.sort_by(|a, b| b.peak_ratio.partial_cmp(&a.peak_ratio).unwrap_or(std::cmp::Ordering::Equal));
+            for p in sorted_profiles.iter().take(5) {
+                println!("    {:>4}  energy={:.2}x  peak=band{}({:.1}x)  damp=band{}({:.2}x)",
+                    p.label, p.total_energy_ratio, p.peak_band, p.peak_ratio, p.damp_band, p.damp_ratio);
+            }
+            if let Err(e) = common::phase_encode::write_vocab_relations_json(&output, &labels, &reports, &dist, Some(&profiles)) {
                 eprintln!("Error writing {}: {}", output, e);
             } else {
                 println!("\n  Written to: {}", output);

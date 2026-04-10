@@ -1,6 +1,6 @@
 # Tier Capability Matrix
 
-**Last updated:** 2026-04-08 (evening)
+**Last updated:** 2026-04-10
 
 Which ODE features work on which compute tier. This is the single source of truth for "what works where."
 
@@ -12,7 +12,7 @@ Which ODE features work on which compute tier. This is the single source of trut
 | SPM (α) | ✅ | ✅ | ✅ | Self-phase modulation |
 | XPM (β) | ✅ | ✅ | ✅ | Cross-phase modulation, [1,1,0,1,1] kernel |
 | FWM forward (χ) | ✅ | ✅ | ✅ | Four-wave mixing, Hamiltonian quartets |
-| FWM Jacobian (backward) | ✅ | ✅ | ✅ | Analytical per-quartet gradient, all 8 role partials |
+| FWM Jacobian (backward) | ✅ | ✅ (fixed v0.5.0) | ✅ | Analytical per-quartet gradient, all 8 role partials. wgpu had 13-binding bug (max_storage_buffers_per_shader_stage=12), fixed by packing d_alpha+d_beta into d_ab_partial |
 | Learnable α | ✅ | ✅ | ✅ | |
 | Learnable β | ✅ | ✅ | ✅ | |
 | Learnable γ (per-band) | ✅ | ✅ | ✅ | |
@@ -54,6 +54,23 @@ WCHK v4 persists χ in the header. Checkpoints trained with FWM retain their chi
 | Curriculum transitions | curriculum | Stage changes, loss jumps |
 | Checkpoint drift | drift | L2 distance between saves |
 | Throughput | throughput | Tokens/sec, iter timing |
+
+## Analysis Tools
+
+| Tool | Flag | What it does |
+|---|---|---|
+| Analyze | --analyze | Wave structure diagnostics, embedding health |
+| ODE monitor | --ode-monitor | Per-band ODE data for specific prompts |
+| Phase decode | --phase-decode | Compare lm_head vs phase coherence decoding |
+| Galaxy scan | --galaxy-scan | End-of-training geometric inventory (5 layers) |
+| Phase encode | --encode* | Direct phase injection into ODE layers |
+| Relate | --relate | Per-harmonic coherence profiles between encodings |
+| Relate vocab | --relate-vocab | Full vocabulary pairwise relationship matrix + energy signatures |
+| Generate | --generate | Text generation from checkpoint |
+| Scale | --scale | Scale checkpoint to different dimensions |
+| Gradient check | --check-gradients | Finite-diff validation of analytical gradients |
+| Recommend | --recommend | Architecture recommendations for a dataset |
+| Framework monitor | (at health intervals) | Live harmonic coherence during training |
 
 ## How to Add a New Physics Term
 

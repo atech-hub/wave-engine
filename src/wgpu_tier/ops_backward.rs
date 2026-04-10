@@ -29,8 +29,7 @@ impl GpuBackend {
         let ds_buf = self.output_buf("kbb_ds", total);
         let dg_buf = self.output_buf("kbb_dg", total);
         let dom_buf = self.output_buf("kbb_dom", total);
-        let da_buf = self.output_buf("kbb_da", total);
-        let db_buf = self.output_buf("kbb_db", total);
+        let dab_buf = self.output_buf("kbb_dab", total * 2); // packed alpha+beta
         let dchi_buf = self.output_buf("kbb_dchi", total);
 
         let params = KerrBwdBatchParams {
@@ -53,10 +52,9 @@ impl GpuBackend {
                 wgpu::BindGroupEntry { binding: 7, resource: ds_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: dg_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: dom_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: da_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: db_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: dab_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: dchi_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: dchi_buf.as_entire_binding() },
             ],
         });
 
@@ -73,8 +71,9 @@ impl GpuBackend {
         let d_s = self.readback(&ds_buf, total);
         let d_gamma = self.readback(&dg_buf, total);
         let d_omega = self.readback(&dom_buf, total);
-        let da_partials = self.readback(&da_buf, total);
-        let db_partials = self.readback(&db_buf, total);
+        let dab_partials = self.readback(&dab_buf, total * 2);
+        let da_partials = &dab_partials[..total];
+        let db_partials = &dab_partials[total..];
         let dchi_partials = self.readback(&dchi_buf, total);
 
         // CPU reduction for d_alpha, d_beta, and d_chi
@@ -162,11 +161,14 @@ impl GpuBackend {
 
         // Parameter gradient outputs (per dispatch) and accumulators
         let dg_step = make_rw("dg_step"); let dom_step = make_rw("dom_step");
-        let da_step = make_rw("da_step"); let db_step = make_rw("db_step");
+        let dab_step = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dab_step"), size: (total * 2 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
         let dchi_step = make_rw("dchi_step");
         let dg_acc = make_init("dg_acc", &vec![0.0f32; total]);
-        let da_acc = make_init("da_acc", &vec![0.0f32; total]);
-        let db_acc = make_init("db_acc", &vec![0.0f32; total]);
+        let dab_acc = make_init("dab_acc", &vec![0.0f32; total * 2]);
         let dchi_acc = make_init("dchi_acc", &vec![0.0f32; total]);
         let zero_buf = make_init("zero", &vec![0.0f32; total]);
 
@@ -256,10 +258,9 @@ impl GpuBackend {
                     wgpu::BindGroupEntry { binding: 7, resource: d_eval_s.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 8, resource: dg_step.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 9, resource: dom_step.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 10, resource: da_step.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 11, resource: db_step.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: dab_step.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: dchi_step.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 12, resource: bwd_u.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 13, resource: dchi_step.as_entire_binding() },
                 ],
             })
         };
@@ -325,8 +326,7 @@ impl GpuBackend {
         let bg_acc_dr = acc_bg(&d_r, &d_eval_r);
         let bg_acc_ds = acc_bg(&d_s, &d_eval_s);
         let bg_acc_dg = acc_bg(&dg_acc, &dg_step);
-        let bg_acc_da = acc_bg(&da_acc, &da_step);
-        let bg_acc_db = acc_bg(&db_acc, &db_step);
+        let bg_acc_dab = acc_bg(&dab_acc, &dab_step);
         let bg_acc_dchi = acc_bg(&dchi_acc, &dchi_step);
 
         // Midpoint reconstruction for backward (reuses r_mid/s_mid)
@@ -335,6 +335,8 @@ impl GpuBackend {
         let bg_bwd_mid_k2_r = vsa_bg(&r_buf, &k1r, &r_mid, &u_half_dt);
         let bg_bwd_mid_k2_s = vsa_bg(&s_buf, &k1s, &s_mid, &u_half_dt);
 
+        let wg2 = (total as u32 * 2 + 63) / 64; // for packed alpha+beta buffers
+
         // ─── Dispatch macros ───
         macro_rules! dispatch {
             ($enc:expr, $pipeline:expr, $bg:expr) => {{
@@ -342,6 +344,14 @@ impl GpuBackend {
                 p.set_pipeline($pipeline);
                 p.set_bind_group(0, $bg, &[]);
                 p.dispatch_workgroups(wg, 1, 1);
+            }};
+        }
+        macro_rules! dispatch2x {
+            ($enc:expr, $pipeline:expr, $bg:expr) => {{
+                let mut p = $enc.begin_compute_pass(&Default::default());
+                p.set_pipeline($pipeline);
+                p.set_bind_group(0, $bg, &[]);
+                p.dispatch_workgroups(wg2, 1, 1);
             }};
         }
 
@@ -404,8 +414,7 @@ impl GpuBackend {
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dr);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_ds);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
-            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
-            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            dispatch2x!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dab);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dchi);
             // d_extra = 0 + dt * d_eval (chain: k4 depends on k3)
             dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_dt_r);
@@ -422,8 +431,7 @@ impl GpuBackend {
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dr);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_ds);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
-            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
-            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            dispatch2x!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dab);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dchi);
             // d_extra = 0 + 0.5*dt * d_eval
             dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_hdt_r);
@@ -440,8 +448,7 @@ impl GpuBackend {
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dr);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_ds);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
-            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
-            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            dispatch2x!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dab);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dchi);
             // d_extra = 0 + 0.5*dt * d_eval
             dispatch!(encoder, &self.vec_scale_add_pipeline, &bg_extra_hdt_r);
@@ -456,8 +463,7 @@ impl GpuBackend {
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dr);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_ds);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dg);
-            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_da);
-            dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_db);
+            dispatch2x!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dab);
             dispatch!(encoder, &self.vec_accumulate_pipeline, &bg_acc_dchi);
         }
 
@@ -468,8 +474,9 @@ impl GpuBackend {
         let d_r_out = self.readback(&d_r, total);
         let d_s_out = self.readback(&d_s, total);
         let dg_out = self.readback(&dg_acc, total);
-        let da_out = self.readback(&da_acc, total);
-        let db_out = self.readback(&db_acc, total);
+        let dab_out = self.readback(&dab_acc, total * 2);
+        let da_out = &dab_out[..total];
+        let db_out = &dab_out[total..];
         let dchi_out = self.readback(&dchi_acc, total);
 
         // CPU reduction: sum across positions for d_gamma, d_alpha, d_beta, d_chi

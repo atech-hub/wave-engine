@@ -368,6 +368,74 @@ pub fn compare_states(input: &[f32], output: &[f32]) -> ComparisonReport {
     }
 }
 
+// ─── Energy deformation signatures ───
+
+/// Per-band magnitude ratio (output/input) — the spectral fingerprint of how the ODE
+/// processes this token. Phase tells WHERE. Energy deformation tells HOW MUCH.
+pub fn deformation_vector(input: &[f32], output: &[f32]) -> Vec<f32> {
+    let n_bands = input.len() / 2;
+    (0..n_bands).map(|k| {
+        let in_r = input[k * 2];
+        let in_s = input[k * 2 + 1];
+        let out_r = output[k * 2];
+        let out_s = output[k * 2 + 1];
+        let mag_in = (in_r * in_r + in_s * in_s).sqrt().max(1e-8);
+        let mag_out = (out_r * out_r + out_s * out_s).sqrt();
+        mag_out / mag_in
+    }).collect()
+}
+
+/// Cosine similarity between two deformation vectors.
+pub fn deformation_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na < 1e-10 || nb < 1e-10 { return 0.0; }
+    dot / (na * nb)
+}
+
+/// Per-token energy profile summary.
+pub struct EnergyProfile {
+    pub label: String,
+    pub deformation: Vec<f32>,   // per-band mag_out/mag_in
+    pub total_energy_ratio: f32, // sum(mag_out²) / sum(mag_in²)
+    pub peak_band: usize,        // band with highest amplification
+    pub peak_ratio: f32,         // that band's ratio
+    pub damp_band: usize,        // band with most damping
+    pub damp_ratio: f32,         // that band's ratio
+}
+
+pub fn compute_energy_profile(label: &str, input: &[f32], output: &[f32]) -> EnergyProfile {
+    let deformation = deformation_vector(input, output);
+    let n_bands = deformation.len();
+
+    let energy_in: f32 = (0..n_bands).map(|k| {
+        input[k*2]*input[k*2] + input[k*2+1]*input[k*2+1]
+    }).sum();
+    let energy_out: f32 = (0..n_bands).map(|k| {
+        output[k*2]*output[k*2] + output[k*2+1]*output[k*2+1]
+    }).sum();
+
+    let mut peak_band = 0;
+    let mut peak_ratio = 0.0f32;
+    let mut damp_band = 0;
+    let mut damp_ratio = f32::MAX;
+    for (k, &r) in deformation.iter().enumerate() {
+        if r > peak_ratio { peak_ratio = r; peak_band = k; }
+        if r < damp_ratio { damp_ratio = r; damp_band = k; }
+    }
+
+    EnergyProfile {
+        label: label.to_string(),
+        deformation,
+        total_energy_ratio: energy_out / energy_in.max(1e-8),
+        peak_band,
+        peak_ratio,
+        damp_band,
+        damp_ratio,
+    }
+}
+
 // ─── Relate mode: per-harmonic coherence profile ───
 
 pub struct HarmonicProfile {
@@ -386,14 +454,27 @@ pub struct RelateReport {
     pub shifted_mrl: f32,
     pub shifted_offset: f32,
     pub shifted_harmonic: usize,
+    pub deformation_sim: f32,  // cosine similarity of energy deformation vectors
 }
 
 /// Compute full harmonic coherence profile between two output states.
+/// `deform_a`/`deform_b` are optional per-token deformation vectors.
 pub fn relate_states(
     state_a: &[f32],
     state_b: &[f32],
     label_a: &str,
     label_b: &str,
+) -> RelateReport {
+    relate_states_with_deformation(state_a, state_b, label_a, label_b, None, None)
+}
+
+pub fn relate_states_with_deformation(
+    state_a: &[f32],
+    state_b: &[f32],
+    label_a: &str,
+    label_b: &str,
+    deform_a: Option<&[f32]>,
+    deform_b: Option<&[f32]>,
 ) -> RelateReport {
     let n_bands = state_a.len() / 2;
     let bands_a = extract_bands(state_a);
@@ -447,6 +528,11 @@ pub fn relate_states(
 
     let catalog_match = match_catalog(mean_deg);
 
+    let deform_sim = match (deform_a, deform_b) {
+        (Some(a), Some(b)) => deformation_similarity(a, b),
+        _ => 0.0,
+    };
+
     RelateReport {
         label_a: label_a.to_string(),
         label_b: label_b.to_string(),
@@ -456,6 +542,7 @@ pub fn relate_states(
         shifted_mrl: best_mrl,
         shifted_offset: best_offset,
         shifted_harmonic: best_n,
+        deformation_sim: deform_sim,
     }
 }
 
@@ -692,23 +779,27 @@ pub fn run_relate(
 
 /// Run relate-vocab: encode all tokens, forward, compute full pairwise matrix.
 /// `char_map` provides display labels for tokens (from data file vocab).
+/// Returns (labels, reports, catalog_dist, energy_profiles).
 pub fn run_relate_vocab(
     model: &crate::WavePacketModel,
     n_bands: usize,
     char_map: Option<&[char]>,
-) -> (Vec<String>, Vec<RelateReport>, std::collections::HashMap<String, usize>) {
+) -> (Vec<String>, Vec<RelateReport>, std::collections::HashMap<String, usize>, Vec<EnergyProfile>) {
     let vocab = model.vocab_size;
     let n_embd = n_bands * 2;
 
     println!("  Encoding {} tokens through ODE...", vocab);
-    let outputs: Vec<Vec<f32>> = (0..vocab).map(|tok| {
+    let mut inputs: Vec<Vec<f32>> = Vec::with_capacity(vocab);
+    let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(vocab);
+    for tok in 0..vocab {
         let mut h = vec![0.0f32; n_embd];
         for i in 0..n_embd {
             h[i] = model.wte[tok][i] + model.wpe[0][i];
         }
         let (final_out, _) = forward_from_layer(model, &h, 0, n_bands);
-        final_out
-    }).collect();
+        inputs.push(h);
+        outputs.push(final_out);
+    }
 
     let labels: Vec<String> = match char_map {
         Some(cm) => (0..vocab).map(|t| {
@@ -720,14 +811,27 @@ pub fn run_relate_vocab(
         None => (0..vocab).map(|t| format!("t{}", t)).collect(),
     };
 
+    // Compute per-token energy deformation profiles
+    println!("  Computing energy deformation profiles...");
+    let deformations: Vec<Vec<f32>> = (0..vocab)
+        .map(|tok| deformation_vector(&inputs[tok], &outputs[tok]))
+        .collect();
+    let profiles: Vec<EnergyProfile> = (0..vocab)
+        .map(|tok| compute_energy_profile(&labels[tok], &inputs[tok], &outputs[tok]))
+        .collect();
+
     let total = vocab * (vocab - 1) / 2;
-    println!("  Computing {} pairwise relationships...", total);
+    println!("  Computing {} pairwise relationships (phase + energy)...", total);
     let mut reports = Vec::with_capacity(total);
     let mut dist: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for i in 0..vocab {
         for j in (i + 1)..vocab {
-            let r = relate_states(&outputs[i], &outputs[j], &labels[i], &labels[j]);
+            let r = relate_states_with_deformation(
+                &outputs[i], &outputs[j],
+                &labels[i], &labels[j],
+                Some(&deformations[i]), Some(&deformations[j]),
+            );
             if let Some((name, _)) = r.catalog_match {
                 *dist.entry(name.to_string()).or_insert(0) += 1;
             }
@@ -735,15 +839,16 @@ pub fn run_relate_vocab(
         }
     }
 
-    (labels, reports, dist)
+    (labels, reports, dist, profiles)
 }
 
-/// Write relate-vocab results to JSON.
+/// Write relate-vocab results to JSON (with energy profiles).
 pub fn write_vocab_relations_json(
     path: &str,
     labels: &[String],
     reports: &[RelateReport],
     dist: &std::collections::HashMap<String, usize>,
+    profiles: Option<&[EnergyProfile]>,
 ) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::File::create(path)?;
@@ -768,11 +873,27 @@ pub fn write_vocab_relations_json(
         let esc = |s: &str| -> String {
             s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
         };
-        write!(f, "    {{\"a\":\"{}\",\"b\":\"{}\",\"angle\":{:.1},\"catalog\":{},\"mrl\":{:.3},\"harm\":{}}}{}\n",
+        write!(f, "    {{\"a\":\"{}\",\"b\":\"{}\",\"angle\":{:.1},\"catalog\":{},\"mrl\":{:.3},\"harm\":{},\"deform_sim\":{:.3}}}{}\n",
             esc(&r.label_a), esc(&r.label_b), r.mean_angular_distance_deg, cat,
-            r.shifted_mrl, r.shifted_harmonic,
+            r.shifted_mrl, r.shifted_harmonic, r.deformation_sim,
             if i + 1 < limit { "," } else { "" })?;
     }
-    write!(f, "  ]\n}}\n")?;
+    write!(f, "  ]")?;
+
+    // Write energy profiles if provided
+    if let Some(profs) = profiles {
+        write!(f, ",\n  \"energy_profiles\": [\n")?;
+        for (i, p) in profs.iter().enumerate() {
+            let esc = |s: &str| -> String {
+                s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+            };
+            write!(f, "    {{\"token\":\"{}\",\"total_energy_ratio\":{:.3},\"peak_band\":{},\"peak_ratio\":{:.3},\"damp_band\":{},\"damp_ratio\":{:.3}}}{}\n",
+                esc(&p.label), p.total_energy_ratio, p.peak_band, p.peak_ratio, p.damp_band, p.damp_ratio,
+                if i + 1 < profs.len() { "," } else { "" })?;
+        }
+        write!(f, "  ]")?;
+    }
+
+    write!(f, "\n}}\n")?;
     Ok(())
 }

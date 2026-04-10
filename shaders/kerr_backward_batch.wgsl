@@ -36,11 +36,10 @@ struct Params {
 @group(0) @binding(7) var<storage, read_write> d_s_out: array<f32>;  // [n_pos * n_bands]
 @group(0) @binding(8) var<storage, read_write> d_gamma_out: array<f32>;  // [n_pos * n_bands]
 @group(0) @binding(9) var<storage, read_write> d_omega_out: array<f32>;  // [n_pos * n_bands]
-@group(0) @binding(10) var<storage, read_write> d_alpha_partial: array<f32>; // [n_pos * n_bands]
-@group(0) @binding(11) var<storage, read_write> d_beta_partial: array<f32>;  // [n_pos * n_bands]
+@group(0) @binding(10) var<storage, read_write> d_ab_partial: array<f32>;   // [2 * n_pos * n_bands] — alpha first half, beta second half
+@group(0) @binding(11) var<storage, read_write> d_chi_partial: array<f32>;  // [n_pos * n_bands]
 
 @group(0) @binding(12) var<uniform> params: Params;
-@group(0) @binding(13) var<storage, read_write> d_chi_partial: array<f32>;  // [n_pos * n_bands]
 
 @compute @workgroup_size(64)
 fn kerr_backward_batch(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -427,7 +426,8 @@ fn kerr_backward_batch(@builtin(global_invocation_id) id: vec3<u32>) {
     d_s_out[idx] = ds_k;
     d_gamma_out[idx] = dg_k;
     d_omega_out[idx] = dom_k;
-    d_alpha_partial[idx] = da_k;
-    d_beta_partial[idx] = db_k;
+    let total = n * n_pos;
+    d_ab_partial[idx] = da_k;            // first half: alpha
+    d_ab_partial[total + idx] = db_k;    // second half: beta
     d_chi_partial[idx] = fwm_dchi;
 }
