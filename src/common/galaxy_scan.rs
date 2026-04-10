@@ -83,8 +83,9 @@ pub struct PairRelation {
     pub stability: f32,
     pub peak_n: usize,
     pub peak_strength: f32,
-    pub shifted_coherence: f32,   // MRL at peak harmonic (coherence at optimal offset)
-    pub shifted_offset: f32,      // optimal phase offset in radians
+    pub shifted_coherence: f32,   // best MRL across harmonics {1,2,3,4,6}
+    pub shifted_offset: f32,      // optimal phase offset at best harmonic
+    pub shifted_harmonic: usize,  // which harmonic has the best MRL
     pub catalog_match: Option<&'static str>,
     pub catalog_orb_fit: f32,
     pub grid_native: &'static str,
@@ -99,6 +100,8 @@ pub struct QuartetConstellation {
     pub bands: [usize; 4],
     pub fwm_index_sum: usize,
     pub mean_coherence_n4: f32,
+    pub phase_sum_mrl: f32,     // MRL of phase-sum trajectory
+    pub category: u8,           // 0=random, 1=oscillating, 2=locked
 }
 
 pub struct LayerSummary {
@@ -115,6 +118,8 @@ pub struct LayerSummary {
     pub fwm_mean_deviation: f32,
     pub fwm_hist_2d: [[u32; 10]; 10], // [baseline_bin][trained_bin]
     pub shifted_pair_count: usize,  // pairs with hidden coherence (MRL > 0.5 and MRL > 3*|peak|)
+    pub quartet_locked: usize,      // quartets with phase-sum MRL > 0.7
+    pub quartet_oscillating: usize, // quartets with phase-sum MRL 0.3-0.7
     pub sphere_fill_fraction: f32,
     pub sphere_center_fraction: f32,
     pub grid1_frac: f32,
@@ -230,6 +235,7 @@ fn scan_layer(
             // MRL captures coherence at ANY fixed offset, not just zero
             let mut best_mrl = 0.0f32;
             let mut best_offset = 0.0f32;
+            let mut best_mrl_n = 1usize;
             for &nh in &[1u32, 2, 3, 4, 6] {
                 let n_f = nh as f32;
                 let mut ss = 0.0f32;
@@ -243,6 +249,7 @@ fn scan_layer(
                 if this_mrl > best_mrl {
                     best_mrl = this_mrl;
                     best_offset = ss.atan2(sc) / n_f;
+                    best_mrl_n = nh as usize;
                 }
             }
             let mrl = best_mrl;
@@ -281,7 +288,7 @@ fn scan_layer(
             all_pairs.push(PairRelation {
                 band_a: i, band_b: j, mean_angular_distance_deg: mean_dist_deg,
                 stability, peak_n, peak_strength: peak_str,
-                shifted_coherence: mrl, shifted_offset,
+                shifted_coherence: mrl, shifted_offset, shifted_harmonic: best_mrl_n,
                 catalog_match: cat_name, catalog_orb_fit: cat_fit, grid_native: grid,
             });
             pair_spectra.push(spectrum);
@@ -308,7 +315,7 @@ fn scan_layer(
             band_a: p.band_a, band_b: p.band_b,
             mean_angular_distance_deg: p.mean_angular_distance_deg,
             stability: p.stability, peak_n: p.peak_n, peak_strength: p.peak_strength,
-            shifted_coherence: p.shifted_coherence, shifted_offset: p.shifted_offset,
+            shifted_coherence: p.shifted_coherence, shifted_offset: p.shifted_offset, shifted_harmonic: p.shifted_harmonic,
             catalog_match: p.catalog_match, catalog_orb_fit: p.catalog_orb_fit,
             grid_native: p.grid_native,
         }
@@ -423,12 +430,24 @@ fn scan_layer(
                     else if base_coh < coh_low && trained_coh < coh_low { fwm_noise += 1; }
                     else { fwm_partial += 1; }
 
-                    // Store quartets with significant deviation or novel creation
-                    if deviation.abs() > 0.15 || (base_coh < coh_low && trained_coh >= coh_high) {
+                    // Phase-sum trajectory MRL for quartet classification
+                    let (ps_ss, ps_sc) = (0..n_positions).fold((0.0f32, 0.0f32), |(ss, sc), pos| {
+                        let ps = phases[pos][a] + phases[pos][b] - phases[pos][c] - phases[pos][d];
+                        (ss + ps.sin(), sc + ps.cos())
+                    });
+                    let ps_mrl = (ps_ss * ps_ss + ps_sc * ps_sc).sqrt() / n_positions as f32;
+                    let cat = if ps_mrl > 0.7 { 2u8 } // locked
+                              else if ps_mrl > 0.3 { 1u8 } // oscillating
+                              else { 0u8 }; // random
+
+                    // Store quartets with significant deviation, novel creation, or non-random trajectory
+                    if deviation.abs() > 0.15 || (base_coh < coh_low && trained_coh >= coh_high) || cat > 0 {
                         fwm_quartets.push(QuartetConstellation {
                             bands: [a, b, c, d],
                             fwm_index_sum: sum,
                             mean_coherence_n4: trained_coh,
+                            phase_sum_mrl: ps_mrl,
+                            category: cat,
                         });
                     }
                 }
@@ -458,6 +477,8 @@ fn scan_layer(
         fwm_hist_2d,
         fwm_mean_deviation: fwm_mean_dev,
         shifted_pair_count,
+        quartet_locked: fwm_quartets.iter().filter(|q| q.category == 2).count(),
+        quartet_oscillating: fwm_quartets.iter().filter(|q| q.category == 1).count(),
         sphere_fill_fraction: fill_frac,
         sphere_center_fraction: center_frac,
         grid1_frac: grid_counts[0] as f32 / total,
@@ -497,9 +518,9 @@ pub fn write_galaxy_map_json(scan: &GalaxyScan, path: &Path) -> std::io::Result<
         for (pi, p) in layer.top_pairs.iter().enumerate() {
             if pi > 0 { write!(f, ",")?; }
             let cat = p.catalog_match.unwrap_or("none");
-            write!(f, r#"{{"a":{},"b":{},"dist_deg":{:.1},"stability":{:.3},"peak_n":{},"peak_str":{:.3},"mrl":{:.3},"offset":{:.3},"cat":"{}","grid":"{}"}}"#,
+            write!(f, r#"{{"a":{},"b":{},"dist_deg":{:.1},"stability":{:.3},"peak_n":{},"peak_str":{:.3},"mrl":{:.3},"mrl_n":{},"offset":{:.3},"cat":"{}","grid":"{}"}}"#,
                 p.band_a, p.band_b, p.mean_angular_distance_deg, p.stability,
-                p.peak_n, p.peak_strength, p.shifted_coherence, p.shifted_offset,
+                p.peak_n, p.peak_strength, p.shifted_coherence, p.shifted_harmonic, p.shifted_offset,
                 cat, p.grid_native)?;
         }
         write!(f, "],")?;
@@ -517,9 +538,10 @@ pub fn write_galaxy_map_json(scan: &GalaxyScan, path: &Path) -> std::io::Result<
         write!(f, r#""fwm_quartets":["#)?;
         for (qi, q) in layer.fwm_quartets.iter().enumerate() {
             if qi > 0 { write!(f, ",")?; }
-            write!(f, r#"{{"bands":[{},{},{},{}],"sum":{},"coh":{:.3}}}"#,
+            let cat_str = match q.category { 2 => "locked", 1 => "oscillating", _ => "random" };
+            write!(f, r#"{{"bands":[{},{},{},{}],"sum":{},"coh":{:.3},"ps_mrl":{:.3},"cat":"{}"}}"#,
                 q.bands[0], q.bands[1], q.bands[2], q.bands[3],
-                q.fwm_index_sum, q.mean_coherence_n4)?;
+                q.fwm_index_sum, q.mean_coherence_n4, q.phase_sum_mrl, cat_str)?;
         }
         write!(f, "],")?;
 
@@ -633,7 +655,8 @@ pub fn print_summary(scan: &GalaxyScan) {
         eprintln!("  FWM quartets ({} total): preserved={}, destroyed={}, created={}, noise={}, partial={}",
             s.fwm_quartet_total, s.fwm_preserved, s.fwm_destroyed,
             s.fwm_created, s.fwm_noise, s.fwm_partial);
-        eprintln!("    mean_dev={:.4}, significant={}", s.fwm_mean_deviation, s.fwm_significant);
+        eprintln!("    mean_dev={:.4}, locked={}, oscillating={}",
+            s.fwm_mean_deviation, s.quartet_locked, s.quartet_oscillating);
         eprintln!("  Grid: g1={:.1}% g2={:.1}% comp={:.1}% approx={:.1}%",
             s.grid1_frac * 100.0, s.grid2_frac * 100.0,
             s.composite_frac * 100.0, s.approximate_frac * 100.0);
