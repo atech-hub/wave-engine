@@ -195,6 +195,10 @@ pub fn print_help() {
     println!("                        multi-grid decomposition. Auto-runs at end of training.");
     println!("                        Output: <checkpoint>_galaxy/ with galaxy_map.json,");
     println!("                        galaxy_matrix.bin, phases.bin.");
+    println!("    --memory FILE       Wave memory file (.kwmf). Created if not found.");
+    println!("                        Memory nudges ODE initial conditions based on");
+    println!("                        accumulated conversation experience. Model weights");
+    println!("                        stay frozen — memory is experience, not education.");
     println!("    --sub-harmonic      Include sub-harmonic diagnostics (with --analyze)");
     println!("    --ode-monitor       Show raw per-band ODE data for a prompt");
     println!("    --compare TEXT      Compare two prompts in ODE monitor mode");

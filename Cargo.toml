@@ -27,6 +27,9 @@ serde_json = "1"
 # FFT for OFDM-inspired ODE acceleration
 rustfft = "6.2"
 
+# Wave memory (persistent ODE state accumulation)
+kerr-memory = { path = "../kerr-memory" }
+
 # Memory-mapped large datasets
 memmap2 = "0.9"
 

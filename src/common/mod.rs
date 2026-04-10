@@ -51,3 +51,4 @@ pub mod ode_backward_monitor;
 pub mod ode_parity;
 pub mod framework_monitor;
 pub mod galaxy_scan;
+pub mod wave_memory;
