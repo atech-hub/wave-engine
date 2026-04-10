@@ -83,6 +83,8 @@ pub struct PairRelation {
     pub stability: f32,
     pub peak_n: usize,
     pub peak_strength: f32,
+    pub shifted_coherence: f32,   // MRL at peak harmonic (coherence at optimal offset)
+    pub shifted_offset: f32,      // optimal phase offset in radians
     pub catalog_match: Option<&'static str>,
     pub catalog_orb_fit: f32,
     pub grid_native: &'static str,
@@ -112,6 +114,7 @@ pub struct LayerSummary {
     pub fwm_significant: usize,  // stored quartets
     pub fwm_mean_deviation: f32,
     pub fwm_hist_2d: [[u32; 10]; 10], // [baseline_bin][trained_bin]
+    pub shifted_pair_count: usize,  // pairs with hidden coherence (MRL > 0.5 and MRL > 3*|peak|)
     pub sphere_fill_fraction: f32,
     pub sphere_center_fraction: f32,
     pub grid1_frac: f32,
@@ -223,6 +226,28 @@ fn scan_layer(
             let spectrum = wa::harmonic_spectrum(&phases_i, &phases_j, 12);
             let (peak_str, peak_n) = wa::best_harmonic_coherence(&phases_i, &phases_j, 12);
 
+            // Shifted coherence (MRL) — best across harmonics 1,2,3,4,6
+            // MRL captures coherence at ANY fixed offset, not just zero
+            let mut best_mrl = 0.0f32;
+            let mut best_offset = 0.0f32;
+            for &nh in &[1u32, 2, 3, 4, 6] {
+                let n_f = nh as f32;
+                let mut ss = 0.0f32;
+                let mut sc = 0.0f32;
+                for pos in 0..n_positions {
+                    let delta = n_f * (phases[pos][i] - phases[pos][j]);
+                    ss += delta.sin();
+                    sc += delta.cos();
+                }
+                let this_mrl = (ss * ss + sc * sc).sqrt() / n_positions as f32;
+                if this_mrl > best_mrl {
+                    best_mrl = this_mrl;
+                    best_offset = ss.atan2(sc) / n_f;
+                }
+            }
+            let mrl = best_mrl;
+            let shifted_offset = best_offset;
+
             // Mean angular distance
             let diffs: Vec<f32> = phases_i.iter().zip(&phases_j)
                 .map(|(&a, &b)| {
@@ -256,26 +281,43 @@ fn scan_layer(
             all_pairs.push(PairRelation {
                 band_a: i, band_b: j, mean_angular_distance_deg: mean_dist_deg,
                 stability, peak_n, peak_strength: peak_str,
+                shifted_coherence: mrl, shifted_offset,
                 catalog_match: cat_name, catalog_orb_fit: cat_fit, grid_native: grid,
             });
             pair_spectra.push(spectrum);
         }
     }
 
-    // Top 100 pairs by peak strength
-    let mut top_indices: Vec<usize> = (0..all_pairs.len()).collect();
-    top_indices.sort_by(|&a, &b| all_pairs[b].peak_strength.partial_cmp(&all_pairs[a].peak_strength).unwrap_or(std::cmp::Ordering::Equal));
-    top_indices.truncate(100);
+    // Top pairs: merge top-100 by peak_strength with top-100 by shifted_coherence, cap at 200
+    let mut top_by_peak: Vec<usize> = (0..all_pairs.len()).collect();
+    top_by_peak.sort_by(|&a, &b| all_pairs[b].peak_strength.partial_cmp(&all_pairs[a].peak_strength).unwrap_or(std::cmp::Ordering::Equal));
+    top_by_peak.truncate(100);
+    let mut top_by_mrl: Vec<usize> = (0..all_pairs.len()).collect();
+    top_by_mrl.sort_by(|&a, &b| all_pairs[b].shifted_coherence.partial_cmp(&all_pairs[a].shifted_coherence).unwrap_or(std::cmp::Ordering::Equal));
+    top_by_mrl.truncate(100);
+    // Merge and deduplicate
+    let mut seen = std::collections::HashSet::new();
+    let mut top_indices = Vec::new();
+    for idx in top_by_peak.into_iter().chain(top_by_mrl.into_iter()) {
+        if seen.insert(idx) { top_indices.push(idx); }
+    }
+    top_indices.truncate(200);
     let top_pairs: Vec<PairRelation> = top_indices.into_iter().map(|idx| {
         let p = &all_pairs[idx];
         PairRelation {
             band_a: p.band_a, band_b: p.band_b,
             mean_angular_distance_deg: p.mean_angular_distance_deg,
             stability: p.stability, peak_n: p.peak_n, peak_strength: p.peak_strength,
+            shifted_coherence: p.shifted_coherence, shifted_offset: p.shifted_offset,
             catalog_match: p.catalog_match, catalog_orb_fit: p.catalog_orb_fit,
             grid_native: p.grid_native,
         }
     }).collect();
+
+    // Count shifted pairs (hidden coherence)
+    let shifted_pair_count = all_pairs.iter()
+        .filter(|p| p.shifted_coherence > 0.5 && p.shifted_coherence > 3.0 * p.peak_strength.abs().max(0.01))
+        .count();
 
     // Layer 3: Triads (brute-force enumerate, filter by trine orb)
     let trine_orb = 15.0f32; // permissive for first build
@@ -415,6 +457,7 @@ fn scan_layer(
         fwm_significant: fwm_quartets.len(),
         fwm_hist_2d,
         fwm_mean_deviation: fwm_mean_dev,
+        shifted_pair_count,
         sphere_fill_fraction: fill_frac,
         sphere_center_fraction: center_frac,
         grid1_frac: grid_counts[0] as f32 / total,
@@ -454,9 +497,10 @@ pub fn write_galaxy_map_json(scan: &GalaxyScan, path: &Path) -> std::io::Result<
         for (pi, p) in layer.top_pairs.iter().enumerate() {
             if pi > 0 { write!(f, ",")?; }
             let cat = p.catalog_match.unwrap_or("none");
-            write!(f, r#"{{"a":{},"b":{},"dist_deg":{:.1},"stability":{:.3},"peak_n":{},"peak_str":{:.3},"cat":"{}","grid":"{}"}}"#,
+            write!(f, r#"{{"a":{},"b":{},"dist_deg":{:.1},"stability":{:.3},"peak_n":{},"peak_str":{:.3},"mrl":{:.3},"offset":{:.3},"cat":"{}","grid":"{}"}}"#,
                 p.band_a, p.band_b, p.mean_angular_distance_deg, p.stability,
-                p.peak_n, p.peak_strength, cat, p.grid_native)?;
+                p.peak_n, p.peak_strength, p.shifted_coherence, p.shifted_offset,
+                cat, p.grid_native)?;
         }
         write!(f, "],")?;
 
@@ -482,8 +526,9 @@ pub fn write_galaxy_map_json(scan: &GalaxyScan, path: &Path) -> std::io::Result<
         // Summary (includes full-matrix catalog counts + FWM deviation stats)
         let sig: Vec<String> = layer.summary.significant_by_type.iter()
             .map(|(k, v)| format!("\"{}\":{}", k, v)).collect();
-        write!(f, r#""summary":{{"pairs":{},"triads":{},"fwm":{{"total":{},"preserved":{},"destroyed":{},"created":{},"noise":{},"partial":{},"significant":{},"mean_dev":{:.4}}},"fill":{:.3},"center":{:.3},"catalog":{{{}}}, "grid":{{"g1":{:.3},"g2":{:.3},"comp":{:.3},"approx":{:.3}}}}}"#,
+        write!(f, r#""summary":{{"pairs":{},"triads":{},"shifted_pairs":{},"fwm":{{"total":{},"preserved":{},"destroyed":{},"created":{},"noise":{},"partial":{},"significant":{},"mean_dev":{:.4}}},"fill":{:.3},"center":{:.3},"catalog":{{{}}}, "grid":{{"g1":{:.3},"g2":{:.3},"comp":{:.3},"approx":{:.3}}}}}"#,
             layer.summary.total_pairs, layer.summary.triadic_count,
+            layer.summary.shifted_pair_count,
             layer.summary.fwm_quartet_total, layer.summary.fwm_preserved,
             layer.summary.fwm_destroyed, layer.summary.fwm_created,
             layer.summary.fwm_noise, layer.summary.fwm_partial,
@@ -584,7 +629,7 @@ pub fn print_summary(scan: &GalaxyScan) {
     if let Some(final_layer) = scan.layers.last() {
         let total_sig: usize = final_layer.summary.significant_by_type.iter().map(|(_, v)| v).sum();
         let s = &final_layer.summary;
-        eprintln!("  Galaxy: {} sig pairs, {} triads", total_sig, s.triadic_count);
+        eprintln!("  Galaxy: {} sig pairs, {} shifted pairs, {} triads", total_sig, s.shifted_pair_count, s.triadic_count);
         eprintln!("  FWM quartets ({} total): preserved={}, destroyed={}, created={}, noise={}, partial={}",
             s.fwm_quartet_total, s.fwm_preserved, s.fwm_destroyed,
             s.fwm_created, s.fwm_noise, s.fwm_partial);
