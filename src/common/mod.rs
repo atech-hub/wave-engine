@@ -52,3 +52,4 @@ pub mod ode_parity;
 pub mod framework_monitor;
 pub mod galaxy_scan;
 pub mod wave_memory;
+pub mod phase_encode;
