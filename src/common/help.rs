@@ -218,6 +218,12 @@ pub fn print_help() {
     println!("    --scan              Run full galaxy scan on encode output");
     println!("    --data FILE         Data file for char vocab (needed for text encode)");
     println!();
+    println!("MEMORY SCAN:");
+    println!("    --scan-memory FILE  Analyze a .kwmf wave memory file.");
+    println!("                        Per-layer: magnitude profile, catalog matches,");
+    println!("                        peak/weakest bands, cross-layer comparison.");
+    println!("    --output FILE       Write scan results to JSON");
+    println!();
     println!("RELATE (harmonic coherence profiles between encodings):");
     println!("    --relate A --relate B   Pairwise harmonic profile between two+ items");
     println!("    --relate-number N       Add a number to relate comparison");

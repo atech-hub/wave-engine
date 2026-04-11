@@ -365,6 +365,26 @@ fn main() {
         return;
     }
 
+    // ─── Scan memory mode ───
+    if std::env::args().any(|a| a == "--scan-memory") {
+        let memory_path = std::env::args().skip_while(|a| a != "--scan-memory").nth(1)
+            .expect("--scan-memory requires a .kwmf file path");
+        let output = std::env::args().skip_while(|a| a != "--output").nth(1);
+
+        println!("Scanning memory: {}", memory_path);
+        let mem = kerr_memory::file::load(&memory_path)
+            .expect("Failed to load memory file");
+        let scans = common::wave_memory::scan_memory(&mem);
+        common::wave_memory::print_memory_scan(&mem, &scans);
+
+        if let Some(out_path) = output {
+            common::wave_memory::write_memory_scan_json(&out_path, &mem, &scans)
+                .unwrap_or_else(|e| eprintln!("Error writing {}: {}", out_path, e));
+            println!("\n  JSON written to: {}", out_path);
+        }
+        return;
+    }
+
     // ─── Galaxy scan mode (retrospective on existing checkpoint) ───
     if std::env::args().any(|a| a == "--galaxy-scan") {
         fn pflag_gs<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -804,6 +824,14 @@ fn main() {
 
         let stencil = fft_ode::StencilFft::new(n_bands);
 
+        // Wave memory
+        let memory_path: Option<String> = std::env::args().skip_while(|a| a != "--memory").nth(1);
+        let wave_mem = memory_path.as_ref().map(|path| {
+            std::sync::Mutex::new(
+                common::wave_memory::load_or_create(path, n_layers, n_bands)
+            )
+        });
+
         let state = std::sync::Arc::new(serve_tier::server::AppState {
             model: std::sync::Arc::new(model),
             vocab: std::sync::Arc::new(vocab),
@@ -813,6 +841,8 @@ fn main() {
             api_key: std::env::args().skip_while(|a| a != "--api-key").nth(1),
             host: parse_flag("--host", "127.0.0.1".to_string()),
             port: parse_flag("--port", 8080),
+            memory: wave_mem,
+            memory_path,
         });
 
         serve_tier::server::run_server(state);
