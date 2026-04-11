@@ -142,6 +142,9 @@ fn main() {
             model
         };
 
+        // Initialize AGC — required for ODE stability in encode/relate paths
+        crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+
         let n_embd = n_bands * 2;
 
         // Build char map from data file for text encoding

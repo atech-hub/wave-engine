@@ -114,6 +114,15 @@ pub fn dual_maestro_forward_cached(
         precond_all.push(precond);
     }
 
+    // AGC: clamp preconditioned input magnitudes before ODE to prevent NaN.
+    // Uses the global static AGC (initialized by init_agc in calling code).
+    let n_bands = n_embd / 2;
+    {
+        let mut agc = super::ffn::AGC.get_or_init(|| std::sync::Mutex::new(super::agc::OdeAgc::new()))
+            .lock().unwrap();
+        agc.process(&mut precond_all, n_bands);
+    }
+
     // ODE: CPU always. GPU ODE produces different FP values → maestro backward gets
     // wrong gradients → 0.4 loss gap. The ODE is frozen but maestro_out backward
     // uses kerr_out_all to compute maestro squeeze/process gradients on CPU.
