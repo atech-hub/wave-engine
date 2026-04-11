@@ -455,6 +455,7 @@ pub struct RelateReport {
     pub shifted_offset: f32,
     pub shifted_harmonic: usize,
     pub deformation_sim: f32,  // cosine similarity of energy deformation vectors
+    pub grid_tag: &'static str, // "same_g1", "same_g2", "cross", "unknown"
 }
 
 /// Compute full harmonic coherence profile between two output states.
@@ -543,6 +544,7 @@ pub fn relate_states_with_deformation(
         shifted_offset: best_offset,
         shifted_harmonic: best_n,
         deformation_sim: deform_sim,
+        grid_tag: "unknown", // set by caller if grid info available
     }
 }
 
@@ -825,18 +827,45 @@ pub fn run_relate_vocab(
     let mut reports = Vec::with_capacity(total);
     let mut dist: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
+    // Grid info for Wu He tagging (m1/m2 derived from vocab)
+    let n_half = n_bands / 2;
+
     for i in 0..vocab {
         for j in (i + 1)..vocab {
-            let r = relate_states_with_deformation(
+            let mut r = relate_states_with_deformation(
                 &outputs[i], &outputs[j],
                 &labels[i], &labels[j],
                 Some(&deformations[i]), Some(&deformations[j]),
             );
+            // Wu He grid tagging: check if tokens share grid-1 or grid-2 position
+            // Grid positions are i % m1 and i % m2 respectively
+            // (approximate — actual grid depends on embedding table moduli)
+            let g1_same = (i % 9) == (j % 9); // approximate for m1=9
+            let g2_same = (i % 11) == (j % 11); // approximate for m2=11
+            r.grid_tag = match (g1_same, g2_same) {
+                (true, false) => "same_g1",
+                (false, true) => "same_g2",
+                (true, true) => "same_both",
+                (false, false) => "cross",
+            };
             if let Some((name, _)) = r.catalog_match {
                 *dist.entry(name.to_string()).or_insert(0) += 1;
             }
             reports.push(r);
         }
+    }
+
+    // Liu Hai: catalog vs friction coherence ratio
+    let catalog_mrls: Vec<f32> = reports.iter()
+        .filter(|r| r.catalog_match.is_some())
+        .map(|r| r.shifted_mrl).collect();
+    let friction_mrls: Vec<f32> = reports.iter()
+        .filter(|r| r.catalog_match.is_none())
+        .map(|r| r.shifted_mrl).collect();
+    if !catalog_mrls.is_empty() && !friction_mrls.is_empty() {
+        let cat_avg = catalog_mrls.iter().sum::<f32>() / catalog_mrls.len() as f32;
+        let fri_avg = friction_mrls.iter().sum::<f32>() / friction_mrls.len() as f32;
+        println!("  Liu Hai ratio (catalog/friction MRL): {:.3}x", cat_avg / fri_avg.max(0.001));
     }
 
     (labels, reports, dist, profiles)
@@ -873,9 +902,9 @@ pub fn write_vocab_relations_json(
         let esc = |s: &str| -> String {
             s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
         };
-        write!(f, "    {{\"a\":\"{}\",\"b\":\"{}\",\"angle\":{:.1},\"catalog\":{},\"mrl\":{:.3},\"harm\":{},\"deform_sim\":{:.3}}}{}\n",
+        write!(f, "    {{\"a\":\"{}\",\"b\":\"{}\",\"angle\":{:.1},\"catalog\":{},\"mrl\":{:.3},\"harm\":{},\"deform_sim\":{:.3},\"grid\":\"{}\"}}{}\n",
             esc(&r.label_a), esc(&r.label_b), r.mean_angular_distance_deg, cat,
-            r.shifted_mrl, r.shifted_harmonic, r.deformation_sim,
+            r.shifted_mrl, r.shifted_harmonic, r.deformation_sim, r.grid_tag,
             if i + 1 < limit { "," } else { "" })?;
     }
     write!(f, "  ]")?;
