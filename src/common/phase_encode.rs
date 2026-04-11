@@ -492,7 +492,7 @@ pub fn relate_states_with_deformation(
     let mean_deg = mean_angle.to_degrees().rem_euclid(360.0);
 
     // Per-harmonic coherence
-    let harm_numbers = [1, 2, 3, 4, 5, 6, 8, 12];
+    let harm_numbers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 20, 24, 27, 36, 60];
     let threshold = 0.8;
     let harmonics: Vec<HarmonicProfile> = harm_numbers.iter().map(|&n| {
         let per_band: Vec<f32> = (0..n_bands).map(|k| {

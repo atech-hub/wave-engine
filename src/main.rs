@@ -190,6 +190,26 @@ fn main() {
                 println!("    {:>4}  energy={:.2}x  peak=band{}({:.1}x)  damp=band{}({:.2}x)",
                     p.label, p.total_energy_ratio, p.peak_band, p.peak_ratio, p.damp_band, p.damp_ratio);
             }
+            // Compute catalog axes (phase, dignity, direction, destruction)
+            let phase_scores: std::collections::HashMap<String, f32> = labels.iter().enumerate().map(|(i, label)| {
+                let total = reports.iter().filter(|r| r.label_a == *label || r.label_b == *label).count();
+                let non_conj = reports.iter().filter(|r| {
+                    (r.label_a == *label || r.label_b == *label)
+                    && r.catalog_match.map(|(n, _)| n != "conjunction").unwrap_or(false)
+                }).count();
+                (label.clone(), if total > 0 { non_conj as f32 / total as f32 } else { 0.0 })
+            }).collect();
+            let axis_scores = common::catalog_axes::compute_all_axes(&model, n_bands, &char_map, &phase_scores);
+            let corr = common::catalog_axes::correlation_matrix(&axis_scores);
+            common::catalog_axes::print_axes_summary(&axis_scores, &corr);
+
+            // Targeted destruction profile
+            let destruction_profile = common::catalog_axes::compute_destruction_profile(&model, n_bands, m1, m2);
+            println!("\n  Targeted destruction profile:");
+            for l in &destruction_profile.per_layer {
+                println!("    L{}: on={:.3} off={:.3} ratio={:.2}x", l.layer, l.on_grid_cos, l.off_grid_cos, l.ratio);
+            }
+
             if let Err(e) = common::phase_encode::write_vocab_relations_json(&output, &labels, &reports, &dist, Some(&profiles)) {
                 eprintln!("Error writing {}: {}", output, e);
             } else {

@@ -53,3 +53,4 @@ pub mod framework_monitor;
 pub mod galaxy_scan;
 pub mod wave_memory;
 pub mod phase_encode;
+pub mod catalog_axes;
