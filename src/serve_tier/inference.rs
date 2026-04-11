@@ -34,6 +34,7 @@ pub fn generate(
     vocab: &Vocab,
     dims: Dims,
     stencil: &crate::fft_ode::StencilFft,
+    memory: Option<&[(&[f32], &[f32])]>,
 ) -> GenerationResult {
     let mut rng = make_rng();
     let mut tokens = prompt_tokens.to_vec();
@@ -41,7 +42,7 @@ pub fn generate(
 
     // Prefill: process entire prompt, populate cache
     let mut cache = kv_cache::KvCache::new(model.blocks.len(), dims.n_head);
-    let mut logits = kv_cache::prefill(model, prompt_tokens, dims, &mut cache, stencil);
+    let mut logits = kv_cache::prefill(model, prompt_tokens, dims, &mut cache, stencil, memory);
 
     for _ in 0..config.max_tokens {
         if let Some(penalty) = config.repetition_penalty {
@@ -56,7 +57,7 @@ pub fn generate(
 
         // Forward one: O(T) using cached attention state
         let pos = tokens.len() - 1;
-        logits = kv_cache::forward_one(model, token, pos, dims, &mut cache, stencil);
+        logits = kv_cache::forward_one(model, token, pos, dims, &mut cache, memory, stencil);
     }
 
     let text = vocab.decode(&generated);
@@ -71,6 +72,7 @@ pub fn generate_streaming<F>(
     vocab: &Vocab,
     dims: Dims,
     stencil: &crate::fft_ode::StencilFft,
+    memory: Option<&[(&[f32], &[f32])]>,
     mut on_token: F,
 ) where
     F: FnMut(TokenEvent) -> bool,
@@ -79,7 +81,7 @@ pub fn generate_streaming<F>(
     let mut tokens = prompt_tokens.to_vec();
 
     let mut cache = kv_cache::KvCache::new(model.blocks.len(), dims.n_head);
-    let mut logits = kv_cache::prefill(model, prompt_tokens, dims, &mut cache, stencil);
+    let mut logits = kv_cache::prefill(model, prompt_tokens, dims, &mut cache, stencil, memory);
 
     for i in 0..config.max_tokens {
         if let Some(penalty) = config.repetition_penalty {
@@ -99,7 +101,7 @@ pub fn generate_streaming<F>(
         }
 
         let pos = tokens.len() - 1;
-        logits = kv_cache::forward_one(model, token, pos, dims, &mut cache, stencil);
+        logits = kv_cache::forward_one(model, token, pos, dims, &mut cache, memory, stencil);
     }
 }
 

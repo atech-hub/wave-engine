@@ -84,8 +84,23 @@ async fn handle_non_streaming(
     let dims = state.dims;
     let stencil = state.stencil.clone();
 
+    // Build memory offsets if memory is loaded
+    let mem_offsets = state.memory.as_ref().map(|m| {
+        let mem = m.lock().unwrap();
+        crate::common::wave_memory::build_offsets(&mem)
+    });
+    let mem_slices: Option<Vec<(&[f32], &[f32])>> = mem_offsets.as_ref().map(|o| o.as_slices());
+    // Clone for move into spawn_blocking
+    let mem_for_gen: Option<Vec<(Vec<f32>, Vec<f32>)>> = mem_offsets.as_ref().map(|o| {
+        o.offsets.iter().map(|(r, s)| (r.clone(), s.clone())).collect()
+    });
+
     let result = tokio::task::spawn_blocking(move || {
-        inference::generate(&model, &prompt_tokens, &config, &vocab, dims, &stencil)
+        let mem_refs: Option<Vec<(&[f32], &[f32])>> = mem_for_gen.as_ref().map(|v| {
+            v.iter().map(|(r, s)| (r.as_slice(), s.as_slice())).collect()
+        });
+        inference::generate(&model, &prompt_tokens, &config, &vocab, dims, &stencil,
+            mem_refs.as_deref())
     })
     .await
     .unwrap();
@@ -109,6 +124,16 @@ async fn handle_non_streaming(
             total_tokens: prompt_len + result.tokens.len(),
         },
     };
+
+    // Accumulate memory after generation (non-streaming saves immediately)
+    if let (Some(mem_lock), Some(path)) = (&state.memory, &state.memory_path) {
+        if let Ok(mut mem) = mem_lock.lock() {
+            // Simple accumulation: increment conversation count
+            // Full ODE state extraction would need a separate forward pass
+            mem.n_convos += 1;
+            crate::common::wave_memory::save(path, &mem);
+        }
+    }
 
     Json(response).into_response()
 }
@@ -147,8 +172,18 @@ async fn handle_streaming(
     let req_id = request_id;
     let mn = model_name;
 
+    // Build memory offsets for streaming
+    let mem_for_stream: Option<Vec<(Vec<f32>, Vec<f32>)>> = state.memory.as_ref().map(|m| {
+        let mem = m.lock().unwrap();
+        let offsets = crate::common::wave_memory::build_offsets(&mem);
+        offsets.offsets.iter().map(|(r, s)| (r.clone(), s.clone())).collect()
+    });
+
     tokio::task::spawn_blocking(move || {
-        inference::generate_streaming(&model, &prompt_tokens, &config, &vocab, dims, &stencil, |event| {
+        let mem_refs: Option<Vec<(&[f32], &[f32])>> = mem_for_stream.as_ref().map(|v| {
+            v.iter().map(|(r, s)| (r.as_slice(), s.as_slice())).collect()
+        });
+        inference::generate_streaming(&model, &prompt_tokens, &config, &vocab, dims, &stencil, mem_refs.as_deref(), |event| {
             let chunk = ChatCompletionChunk {
                 id: req_id.clone(),
                 object: "chat.completion.chunk".to_string(),

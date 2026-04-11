@@ -26,6 +26,8 @@ pub struct AppState {
     pub api_key: Option<String>,
     pub host: String,
     pub port: u16,
+    pub memory: Option<std::sync::Mutex<kerr_memory::memory::WaveMemory>>,
+    pub memory_path: Option<String>,
 }
 
 /// Bearer token auth middleware.

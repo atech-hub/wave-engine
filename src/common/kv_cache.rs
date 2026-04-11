@@ -96,6 +96,7 @@ pub fn prefill(
     dims: Dims,
     cache: &mut KvCache,
     stencil: &crate::fft_ode::StencilFft,
+    memory: Option<&[(&[f32], &[f32])]>,
 ) -> Vec<f32> {
     let t = tokens.len();
     let n_embd = dims.n_embd;
@@ -195,9 +196,10 @@ pub fn prefill(
         let normed_ffn: Vec<Vec<f32>> = hidden.iter()
             .map(|h| layer_norm(h, &block.ln_ffn.weight, &block.ln_ffn.bias))
             .collect();
+        let layer_mem = memory.and_then(|m| m.get(layer_idx).copied());
         let (ffn_out, _) = crate::ffn_backend::ffn_forward_via_backend(
             &block.ffn, &normed_ffn, &crate::backend::CpuBackend,
-            Some(stencil), None, None, true, dims.use_corrector, None, None,
+            Some(stencil), None, None, true, dims.use_corrector, None, layer_mem,
         );
 
         // Residual
@@ -235,6 +237,7 @@ pub fn forward_one(
     pos: usize,
     dims: Dims,
     cache: &mut KvCache,
+    memory: Option<&[(&[f32], &[f32])]>,
     stencil: &crate::fft_ode::StencilFft,
 ) -> Vec<f32> {
     let n_embd = dims.n_embd;
@@ -326,9 +329,10 @@ pub fn forward_one(
 
         // FFN (single position)
         let normed_ffn = layer_norm(&hidden, &block.ln_ffn.weight, &block.ln_ffn.bias);
+        let layer_mem = memory.and_then(|m| m.get(layer_idx).copied());
         let (ffn_out, _) = crate::ffn_backend::ffn_forward_via_backend(
             &block.ffn, &[normed_ffn], &crate::backend::CpuBackend,
-            Some(stencil), None, None, true, dims.use_corrector, None, None,
+            Some(stencil), None, None, true, dims.use_corrector, None, layer_mem,
         );
 
         // Residual
