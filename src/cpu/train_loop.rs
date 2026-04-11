@@ -336,7 +336,7 @@ pub fn run_training(config: TrainConfig) {
                         }).collect()
                     });
                     let layer_agcs_ref = layer_agcs_storage.as_deref_mut();
-                    let cache = forward_with_cache(model_ref, input, dims, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref, layer_agcs_ref);
+                    let cache = forward_with_cache(model_ref, input, dims, gpu_ref, pp_ref, fg_ref, st_ref, gk_ref, layer_agcs_ref, None);
 
                     // Health monitors on first batch element only (before backward)
                     let is_health = measure_batch_distortion && batch_idx == 0;
@@ -519,7 +519,7 @@ pub fn run_training(config: TrainConfig) {
             let scan_start = (crate::rng::Rng::new(42).next_u64() as usize) % (train_data.len() - seq_len - 1);
             let scan_tokens = &train_data[scan_start..scan_start + seq_len];
             let scan_cache = crate::cpu::forward::forward_with_cache(
-                &model, scan_tokens, dims, None, None, None, Some(&stencil), None, None,
+                &model, scan_tokens, dims, None, None, None, Some(&stencil), None, None, None,
             );
             let scan_precond = if let Some(ref fc) = scan_cache.block_caches[0].ffn_backend_cache {
                 fc.precond[0].clone()
@@ -548,7 +548,7 @@ pub fn run_training(config: TrainConfig) {
             let sample_tokens = &train_data[sample_start..sample_start + seq_len];
             // Run a quick forward to get block caches with real activations
             let sample_cache = crate::cpu::forward::forward_with_cache(
-                &model, sample_tokens, dims, None, None, None, Some(&stencil), None, None,
+                &model, sample_tokens, dims, None, None, None, Some(&stencil), None, None, None,
             );
             use std::io::Write;
             let mut fwm_layers = Vec::new();
@@ -807,7 +807,7 @@ pub fn run_training(config: TrainConfig) {
         let scan_tokens = &train_data[..scan_len];
         // Forward pass on CPU for phase extraction
         let scan_cache = crate::cpu::forward::forward_with_cache(
-            &model, scan_tokens, dims, None, None, None, Some(&stencil), None, None,
+            &model, scan_tokens, dims, None, None, None, Some(&stencil), None, None, None,
         );
         let all_layer_hidden: Vec<Vec<Vec<f32>>> = scan_cache.block_caches.iter()
             .map(|bc| bc.input.clone()).collect();

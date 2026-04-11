@@ -59,7 +59,7 @@ pub fn sample(
     let token_ids = &token_ids[..max_t];
 
     // Forward pass (CPU, no GPU — this is a diagnostic)
-    let cache = forward_with_cache(model, token_ids, dims, None, None, None, Some(stencil), None, None);
+    let cache = forward_with_cache(model, token_ids, dims, None, None, None, Some(stencil), None, None, None);
     let hidden = &cache.post_ln_f;
 
     let n_bands = dims.n_bands;

@@ -53,6 +53,7 @@ pub fn forward_with_cache(
     stencil: Option<&fft_ode::StencilFft>,
     gpu_kernel: Option<(&fft_ode::GpuKernelFft, &gpu_pipelines::GpuBackend)>,
     layer_agcs: Option<&mut [crate::common::agc::OdeAgc]>,
+    memory_offsets: Option<&[(&[f32], &[f32])]>,
 ) -> ForwardCache {
     let profile = PROFILE.load(std::sync::atomic::Ordering::Relaxed);
     let t = tokens.len();
@@ -92,7 +93,8 @@ pub fn forward_with_cache(
         let _tf = std::time::Instant::now();
         let freeze_ode = !d.learnable_ode;
         let use_corrector = d.use_corrector;
-        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, freeze_ode, use_corrector, agc_for_layer);
+        let layer_mem = memory_offsets.and_then(|offsets| offsets.get(block_idx).copied());
+        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, freeze_ode, use_corrector, agc_for_layer, layer_mem);
         let ffn_dur = _tf.elapsed();
 
         // Attention (CPU — frozen, harmonic coherence scoring)

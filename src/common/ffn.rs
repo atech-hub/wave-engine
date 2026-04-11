@@ -46,6 +46,7 @@ pub fn ffn_forward_via_backend(
     freeze_ode: bool,
     use_corrector: bool,
     layer_agc: Option<&mut crate::common::agc::OdeAgc>,
+    memory: Option<(&[f32], &[f32])>,
 ) -> (Vec<Vec<f32>>, FfnCache) {
     let t = x.len();
     let n_embd = x[0].len();
@@ -75,6 +76,17 @@ pub fn ffn_forward_via_backend(
     };
     ODE_CLAMP_COUNT.store(clamp_count, std::sync::atomic::Ordering::Relaxed);
     ODE_MAX_MAG.store(max_pre_clamp_mag.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+    // 2b. Wave memory injection: add per-band offsets to ODE initial conditions.
+    //     When None, code path is identical (bit-identical baseline).
+    if let Some((r_mem, s_mem)) = memory {
+        for p in &mut precond {
+            for k in 0..n_bands.min(r_mem.len()) {
+                p[k * 2] += r_mem[k];
+                p[k * 2 + 1] += s_mem[k];
+            }
+        }
+    }
 
     // 3. ODE: when !freeze_ode, use caching forward for backward pass.
     //    When freeze_ode, use the fast path (GPU/FFT/sequential, no cache).

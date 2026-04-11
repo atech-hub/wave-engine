@@ -404,7 +404,7 @@ fn main() {
         let scan_len = tokens.len().min(200).min(128); // clamp to block_size
         let stencil = fft_ode::StencilFft::new(n_bands * 2);
         let cache = crate::cpu::forward::forward_with_cache(
-            &model, &tokens[..scan_len], dims, None, None, None, Some(&stencil), None, None,
+            &model, &tokens[..scan_len], dims, None, None, None, Some(&stencil), None, None, None,
         );
         let all_hidden: Vec<Vec<Vec<f32>>> = cache.block_caches.iter()
             .map(|bc| bc.input.clone()).collect();
@@ -744,6 +744,7 @@ fn main() {
             beta: parse_flag("--beta", parse_flag("--alpha", 0.1)),
             temperature: parse_flag("--temperature", 0.0),
             phase_native: std::env::args().any(|a| a == "--phase-native"),
+            memory_path: std::env::args().skip_while(|a| a != "--memory").nth(1),
         });
         return;
     }

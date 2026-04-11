@@ -205,7 +205,7 @@ pub fn run_analyze(
 
     // Forward pass
     let stencil = fft_ode::StencilFft::new(dims.n_bands);
-    let cache = forward_with_cache(&model, &token_ids, dims, None, None, None, Some(&stencil), None, None);
+    let cache = forward_with_cache(&model, &token_ids, dims, None, None, None, Some(&stencil), None, None, None);
 
     // Extract per-layer phases
     let mut per_layer_phases: Vec<Vec<Vec<f32>>> = Vec::new();

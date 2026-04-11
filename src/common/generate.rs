@@ -20,6 +20,7 @@ pub struct GenerateConfig {
     pub beta: f32,
     pub temperature: f32,
     pub phase_native: bool,
+    pub memory_path: Option<String>,
 }
 
 pub fn run_generate(config: GenerateConfig) {
@@ -190,6 +191,14 @@ pub fn run_generate(config: GenerateConfig) {
     let beta = mdl.blocks[0].ffn.kerr.beta;
     crate::ffn_backend::init_agc(alpha, beta);
 
+    // Wave memory: load or create if --memory was specified
+    let n_ode_layers = config.n_layers; // all layers have ODE in wave-engine
+    let mut wave_mem = config.memory_path.as_ref().map(|path| {
+        crate::common::wave_memory::load_or_create(path, n_ode_layers, config.n_bands)
+    });
+    let mem_offsets = wave_mem.as_ref().map(|m| crate::common::wave_memory::build_offsets(m));
+    let mem_slices: Option<Vec<(&[f32], &[f32])>> = mem_offsets.as_ref().map(|o| o.as_slices());
+
     // Autoregressive generation
     let mut tokens = token_ids.clone();
     let block_size = dims.block_size;
@@ -213,8 +222,9 @@ pub fn run_generate(config: GenerateConfig) {
         let start = if tokens.len() > block_size { tokens.len() - block_size } else { 0 };
         let input = &tokens[start..];
 
-        // Forward pass — SAME as training
-        let cache = forward_with_cache(&mdl, input, dims, None, None, None, Some(&stencil), None, None);
+        // Forward pass — SAME as training, with optional memory injection
+        let cache = forward_with_cache(&mdl, input, dims, None, None, None, Some(&stencil), None, None,
+            mem_slices.as_deref());
 
         // Get logits/scores for last position
         // Phase-native decode is now handled in forward.rs (dot product against embeddings)
@@ -259,4 +269,32 @@ pub fn run_generate(config: GenerateConfig) {
     println!();
     eprintln!("---");
     eprintln!("  Generated {} tokens (total {} tokens)", config.max_tokens, tokens.len());
+
+    // Wave memory: accumulate ODE states from generation and save
+    if let (Some(mem), Some(path)) = (&mut wave_mem, &config.memory_path) {
+        // Run one final forward to extract ODE states
+        let start = if tokens.len() > dims.block_size { tokens.len() - dims.block_size } else { 0 };
+        let final_input = &tokens[start..];
+        let final_cache = forward_with_cache(&mdl, final_input, dims, None, None, None, Some(&stencil), None, None,
+            mem_slices.as_deref());
+        // Extract per-layer ODE states (average r/s across positions)
+        let n_bands = config.n_bands;
+        let ode_states: Vec<(Vec<f32>, Vec<f32>)> = final_cache.block_caches.iter().map(|bc| {
+            let t = bc.ffn_out.len().max(1);
+            let mut avg_r = vec![0.0f32; n_bands];
+            let mut avg_s = vec![0.0f32; n_bands];
+            // Use normed_ffn (input to ODE) as proxy for ODE state
+            for pos in &bc.normed_ffn {
+                for k in 0..n_bands.min(pos.len() / 2) {
+                    avg_r[k] += pos[k * 2];
+                    avg_s[k] += pos[k * 2 + 1];
+                }
+            }
+            let scale = 1.0 / t as f32;
+            for k in 0..n_bands { avg_r[k] *= scale; avg_s[k] *= scale; }
+            (avg_r, avg_s)
+        }).collect();
+        crate::common::wave_memory::merge_ode_states(mem, &ode_states);
+        crate::common::wave_memory::save(path, mem);
+    }
 }

@@ -18,7 +18,7 @@ pub fn phase_decode_compare(
     let n_bands = dims.n_bands;
 
     // Forward pass — same as training
-    let cache = forward_with_cache(model, tokens, dims, None, None, None, Some(stencil), None, None);
+    let cache = forward_with_cache(model, tokens, dims, None, None, None, Some(stencil), None, None, None);
 
     // Get the final hidden state (post ln_f) for the last position
     let last_hidden = &cache.post_ln_f[cache.post_ln_f.len() - 1];

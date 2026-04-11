@@ -36,7 +36,7 @@ pub fn extract_ode_data(
     stencil: &crate::fft_ode::StencilFft,
     position: usize,
 ) -> (Vec<OdeSnapshot>, ForwardCache) {
-    let cache = forward_with_cache(model, tokens, dims, None, None, None, Some(stencil), None, None);
+    let cache = forward_with_cache(model, tokens, dims, None, None, None, Some(stencil), None, None, None);
     let n_bands = dims.n_bands;
 
     let mut snapshots = Vec::new();

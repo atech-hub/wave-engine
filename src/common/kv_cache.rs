@@ -197,7 +197,7 @@ pub fn prefill(
             .collect();
         let (ffn_out, _) = crate::ffn_backend::ffn_forward_via_backend(
             &block.ffn, &normed_ffn, &crate::backend::CpuBackend,
-            Some(stencil), None, None, true, dims.use_corrector, None,
+            Some(stencil), None, None, true, dims.use_corrector, None, None,
         );
 
         // Residual
@@ -328,7 +328,7 @@ pub fn forward_one(
         let normed_ffn = layer_norm(&hidden, &block.ln_ffn.weight, &block.ln_ffn.bias);
         let (ffn_out, _) = crate::ffn_backend::ffn_forward_via_backend(
             &block.ffn, &[normed_ffn], &crate::backend::CpuBackend,
-            Some(stencil), None, None, true, dims.use_corrector, None,
+            Some(stencil), None, None, true, dims.use_corrector, None, None,
         );
 
         // Residual
