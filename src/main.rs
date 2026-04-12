@@ -97,6 +97,113 @@ fn main() {
         return;
     }
 
+    // ─── Convert dataset to wave memory ───
+    if std::env::args().any(|a| a == "--convert-dataset") {
+        fn pflag_cd<T: std::str::FromStr>(name: &str, default: T) -> T {
+            std::env::args().skip_while(|a| a != name).nth(1)
+                .and_then(|s| s.parse().ok()).unwrap_or(default)
+        }
+        let data_path = std::env::args().skip_while(|a| a != "--convert-dataset").nth(1)
+            .expect("--convert-dataset requires a data file path");
+        let output = std::env::args().skip_while(|a| a != "--output").nth(1)
+            .unwrap_or("dataset_waves.kwmf".to_string());
+        let n_bands: usize = pflag_cd("--n-bands", 84);
+        let n_head: usize = pflag_cd("--n-head", 4);
+        let n_layers: usize = pflag_cd("--layers", 4);
+        let alpha: f32 = pflag_cd("--alpha", 0.1);
+        let beta: f32 = pflag_cd("--beta", 0.2);
+        let out_proj_groups: usize = pflag_cd("--out-proj-groups", 1);
+        let use_bpe = std::env::args().any(|a| a == "--bpe");
+        let tokenizer_path: String = pflag_cd("--tokenizer", "data/tokenizer.json".to_string());
+        let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1);
+
+        // Load or create model
+        let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
+        let (tokens, vocab_size) = common::data_loader::load_data(&data_path, use_bpe,
+            if use_bpe { Some(&tokenizer_path) } else { None });
+
+        let model = if let Some(ref ckpt) = resume_path {
+            println!("Converting dataset through trained model: {}", ckpt);
+            let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(ckpt);
+            let mut m = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims, alpha, beta);
+            m.phase_native = true;
+            m.output_corrector = vec![0.0; n_bands];
+            if params.len() == count_trainable_ex(&m, false) {
+                unflatten_params_ex(&mut m, &params, false);
+            } else {
+                let dims_nc = Dims::from_cli(n_bands, n_head, 16, 128, 16).with_corrector(false);
+                m = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_nc, alpha, beta);
+                m.phase_native = true;
+                m.output_corrector = vec![0.0; n_bands];
+                unflatten_params_ex(&mut m, &params, false);
+            }
+            m.learnable_ode = false;
+            m
+        } else {
+            println!("Converting dataset through UNTRAINED model (random init)");
+            let mut m = init_model(vocab_size, 42, n_layers, out_proj_groups, dims, alpha, beta);
+            m.phase_native = true;
+            m.output_corrector = vec![0.0; n_bands];
+            m.learnable_ode = false;
+            m
+        };
+
+        // Init AGC
+        crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+        let stencil = fft_ode::StencilFft::new(n_bands);
+
+        // Create fresh memory
+        let mut mem = common::wave_memory::load_or_create(&output, n_layers, n_bands);
+
+        // Process dataset in chunks (block_size windows)
+        let block_size = 128;
+        let n_chunks = (tokens.len().saturating_sub(1)) / block_size;
+        println!("  Processing {} tokens in {} chunks of {}...", tokens.len(), n_chunks, block_size);
+
+        for chunk_idx in 0..n_chunks {
+            let start = chunk_idx * block_size;
+            let end = (start + block_size).min(tokens.len());
+            let chunk = &tokens[start..end];
+
+            // Forward pass through model
+            let cache = crate::cpu::forward::forward_with_cache(
+                &model, chunk, dims, None, None, None, Some(&stencil), None, None, None,
+            );
+
+            // Extract per-layer hidden states, average across positions
+            let ode_states: Vec<(Vec<f32>, Vec<f32>)> = cache.block_caches.iter().map(|bc| {
+                let t = bc.input.len().max(1);
+                let mut avg_r = vec![0.0f32; n_bands];
+                let mut avg_s = vec![0.0f32; n_bands];
+                for pos in &bc.input {
+                    for k in 0..n_bands.min(pos.len() / 2) {
+                        avg_r[k] += pos[k * 2];
+                        avg_s[k] += pos[k * 2 + 1];
+                    }
+                }
+                let scale = 1.0 / t as f32;
+                for k in 0..n_bands { avg_r[k] *= scale; avg_s[k] *= scale; }
+                (avg_r, avg_s)
+            }).collect();
+
+            common::wave_memory::merge_ode_states(&mut mem, &ode_states);
+
+            if (chunk_idx + 1) % 100 == 0 {
+                println!("    {}/{} chunks processed", chunk_idx + 1, n_chunks);
+            }
+        }
+
+        // Save
+        common::wave_memory::save(&output, &mem);
+        println!("  Dataset converted: {} chunks → {} conversations in {}", n_chunks, mem.n_convos, output);
+
+        // Auto-scan
+        let scans = common::wave_memory::scan_memory(&mem);
+        common::wave_memory::print_memory_scan(&mem, &scans);
+
+        return;
+    }
+
     // ─── Phase encode mode ───
     if std::env::args().any(|a| a == "--encode" || a == "--encode-number"
         || a == "--encode-catalog" || a == "--encode-phases"
