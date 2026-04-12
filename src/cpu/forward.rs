@@ -132,8 +132,15 @@ pub fn forward_with_cache(
         .map(|h| layer_norm(h, &model.ln_f.weight, &model.ln_f.bias))
         .collect();
 
-    let logits: Vec<Vec<f32>> = if model.phase_native {
-        // Phase-native: dot product against embeddings (replaces lm_head)
+    let logits: Vec<Vec<f32>> = if model.phase_native && model.decode_v2 {
+        // Phase-native V2: per-harmonic coherence decoder
+        let n_bands = d.n_bands;
+        use crate::common::phase_decode_v2::{decode_v2, DecodeMode};
+        post_ln_f.par_iter().map(|hidden| {
+            decode_v2(hidden, &model.wte, &model.output_corrector, n_bands, model.vocab_size, DecodeMode::MaxHarmonic)
+        }).collect()
+    } else if model.phase_native {
+        // Phase-native V1: dot product against embeddings (replaces lm_head)
         let n_bands = d.n_bands;
         post_ln_f.par_iter().map(|hidden| {
             // Apply output corrector: per-band phase rotation

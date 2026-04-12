@@ -30,6 +30,7 @@ pub mod ode_distortion;
 pub mod generate;
 pub mod kv_cache;
 pub mod phase_decode;
+pub mod phase_decode_v2;
 pub mod ode_monitor;
 pub mod phase_loss;
 pub mod dyn_param_monitor;

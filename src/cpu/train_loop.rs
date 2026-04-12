@@ -93,6 +93,7 @@ pub fn run_training(config: TrainConfig) {
 
     // Phase-native mode: ODE learns to output in embedding space, no lm_head
     model.phase_native = config.phase_native;
+    model.decode_v2 = config.decode_v2;
 
     // Four-wave mixing: cubic amplitude coupling inside ODE
     // CLI --fwm-strength overrides; checkpoint chi is fallback on resume

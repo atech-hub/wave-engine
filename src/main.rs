@@ -766,6 +766,137 @@ fn main() {
         return;
     }
 
+    // ─── Decoder V2 comparison (diagnostic) ───
+    if std::env::args().any(|a| a == "--test-decode-v2") {
+        let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)
+            .expect("--test-decode-v2 requires --resume");
+        let n_layers: usize = parse_flag("--layers", N_LAYERS);
+        let n_bands: usize = parse_flag("--n-bands", N_BANDS);
+        let n_head: usize = parse_flag("--n-head", N_HEAD);
+        let out_proj_groups: usize = parse_flag("--out-proj-groups", 6);
+        let alpha: f32 = parse_flag("--alpha", 0.1);
+        let beta: f32 = parse_flag("--beta", parse_flag("--alpha", 0.1));
+        let data_path = std::env::args().skip_while(|a| a != "--data").nth(1)
+            .unwrap_or("data/arithmetic.txt".to_string());
+
+        let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&resume_path);
+        // Load model — same pattern as generate mode (try PN then non-PN)
+        let dims_ext = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(true);
+        let mut model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_ext, alpha, beta);
+        model.phase_native = true;
+        model.output_corrector = vec![0.0; n_bands];
+        if params.len() == count_trainable_ex(&model, false) {
+            unflatten_params_ex(&mut model, &params, false);
+        } else {
+            // Without corrector
+            let dims_nc = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+                .with_corrector(false);
+            model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_nc, alpha, beta);
+            model.phase_native = true;
+            model.output_corrector = vec![0.0; n_bands];
+            if params.len() == count_trainable_ex(&model, false) {
+                unflatten_params_ex(&mut model, &params, false);
+            } else {
+                // Non-PN
+                model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims_nc, alpha, beta);
+                model.output_corrector = vec![0.0; n_bands];
+                unflatten_params_ex(&mut model, &params, false);
+            }
+        }
+        model.learnable_ode = false;
+        let dims = Dims::from_cli(n_bands, n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+            .with_learnable_ode(false).with_corrector(true);
+
+        let stencil = fft_ode::StencilFft::new(n_bands);
+        crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+
+        // Build char vocab
+        let text = common::data_loader::load_text_raw(&data_path);
+        let mut chars: Vec<char> = text.chars().collect();
+        chars.sort(); chars.dedup();
+        let char_map: Vec<char> = chars[..chars.len().min(ck_vocab)].to_vec();
+        let encode_fn = |s: &str| -> Vec<usize> {
+            s.chars().filter_map(|c| char_map.iter().position(|&ch| ch == c)).collect()
+        };
+        let decode_fn = |id: usize| -> String {
+            if id < char_map.len() { char_map[id].to_string() } else { "?".to_string() }
+        };
+
+        println!("=== Decoder V2 Comparison ===");
+        println!("  {} params, {} vocab, phase_native={}", params.len(), ck_vocab, model.phase_native);
+        println!();
+
+        // Three decode modes to compare
+        use common::phase_decode_v2::DecodeMode;
+        let modes = [
+            ("V1 (dot product)", None),
+            ("V2 max-harmonic", Some(DecodeMode::MaxHarmonic)),
+            ("V2 sum-harmonic", Some(DecodeMode::SumHarmonic)),
+            ("V2 mag-weighted", Some(DecodeMode::MagWeighted)),
+        ];
+
+        // Test prompts — arithmetic if available, else grammar
+        let prompts_expected: Vec<(&str, &str)> = if data_path.contains("arithmetic") {
+            vec![("9-1=", "8"), ("3+4=", "7"), ("5-2=", "3"), ("7+2=", "9"), ("1+1=", "2"),
+                 ("8-3=", "5"), ("6+3=", "9"), ("4-0=", "4"), ("0+5=", "5"), ("9-9=", "0")]
+        } else {
+            vec![("A noun", "?"), ("The verb", "?"), ("A sentence", "?")]
+        };
+
+        println!("{:<12} {:<8}", "Prompt", "Expected");
+        for (name, _) in &modes { print!("  {:<16}", name); }
+        println!();
+        println!("{}", "-".repeat(80));
+
+        let mut scores = vec![0usize; modes.len()];
+
+        for (prompt, expected) in &prompts_expected {
+            let tokens = encode_fn(prompt);
+            if tokens.is_empty() { continue; }
+
+            let (v1_logits, _) = common::phase_decode_v2::compare_decoders(
+                &model, &tokens, dims, &stencil, DecodeMode::MaxHarmonic,
+            );
+
+            print!("{:<12} {:<8}", prompt, expected);
+
+            for (mi, (name, mode_opt)) in modes.iter().enumerate() {
+                let logits = if let Some(mode) = mode_opt {
+                    // V2 decode
+                    let cache = crate::cpu::forward::forward_with_cache(
+                        &model, &tokens, dims, None, None, None, Some(&stencil), None, None, None,
+                    );
+                    let last = cache.post_ln_f.len() - 1;
+                    common::phase_decode_v2::decode_v2(
+                        &cache.post_ln_f[last], &model.wte, &model.output_corrector,
+                        n_bands, model.vocab_size, *mode,
+                    )
+                } else {
+                    v1_logits.clone()
+                };
+
+                let best_tok = logits.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i).unwrap_or(0);
+                let answer = decode_fn(best_tok);
+                let correct = answer == *expected;
+                if correct { scores[mi] += 1; }
+                print!("  {:<16}", format!("{}{}", answer, if correct { " ok" } else { "" }));
+            }
+            println!();
+        }
+
+        println!("{}", "-".repeat(80));
+        print!("{:<12} {:<8}", "Score", "");
+        for (mi, (name, _)) in modes.iter().enumerate() {
+            print!("  {:<16}", format!("{}/{}", scores[mi], prompts_expected.len()));
+        }
+        println!();
+
+        return;
+    }
+
     // ─── Generate mode ───
     if std::env::args().any(|a| a == "--generate") {
         let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)
@@ -909,6 +1040,7 @@ fn main() {
         layer_scale: parse_dyn_param("--layer-scale"),
         lr_scale: parse_dyn_param("--lr-scale"),
         phase_native: std::env::args().any(|a| a == "--phase-native"),
+        decode_v2: std::env::args().any(|a| a == "--decode-v2"),
         fwm_strength: parse_flag("--fwm-strength", 0.0),
         phase_temp: parse_flag("--phase-temp", 1.0),
         pythagorean: std::env::args().any(|a| a == "--pythagorean"),
