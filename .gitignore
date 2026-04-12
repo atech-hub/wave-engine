@@ -90,3 +90,9 @@ CLAUDE.md
 # Galaxy scan output
 *_galaxy/
 galaxy_diff.*
+
+# Research output (JSON, private scripts)
+*.json
+!data/tokenizer*.json
+!package.json
+research-lab/
