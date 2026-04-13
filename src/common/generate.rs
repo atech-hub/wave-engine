@@ -21,6 +21,7 @@ pub struct GenerateConfig {
     pub temperature: f32,
     pub phase_native: bool,
     pub memory_path: Option<String>,
+    pub diagnose: bool,
 }
 
 pub fn run_generate(config: GenerateConfig) {
@@ -416,6 +417,10 @@ pub fn run_wave_generate(config: GenerateConfig) {
             }
         }
 
+        if config.diagnose {
+            print_wave_diagnosis(output, best_tok, &mdl.wte, config.n_bands, &*detokenize, tokens.len() - token_ids.len());
+        }
+
         tokens.push(best_tok);
         print!("{}", detokenize(best_tok));
         use std::io::Write;
@@ -424,4 +429,111 @@ pub fn run_wave_generate(config: GenerateConfig) {
     println!();
     eprintln!("---");
     eprintln!("  Generated {} tokens (wave-space decode)", config.max_tokens);
+}
+
+/// Diagnose the output wave vs target embedding at the phase level.
+fn print_wave_diagnosis(
+    output: &[f32],
+    chosen_tok: usize,
+    wte: &[Vec<f32>],
+    n_bands: usize,
+    detokenize: &dyn Fn(usize) -> String,
+    step: usize,
+) {
+    let n_embd = n_bands * 2;
+    let target = &wte[chosen_tok];
+
+    // Extract phases and magnitudes
+    let out_phases = super::wave_analysis::extract_phases(output, n_bands);
+    let tgt_phases = super::wave_analysis::extract_phases(target, n_bands);
+
+    let out_mags: Vec<f32> = (0..n_bands).map(|k| {
+        (output[k*2]*output[k*2] + output[k*2+1]*output[k*2+1]).sqrt()
+    }).collect();
+    let tgt_mags: Vec<f32> = (0..n_bands).map(|k| {
+        (target[k*2]*target[k*2] + target[k*2+1]*target[k*2+1]).sqrt()
+    }).collect();
+
+    // Per-band phase error (wrapped to [0, PI])
+    let phase_errors: Vec<f32> = (0..n_bands).map(|k| {
+        let diff = (out_phases[k] - tgt_phases[k]).abs();
+        let wrapped = if diff > std::f32::consts::PI { std::f32::consts::TAU - diff } else { diff };
+        wrapped
+    }).collect();
+
+    let mean_phase_err = phase_errors.iter().sum::<f32>() / n_bands as f32;
+    let mut sorted_errs = phase_errors.clone();
+    sorted_errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_phase_err = sorted_errs[n_bands / 2];
+    let close_count = phase_errors.iter().filter(|&&e| e < std::f32::consts::FRAC_PI_4).count();
+    let far_count = phase_errors.iter().filter(|&&e| e > std::f32::consts::FRAC_PI_4 * 3.0).count();
+
+    // Worst 5 bands
+    let mut indexed_errs: Vec<(usize, f32)> = phase_errors.iter().enumerate().map(|(i, &e)| (i, e)).collect();
+    indexed_errs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    // Phase vs magnitude L2 decomposition
+    let mut phase_l2 = 0.0f32;
+    let mut mag_l2 = 0.0f32;
+    for k in 0..n_bands {
+        phase_l2 += tgt_mags[k] * tgt_mags[k] * 2.0 * (1.0 - phase_errors[k].cos());
+        mag_l2 += (out_mags[k] - tgt_mags[k]) * (out_mags[k] - tgt_mags[k]);
+    }
+    let total_l2: f32 = (0..n_embd).map(|j| (output[j] - target[j]).powi(2)).sum();
+    let phase_pct = if total_l2 > 0.0 { phase_l2 / total_l2 * 100.0 } else { 0.0 };
+    let mag_pct = if total_l2 > 0.0 { mag_l2 / total_l2 * 100.0 } else { 0.0 };
+
+    // Grid breakdown
+    let half = n_bands / 2;
+    let g1_phase: f32 = phase_errors[..half].iter().sum::<f32>() / half as f32;
+    let g2_phase: f32 = phase_errors[half..].iter().sum::<f32>() / half as f32;
+    let g1_mag: f32 = (0..half).map(|k| (out_mags[k] - tgt_mags[k]).abs()).sum::<f32>() / half as f32;
+    let g2_mag: f32 = (half..n_bands).map(|k| (out_mags[k] - tgt_mags[k]).abs()).sum::<f32>() / half as f32;
+
+    // Top-5 decode candidates
+    let mut candidates: Vec<(usize, f32, f32, f32)> = (0..wte.len()).map(|v| {
+        let emb = &wte[v];
+        let dot: f32 = (0..n_embd).map(|j| output[j] * emb[j]).sum();
+        let l2: f32 = (0..n_embd).map(|j| (output[j] - emb[j]).powi(2)).sum();
+        let emb_phases = super::wave_analysis::extract_phases(emb, n_bands);
+        let mean_ang: f32 = (0..n_bands).map(|k| {
+            let d = (out_phases[k] - emb_phases[k]).abs();
+            if d > std::f32::consts::PI { std::f32::consts::TAU - d } else { d }
+        }).sum::<f32>() / n_bands as f32;
+        (v, dot, l2, mean_ang)
+    }).collect();
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    // Print
+    eprintln!("\n── Step {} diagnose ──", step);
+    eprintln!("  Chosen: '{}' (id={})", detokenize(chosen_tok).replace('\n', "\\n"), chosen_tok);
+    eprintln!();
+    eprintln!("  Phase error vs chosen embedding:");
+    eprintln!("    mean={:.2}rad  median={:.2}rad  close(<π/4)={}  far(>3π/4)={}",
+        mean_phase_err, median_phase_err, close_count, far_count);
+    eprint!("    Worst bands:");
+    for i in 0..5.min(indexed_errs.len()) {
+        eprint!(" #{}({:.2})", indexed_errs[i].0, indexed_errs[i].1);
+    }
+    eprintln!();
+
+    eprintln!();
+    eprintln!("  Phase vs magnitude split (of total L2={:.1}):", total_l2);
+    eprintln!("    Phase-only: {:.1} ({:.0}%)    Magnitude-only: {:.1} ({:.0}%)",
+        phase_l2, phase_pct, mag_l2, mag_pct);
+
+    eprintln!();
+    eprintln!("  Grid breakdown:");
+    eprintln!("    Grid1 (0-{}):  phase={:.2}rad  mag_err={:.2}", half-1, g1_phase, g1_mag);
+    eprintln!("    Grid2 ({}-{}): phase={:.2}rad  mag_err={:.2}", half, n_bands-1, g2_phase, g2_mag);
+
+    eprintln!();
+    eprintln!("  Top-5 candidates:");
+    eprintln!("    {:>4} {:>8} {:>8} {:>8}  token", "rank", "dot", "L2", "phase");
+    for i in 0..5.min(candidates.len()) {
+        let (v, dot, l2, ang) = candidates[i];
+        eprintln!("    #{:<3} {:>8.1} {:>8.1} {:>8.2}  '{}'",
+            i+1, dot, l2, ang, detokenize(v).replace('\n', "\\n"));
+    }
+    eprintln!();
 }

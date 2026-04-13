@@ -932,6 +932,7 @@ fn main() {
             temperature: parse_flag("--temperature", 0.0),
             phase_native: true,
             memory_path: None,
+            diagnose: std::env::args().any(|a| a == "--wave-diagnose"),
         });
         return;
     }
@@ -958,6 +959,7 @@ fn main() {
             temperature: parse_flag("--temperature", 0.0),
             phase_native: std::env::args().any(|a| a == "--phase-native"),
             memory_path: std::env::args().skip_while(|a| a != "--memory").nth(1),
+            diagnose: false,
         });
         return;
     }
