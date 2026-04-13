@@ -27,9 +27,10 @@ pub struct WaveAttnHeadWeights {
     /// Output projection weights for this head: [head_dim, head_dim]
     pub v_proj_w: Vec<Vec<f32>>,
     pub v_proj_b: Vec<f32>,
-    /// Content projection for learnable attention routing (wave training only).
+    /// Frozen content projection — deterministic-random symmetry-breaker.
     /// Projects input wave to a content vector; dot product between content vectors
     /// adds a content-dependent bias to the harmonic coherence score.
+    /// Never serialized or trained — initialized once from RNG seed at model creation.
     /// When empty, attention is pure harmonic coherence (backward-compatible).
     pub content_proj_w: Vec<Vec<f32>>, // [CONTENT_DIM, n_embd]
     pub content_proj_b: Vec<f32>,      // [CONTENT_DIM]
@@ -84,7 +85,7 @@ pub fn wave_attention_forward(
             project_phase(&x[pos], &weights.heads[head].phase_proj_w, &weights.heads[head].phase_proj_b)
         }).collect();
 
-        // Phase 1b: Content projection (learnable attention routing)
+        // Phase 1b: Frozen content projection (symmetry-breaking)
         // When content_proj_w is non-empty, project each position to a content vector
         // for content-dependent attention bias. Empty = backward-compatible (no bias).
         let has_content = !weights.heads[head].content_proj_w.is_empty();
@@ -154,7 +155,7 @@ pub fn wave_attention_forward(
                     if ki > qi { continue; }
                     let delta = phases[qi] - phases[ki];
                     let mut score = (harmonic_n * delta).cos();
-                    // Add content-dependent bias if learnable attention is active
+                    // Add content-dependent bias if frozen content projection is active
                     if has_content {
                         let dot: f32 = content_vecs[qi].iter().zip(content_vecs[ki].iter())
                             .map(|(&a, &b)| a * b).sum();

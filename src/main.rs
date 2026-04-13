@@ -550,15 +550,41 @@ fn main() {
         let m2: usize = pflag_gs("--m2", 7);
 
         let (params, ck_vocab, _, _, _, _, _, _, _, _, _ck_chi) = wave_checkpoint::load_checkpoint(&resume);
-        let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
+        // Try all 4 layout variants: {ode, no-ode} × {corrector, no-corrector}
+        let variants: [(bool, bool); 4] = [
+            (false, true), (false, false), (true, true), (true, false),
+        ];
+        let mut dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
         let mut model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims, alpha, beta);
-        // Phase-native detection
-        let ext_count = count_trainable_ex(&model, false);
-        if params.len() < ext_count {
-            model.phase_native = true;
-            model.output_corrector = vec![0.0; n_bands];
+        let mut loaded = false;
+        for (use_ode, use_corr) in &variants {
+            let d = Dims::from_cli(n_bands, n_head, 16, 128, 16)
+                .with_learnable_ode(*use_ode).with_corrector(*use_corr);
+            let mut m = init_model(ck_vocab, 42, n_layers, out_proj_groups, d, alpha, beta);
+            m.phase_native = true;
+            m.output_corrector = vec![0.0; n_bands];
+            if params.len() == count_trainable_ex(&m, false) {
+                unflatten_params_ex(&mut m, &params, false);
+                eprintln!("  [galaxy-scan] Loaded: ode={}, corrector={}", use_ode, use_corr);
+                model = m;
+                dims = d;
+                loaded = true;
+                break;
+            }
+            // Also try non-phase-native
+            let mut m2 = init_model(ck_vocab, 42, n_layers, out_proj_groups, d, alpha, beta);
+            if params.len() == count_trainable_ex(&m2, false) {
+                unflatten_params_ex(&mut m2, &params, false);
+                eprintln!("  [galaxy-scan] Loaded (non-PN): ode={}, corrector={}", use_ode, use_corr);
+                model = m2;
+                dims = d;
+                loaded = true;
+                break;
+            }
         }
-        unflatten_params_ex(&mut model, &params, false);
+        if !loaded {
+            panic!("Cannot match checkpoint param count {} to any model variant", params.len());
+        }
 
         // Load test corpus (first 200 tokens of data file)
         let (tokens, _vs) = common::data_loader::load_data(&data_path, false, None);

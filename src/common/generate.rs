@@ -303,25 +303,43 @@ pub fn run_wave_generate(config: GenerateConfig) {
 
     let effective_vocab = vocab_size.max(ck_vocab);
 
-    // Build model
-    let dims = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
-        .with_learnable_ode(false).with_corrector(true);
-    let mut mdl = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims, config.alpha, config.beta);
-
-    // Try phase-native loading (same as generate)
+    // Build model — try multiple configurations to match checkpoint param count.
+    // Checkpoints may have been saved with learnable_ode=true (ODE params in vector)
+    // or learnable_ode=false. Try all 4 combinations: {ode, no-ode} × {corrector, no-corrector}.
+    let variants: [(bool, bool); 4] = [
+        (false, true),  // standard: no ODE, with corrector
+        (false, false), // no ODE, no corrector
+        (true, true),   // ODE params + corrector (wave training default)
+        (true, false),  // ODE params, no corrector
+    ];
+    let mut mdl = {
+        let dims0 = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
+            .with_learnable_ode(false).with_corrector(true);
+        init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims0, config.alpha, config.beta)
+    };
     mdl.phase_native = true;
     mdl.output_corrector = vec![0.0; config.n_bands];
-    if params.len() == count_trainable_ex(&mdl, false) {
-        unflatten_params_ex(&mut mdl, &params, false);
-    } else {
-        let dims_nc = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
-            .with_corrector(false);
-        mdl = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_nc, config.alpha, config.beta);
-        mdl.phase_native = true;
-        mdl.output_corrector = vec![0.0; config.n_bands];
-        unflatten_params_ex(&mut mdl, &params, false);
+
+    let mut dims = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS);
+    let mut loaded = false;
+    for (use_ode, use_corr) in &variants {
+        let dims_try = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
+            .with_learnable_ode(*use_ode).with_corrector(*use_corr);
+        let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_try, config.alpha, config.beta);
+        m.phase_native = true;
+        m.output_corrector = vec![0.0; config.n_bands];
+        if params.len() == count_trainable_ex(&m, false) {
+            unflatten_params_ex(&mut m, &params, false);
+            eprintln!("  [wave-generate] Loaded: ode={}, corrector={}", use_ode, use_corr);
+            mdl = m;
+            dims = dims_try;
+            loaded = true;
+            break;
+        }
     }
-    mdl.learnable_ode = false;
+    if !loaded {
+        panic!("Cannot match checkpoint param count {} to any model variant", params.len());
+    }
 
     let stencil = fft_ode::StencilFft::new(config.n_bands);
     let alpha = mdl.blocks[0].ffn.kerr.alpha;

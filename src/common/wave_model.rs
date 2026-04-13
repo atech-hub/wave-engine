@@ -62,12 +62,13 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
         let heads: Vec<WaveAttnHeadWeights> = (0..d.n_head).map(|h| {
             let (phase_w, phase_b) = init_linear(&mut rng, 2, d.n_embd);
             let (v_w, v_b) = init_linear(&mut rng, head_dim, head_dim);
-            // Content projection for learnable attention routing (wave training)
+            // Frozen content projection — deterministic-random symmetry-breaker for attention.
+            // Breaks the content-independence of harmonic coherence scoring so that
+            // different inputs attend differently. Never serialized, never trained.
             let (content_w, content_b) = if d.learnable_ode {
-                // Initialize with small random weights — learnable during wave training
                 init_linear(&mut rng, crate::wave_attn::CONTENT_DIM, d.n_embd)
             } else {
-                (vec![], vec![]) // empty = no content routing (backward-compatible)
+                (vec![], vec![]) // empty = pure harmonic coherence (backward-compatible)
             };
             WaveAttnHeadWeights {
                 harmonic_raw: ((h + 1) as f32 * 0.5f32).ln(),
