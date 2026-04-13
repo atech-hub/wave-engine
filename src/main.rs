@@ -117,10 +117,21 @@ fn main() {
         let tokenizer_path: String = pflag_cd("--tokenizer", "data/tokenizer.json".to_string());
         let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1);
 
-        // Load or create model
-        let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
         let (tokens, vocab_size) = common::data_loader::load_data(&data_path, use_bpe,
             if use_bpe { Some(&tokenizer_path) } else { None });
+
+        // Per-position mode: write KWDS file (embedding + positional, no ODE)
+        if std::env::args().any(|a| a == "--per-position") {
+            let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
+            let model = init_model(vocab_size, 42, n_layers, out_proj_groups, dims, alpha, beta);
+            println!("Converting to KWDS (per-position): {} tokens, {} bands", tokens.len(), n_bands);
+            common::kwds::convert_tokens_to_kwds(&output, &tokens, &model.wte, &model.wpe, n_bands)
+                .unwrap_or_else(|e| { eprintln!("Error: {}", e); std::process::exit(1); });
+            return;
+        }
+
+        // Aggregate mode: accumulate into KWMF
+        let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
 
         let model = if let Some(ref ckpt) = resume_path {
             println!("Converting dataset through trained model: {}", ckpt);
@@ -976,6 +987,149 @@ fn main() {
         });
 
         serve_tier::server::run_server(state);
+        return;
+    }
+
+    // ─── Train from KWDS (wave dataset) ───
+    if std::env::args().any(|a| a == "--train-from-kwds") {
+        let kwds_path = std::env::args().skip_while(|a| a != "--train-from-kwds").nth(1)
+            .expect("--train-from-kwds requires a .kwds file path");
+        let n_iters: usize = parse_flag("--iters", 10000);
+        let n_layers: usize = parse_flag("--layers", N_LAYERS);
+        let n_head: usize = parse_flag("--n-head", N_HEAD);
+        let out_proj_groups: usize = parse_flag("--out-proj-groups", 1);
+        let alpha: f32 = parse_flag("--alpha", 0.1);
+        let beta: f32 = parse_flag("--beta", parse_flag("--alpha", 0.1));
+        let lr: f32 = parse_flag("--lr", 3e-4);
+        let seq_len: usize = parse_flag("--seq", 128);
+        let checkpoint_name: String = parse_flag("--checkpoint-name", "wave_trained.bin".to_string());
+
+        // Read KWDS header
+        let mut f = std::fs::File::open(&kwds_path).expect("Cannot open KWDS file");
+        let header = common::kwds::read_header(&mut f).unwrap();
+        let n_bands = header.n_bands as usize;
+        let n_embd = header.n_embd as usize;
+        let n_positions = header.n_positions as usize;
+        println!("Training from KWDS: {} positions, {} bands, {:.1} MB",
+            n_positions, n_bands, header.file_size() as f64 / (1024.0 * 1024.0));
+
+        // Create model (no embedding table needed for input, but we keep it for output translation)
+        let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
+        let vocab_size = 128; // placeholder — output translation uses embedding lookup
+        let mut model = init_model(vocab_size, 42, n_layers, out_proj_groups, dims, alpha, beta);
+        model.phase_native = true;
+        model.output_corrector = vec![0.0; n_bands];
+        model.learnable_ode = true;
+
+        crate::ffn_backend::init_agc(alpha, beta);
+        let stencil = fft_ode::StencilFft::new(n_bands);
+
+        let mut rng = crate::rng::Rng::new(1337);
+        let n_trainable = count_trainable_ex(&model, false);
+        println!("  Model: {}L, {}bands, {} trainable params", n_layers, n_bands, n_trainable);
+
+        // Finite-difference gradient check on one batch
+        {
+            println!("  Gradient check (cosine loss)...");
+            let inputs = common::kwds::read_input_window(&mut f, &header, 0, 8).unwrap();
+            let targets = common::kwds::read_target_window(&mut f, &header, 0, 8).unwrap();
+            // Check the wave_loss module's cosine gradient
+            let (passed, max_err) = common::wave_loss::check_cosine_gradient(&inputs[0], &targets[0]);
+            println!("    Cosine grad check: {} (max_rel_err={:.6})", if passed { "PASS" } else { "FAIL" }, max_err);
+        }
+
+        // Training loop with real backward pass
+        // Adam state
+        let mut adam_m = vec![0.0f32; n_trainable];
+        let mut adam_v = vec![0.0f32; n_trainable];
+        let mut adam_t = 0u64;
+        let beta1 = 0.9f32;
+        let beta2 = 0.999f32;
+        let adam_eps = 1e-8f32;
+
+        println!("  Training for {} iters, seq_len={}, lr={}", n_iters, seq_len, lr);
+        let mut best_loss = f32::MAX;
+        let t0 = std::time::Instant::now();
+
+        for iter in 0..n_iters {
+            let max_start = n_positions.saturating_sub(seq_len + 1);
+            let start = (rng.next_u64() as usize) % max_start.max(1);
+            let window_len = seq_len.min(n_positions - start - 1);
+
+            let inputs = common::kwds::read_input_window(&mut f, &header, start as u64, window_len).unwrap();
+            let targets = common::kwds::read_target_window(&mut f, &header, start as u64, window_len).unwrap();
+
+            // Forward
+            let cache = crate::cpu::forward::forward_with_cache_from_waves(
+                &model, &inputs, dims, Some(&stencil),
+            );
+
+            // Backward with wave targets (cosine loss)
+            let (loss, grads) = crate::cpu::model_backward::backward_wave(&model, &cache, &targets, dims);
+
+            if loss < best_loss { best_loss = loss; }
+
+            // Flatten grads and apply Adam
+            let flat_grads = crate::cpu::model_backward::flatten_grads_ex(&grads, false);
+            adam_t += 1;
+            let mut params = flatten_params_ex(&model, false);
+            for i in 0..params.len() {
+                adam_m[i] = beta1 * adam_m[i] + (1.0 - beta1) * flat_grads[i];
+                adam_v[i] = beta2 * adam_v[i] + (1.0 - beta2) * flat_grads[i] * flat_grads[i];
+                let m_hat = adam_m[i] / (1.0 - beta1.powi(adam_t as i32));
+                let v_hat = adam_v[i] / (1.0 - beta2.powi(adam_t as i32));
+                params[i] -= lr * m_hat / (v_hat.sqrt() + adam_eps);
+            }
+            unflatten_params_ex(&mut model, &params, false);
+
+            if iter % 100 == 0 || iter == n_iters - 1 {
+                let elapsed = t0.elapsed().as_millis();
+                let ms_per = if iter > 0 { elapsed / iter as u128 } else { 0 };
+                println!("  iter {:6}  cos_loss {:.6}  best {:.6}  {}ms/iter",
+                    iter, loss, best_loss, ms_per);
+            }
+        }
+
+        println!("\n=== Wave Training Complete ===");
+        println!("  Iters: {}", n_iters);
+        println!("  Best cosine loss: {:.6} (similarity: {:.4})", best_loss, 1.0 - best_loss);
+
+        // Save checkpoint
+        let final_params = flatten_params_ex(&model, false);
+        let n_params = final_params.len();
+        let dummy_adam = train::Adam::new(lr, n_params);
+        wave_checkpoint::save_checkpoint(
+            &final_params, vocab_size, n_layers, out_proj_groups,
+            n_iters, lr, &dummy_adam, rng.state(), &checkpoint_name, dims,
+        );
+        println!("  Saved to: {}", checkpoint_name);
+
+        // Galaxy scan on the wave-trained model
+        println!("\n  Running galaxy scan...");
+        // Need to process some data through the model for the scan
+        // Use the KWDS input waves as the scan data
+        let scan_len = 128.min(n_positions);
+        let scan_inputs = common::kwds::read_input_window(&mut f, &header, 0, scan_len).unwrap();
+        let scan_cache = crate::cpu::forward::forward_with_cache_from_waves(
+            &model, &scan_inputs, dims, Some(&stencil),
+        );
+        let all_hidden: Vec<Vec<Vec<f32>>> = scan_cache.block_caches.iter()
+            .map(|bc| bc.input.clone()).collect();
+        let per_layer_ceilings: Vec<f32> = model.blocks.iter()
+            .map(|b| (std::f32::consts::FRAC_PI_2 / (b.ffn.kerr.alpha + 4.0 * b.ffn.kerr.beta)).sqrt().max(0.5))
+            .collect();
+        let m1 = 5; let m2 = 7; // default grids
+        let galaxy_dir = std::path::PathBuf::from(checkpoint_name.replace(".bin", "_galaxy"));
+        match common::galaxy_scan::run_and_write_full_scan(
+            &all_hidden, &scan_cache.post_ln_f, n_bands, &per_layer_ceilings, m1, m2, &galaxy_dir,
+        ) {
+            Ok(scan) => {
+                println!("  Galaxy map written to: {}", galaxy_dir.display());
+                common::galaxy_scan::print_summary(&scan);
+            }
+            Err(e) => eprintln!("  Galaxy scan error: {}", e),
+        }
+
         return;
     }
 

@@ -58,6 +58,15 @@ pub struct Gradients {
 }
 
 pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], d: Dims, gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>, ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>, full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>) -> (f32, Gradients) {
+    backward_impl(model, cache, targets, None, d, gpu, ping_pong, full_gpu)
+}
+
+/// Backward pass with wave targets (cosine loss in wave space).
+pub fn backward_wave(model: &WavePacketModel, cache: &ForwardCache, wave_targets: &[Vec<f32>], d: Dims) -> (f32, Gradients) {
+    backward_impl(model, cache, &[], Some(wave_targets), d, None, None, None)
+}
+
+fn backward_impl(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], wave_targets: Option<&[Vec<f32>]>, d: Dims, gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>, ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>, full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>) -> (f32, Gradients) {
     let t = cache.logits.len();
     let vocab_size = model.vocab_size;
 
@@ -101,7 +110,31 @@ pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize]
     let mut total_loss = 0.0f32;
     let mut d_hidden: Vec<Vec<f32>> = vec![vec![0.0f32; n_embd]; t];
 
-    if model.phase_native {
+    if let Some(wt) = wave_targets {
+        // Wave-target cosine loss: compare post_ln_f against target wave patterns.
+        // loss = mean(1 - cos(pred, target)) across positions.
+        // d_loss/d_pred_i = -(target_i / (|pred|*|tgt|)) + pred_i * (pred·tgt) / (|pred|³*|tgt|)
+        grads.d_output_corrector = vec![0.0f32; d.n_bands]; // zero corrector grads for wave training
+        for pos in 0..t.min(wt.len()) {
+            let pred = &cache.post_ln_f[pos];
+            let tgt = &wt[pos];
+            let dot: f32 = pred.iter().zip(tgt.iter()).map(|(&a, &b)| a * b).sum();
+            let np: f32 = pred.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nt: f32 = tgt.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if np > 1e-8 && nt > 1e-8 {
+                let cos = dot / (np * nt);
+                total_loss += 1.0 - cos;
+                let np3 = np * np * np;
+                for i in 0..n_embd {
+                    let d_cos = tgt[i] / (np * nt) - pred[i] * dot / (np3 * nt);
+                    d_hidden[pos][i] = -d_cos / t as f32; // negative because loss = 1 - cos, scaled by 1/t
+                }
+            } else {
+                total_loss += 1.0;
+            }
+        }
+        total_loss /= t.min(wt.len()).max(1) as f32;
+    } else if model.phase_native {
         // Phase-native loss: compare post_ln_f against embeddings using phase coherence.
         // No lm_head involved. The ODE learns to output in embedding space.
         let temp = if d.phase_temp > 0.0 { d.phase_temp } else { 1.0 };

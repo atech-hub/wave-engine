@@ -196,6 +196,65 @@ pub fn forward_with_cache(
     ForwardCache { block_caches, pre_ln_f: hidden, post_ln_f, logits }
 }
 
+/// Forward pass from pre-computed wave inputs (no embedding lookup).
+/// Used by --train-from-kwds to train on wave data directly.
+pub fn forward_with_cache_from_waves(
+    model: &WavePacketModel,
+    wave_inputs: &[Vec<f32>],
+    d: Dims,
+    stencil: Option<&fft_ode::StencilFft>,
+) -> ForwardCache {
+    let t = wave_inputs.len();
+    let mut hidden = wave_inputs.to_vec();
+    let mut block_caches = Vec::new();
+
+    for (block_idx, block) in model.blocks.iter().enumerate() {
+        let normed: Vec<Vec<f32>> = hidden.iter()
+            .map(|h| layer_norm(h, &block.ln.weight, &block.ln.bias))
+            .collect();
+
+        let be: &dyn backend::ComputeBackend = &backend::CpuBackend;
+        let freeze_ode = !d.learnable_ode;
+        let use_corrector = d.use_corrector;
+        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(
+            &block.ffn, &normed, be, stencil, None, None, freeze_ode, use_corrector, None, None,
+        );
+
+        let (attn_out, att_weights) = wave_attention_forward(&block.attn, &normed, d.n_bands, None);
+
+        let scale = if model.use_layer_scale { model.layer_scale[block_idx] } else { 1.0 };
+        let output: Vec<Vec<f32>> = (0..t).map(|i| {
+            let mut v = vec![0.0f32; d.n_embd];
+            for j in 0..d.n_embd { v[j] = hidden[i][j] + scale * (attn_out[i][j] + ffn_out[i][j]); }
+            v
+        }).collect();
+
+        block_caches.push(BlockCache {
+            input: hidden,
+            normed: normed.clone(),
+            normed_ffn: normed,
+            attn_out,
+            ffn_out,
+            att_weights,
+            ffn_backend_cache: Some(ffn_be_cache),
+            ffn_mae_in_sq: vec![], ffn_mae_in_act: vec![], ffn_precond: vec![],
+            ffn_kerr_out: vec![], ffn_mae_out_sq: vec![], ffn_mae_out_act: vec![],
+            ffn_regulated: vec![],
+        });
+
+        hidden = output;
+    }
+
+    let post_ln_f: Vec<Vec<f32>> = hidden.iter()
+        .map(|h| layer_norm(h, &model.ln_f.weight, &model.ln_f.bias))
+        .collect();
+
+    // No logit computation — wave training computes loss directly in wave space
+    let logits = vec![vec![]; t];
+
+    ForwardCache { block_caches, pre_ln_f: hidden, post_ln_f, logits }
+}
+
 // FFN forward — now routes through GPU backend for the full FFN path
 pub fn dual_maestro_forward(
     weights: &KerrDualMaestroWeights,
