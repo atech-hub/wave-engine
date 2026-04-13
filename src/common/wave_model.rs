@@ -33,6 +33,7 @@ pub struct WavePacketModel {
     pub agc_headroom: Vec<f32>, // per-layer AGC headroom (3.0 = 3-sigma default, training only)
     pub phase_native: bool, // true = use phase coherence loss instead of lm_head
     pub output_corrector: Vec<f32>, // [n_bands] per-band phase rotation before phase comparison
+    pub learnable_attn: bool, // true = attention weights are trainable (parallel path)
 }
 
 pub fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
@@ -170,6 +171,7 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
         agc_headroom: vec![3.0; n_layers], // 3-sigma default per layer
         phase_native: false,
         output_corrector: vec![0.0; d.n_bands], // 84 phase rotations, zero = transparent
+        learnable_attn: d.learnable_attn,
     }
 }
 
@@ -200,6 +202,18 @@ pub fn count_trainable_ex(model: &WavePacketModel, tied: bool) -> usize {
         }
         if model.use_dyn_harmonics {
             n += block.attn.heads.len(); // harmonic_raw per head
+        }
+        if model.learnable_attn {
+            for head in &block.attn.heads {
+                n += head.phase_proj_w.len() * head.phase_proj_w[0].len(); // phase_proj_w [2][n_embd]
+                n += head.phase_proj_b.len(); // phase_proj_b [2]
+                n += head.v_proj_w.len() * head.v_proj_w[0].len(); // v_proj_w [head_dim][head_dim]
+                n += head.v_proj_b.len(); // v_proj_b [head_dim]
+                // harmonic_raw counted only if use_dyn_harmonics is NOT already true
+                if !model.use_dyn_harmonics { n += 1; }
+            }
+            n += block.attn.out_proj_w.len() * block.attn.out_proj_w[0].len(); // out_proj_w [n_embd][n_embd]
+            n += block.attn.out_proj_b.len(); // out_proj_b [n_embd]
         }
     }
     if model.use_layer_scale {
@@ -255,6 +269,17 @@ pub fn flatten_params_ex(model: &WavePacketModel, tied: bool) -> Vec<f32> {
             for head in &block.attn.heads {
                 p.push(head.harmonic_raw);
             }
+        }
+        if model.learnable_attn {
+            for head in &block.attn.heads {
+                for row in &head.phase_proj_w { p.extend_from_slice(row); }
+                p.extend_from_slice(&head.phase_proj_b);
+                for row in &head.v_proj_w { p.extend_from_slice(row); }
+                p.extend_from_slice(&head.v_proj_b);
+                if !model.use_dyn_harmonics { p.push(head.harmonic_raw); }
+            }
+            for row in &block.attn.out_proj_w { p.extend_from_slice(row); }
+            p.extend_from_slice(&block.attn.out_proj_b);
         }
     }
     if model.use_layer_scale {
@@ -320,6 +345,17 @@ pub fn unflatten_params_ex(model: &mut WavePacketModel, params: &[f32], tied: bo
             for head in &mut block.attn.heads {
                 head.harmonic_raw = params[idx]; idx += 1;
             }
+        }
+        if model.learnable_attn {
+            for head in &mut block.attn.heads {
+                for row in &mut head.phase_proj_w { let len = row.len(); row.copy_from_slice(&params[idx..idx+len]); idx += len; }
+                let pb = head.phase_proj_b.len(); head.phase_proj_b.copy_from_slice(&params[idx..idx+pb]); idx += pb;
+                for row in &mut head.v_proj_w { let len = row.len(); row.copy_from_slice(&params[idx..idx+len]); idx += len; }
+                let vb = head.v_proj_b.len(); head.v_proj_b.copy_from_slice(&params[idx..idx+vb]); idx += vb;
+                if !model.use_dyn_harmonics { head.harmonic_raw = params[idx]; idx += 1; }
+            }
+            for row in &mut block.attn.out_proj_w { let len = row.len(); row.copy_from_slice(&params[idx..idx+len]); idx += len; }
+            let ob = block.attn.out_proj_b.len(); block.attn.out_proj_b.copy_from_slice(&params[idx..idx+ob]); idx += ob;
         }
     }
     if model.use_layer_scale {
