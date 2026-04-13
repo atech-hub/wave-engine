@@ -1,6 +1,6 @@
 # wave-engine
 
-Training engine for wave-coherent neural architectures. Replaces standard MLP layers with coupled harmonic oscillators (Kerr-ODE) governed by a differential equation. Three training tiers — CPU, cross-platform GPU (wgpu), and NVIDIA GPU (Candle/CUDA) — all producing the same model from one binary, one command.
+A research platform for wave-coherent neural architectures. Started as a training engine, grew into a lab: one binary, one command, and a full instrument suite — galaxy scan, catalog axes, phase encode, vocabulary relationship mapping, wave memory scanning, dataset-to-wave conversion, and wave-native training — alongside three training tiers (CPU, cross-platform GPU via wgpu, NVIDIA CUDA via Candle). Replaces standard MLP layers with coupled harmonic oscillators (Kerr-ODE) governed by a differential equation.
 
 Part of the [Wave Coherence as a Computational Primitive](https://github.com/atech-hub/Wave-Coherence-as-a-Computational-Primitive) research project.
 
@@ -30,9 +30,11 @@ cargo build --release --features candle-backend
 ./target/release/wave-engine --help
 ```
 
-No Python. No pip. No CUDA toolkit. Build once, run anywhere.
+No Python. No pip. No CUDA toolkit. Build once, run anywhere. Every feature serves observation — the engine trains models, the instruments measure what the model builds while it trains.
 
 ## Validated Results
+
+Training capability validated on four tasks. The measurement instruments are what the findings came from.
 
 | Task | Accuracy | Config | Finding |
 |------|----------|--------|---------|
@@ -484,6 +486,7 @@ Proven: fixing attention alone without fixing bands gives zero accuracy gain (va
 | Feature | Status | Description |
 |---------|--------|-------------|
 | Three training tiers | ✓ | CPU, wgpu (any GPU), Candle/CUDA (NVIDIA) |
+| Instrument suite | ✓ | Galaxy scan, relate-vocab, phase encode, dataset-to-wave converter, wave memory scanner, catalog axes — every instrument observes the trained model's geometry |
 | Four-wave mixing (FWM) | ✓ | Hamiltonian cubic coupling (`--fwm-strength`). All 3 tiers. Analytical Jacobian. |
 | FWM CUDA kernel | ✓ | Fused AGC+RK4+FWM forward+backward — zero overhead vs chi=0 |
 | Phase-native loss | ✓ | Dot product against embeddings — no lm_head. 55/55 arithmetic. |
