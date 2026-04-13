@@ -1039,13 +1039,29 @@ fn main() {
         println!("Training from KWDS: {} positions, {} bands, {:.1} MB",
             n_positions, n_bands, header.file_size() as f64 / (1024.0 * 1024.0));
 
-        // Create model (no embedding table needed for input, but we keep it for output translation)
+        // Create model — vocab_size must match the data's actual vocabulary
         let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
-        let vocab_size = 128; // placeholder — output translation uses embedding lookup
+        let vocab_size: usize = parse_flag("--vocab", 15);
+        let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1);
+        let mut start_iter = 0usize;
+
         let mut model = init_model(vocab_size, 42, n_layers, out_proj_groups, dims, alpha, beta);
         model.phase_native = true;
         model.output_corrector = vec![0.0; n_bands];
         model.learnable_ode = true;
+
+        // Resume from checkpoint if provided
+        if let Some(ref ckpt) = resume_path {
+            let (params, _ck_vocab, ck_iter, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(ckpt);
+            let ext_count = count_trainable_ex(&model, false);
+            if params.len() == ext_count {
+                unflatten_params_ex(&mut model, &params, false);
+                start_iter = ck_iter;
+                println!("  Resumed from {} at iter {}", ckpt, ck_iter);
+            } else {
+                eprintln!("  WARNING: param count mismatch ({} vs {}), starting fresh", params.len(), ext_count);
+            }
+        }
 
         crate::ffn_backend::init_agc(alpha, beta);
         let stencil = fft_ode::StencilFft::new(n_bands);
@@ -1073,11 +1089,12 @@ fn main() {
         let beta2 = 0.999f32;
         let adam_eps = 1e-8f32;
 
-        println!("  Training for {} iters, seq_len={}, lr={}", n_iters, seq_len, lr);
+        let total_iters = start_iter + n_iters;
+        println!("  Training for {} iters ({}→{}), seq_len={}, lr={}", n_iters, start_iter, total_iters, seq_len, lr);
         let mut best_loss = f32::MAX;
         let t0 = std::time::Instant::now();
 
-        for iter in 0..n_iters {
+        for iter in start_iter..total_iters {
             let max_start = n_positions.saturating_sub(seq_len + 1);
             let start = (rng.next_u64() as usize) % max_start.max(1);
             let window_len = seq_len.min(n_positions - start - 1);
@@ -1090,8 +1107,23 @@ fn main() {
                 &model, &inputs, dims, Some(&stencil),
             );
 
-            // Backward with wave targets (cosine loss)
+            // Backward with wave targets (L2 loss — gradients stay strong near optimum)
             let (loss, grads) = crate::cpu::model_backward::backward_wave(&model, &cache, &targets, dims);
+
+            // Also compute cosine similarity for monitoring decode readiness
+            let cos_sim = {
+                let mut sum = 0.0f32;
+                let ct = cache.post_ln_f.len().min(targets.len());
+                for pos in 0..ct {
+                    let pred = &cache.post_ln_f[pos];
+                    let tgt = &targets[pos];
+                    let dot: f32 = pred.iter().zip(tgt.iter()).map(|(&a, &b)| a * b).sum();
+                    let np: f32 = pred.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let nt: f32 = tgt.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if np > 1e-8 && nt > 1e-8 { sum += dot / (np * nt); }
+                }
+                sum / ct.max(1) as f32
+            };
 
             if loss < best_loss { best_loss = loss; }
 
@@ -1111,14 +1143,15 @@ fn main() {
             if iter % 100 == 0 || iter == n_iters - 1 {
                 let elapsed = t0.elapsed().as_millis();
                 let ms_per = if iter > 0 { elapsed / iter as u128 } else { 0 };
-                println!("  iter {:6}  cos_loss {:.6}  best {:.6}  {}ms/iter",
-                    iter, loss, best_loss, ms_per);
+                println!("  iter {:6}  l2_loss {:.6}  cos_sim {:.4}  best_l2 {:.6}  {}ms/iter",
+                    iter, loss, cos_sim, best_loss, ms_per);
             }
         }
 
         println!("\n=== Wave Training Complete ===");
-        println!("  Iters: {}", n_iters);
-        println!("  Best cosine loss: {:.6} (similarity: {:.4})", best_loss, 1.0 - best_loss);
+        println!("  Iters: {} ({}→{})", n_iters, start_iter, total_iters);
+        println!("  Best L2 loss: {:.6}", best_loss);
+        println!("  Target cosine for decode: ~0.95");
 
         // Save checkpoint
         let final_params = flatten_params_ex(&model, false);
@@ -1126,7 +1159,7 @@ fn main() {
         let dummy_adam = train::Adam::new(lr, n_params);
         wave_checkpoint::save_checkpoint(
             &final_params, vocab_size, n_layers, out_proj_groups,
-            n_iters, lr, &dummy_adam, rng.state(), &checkpoint_name, dims,
+            total_iters, lr, &dummy_adam, rng.state(), &checkpoint_name, dims,
         );
         println!("  Saved to: {}", checkpoint_name);
 

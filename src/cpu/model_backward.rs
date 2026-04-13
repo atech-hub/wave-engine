@@ -111,27 +111,21 @@ fn backward_impl(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize
     let mut d_hidden: Vec<Vec<f32>> = vec![vec![0.0f32; n_embd]; t];
 
     if let Some(wt) = wave_targets {
-        // Wave-target cosine loss: compare post_ln_f against target wave patterns.
-        // loss = mean(1 - cos(pred, target)) across positions.
-        // d_loss/d_pred_i = -(target_i / (|pred|*|tgt|)) + pred_i * (pred·tgt) / (|pred|³*|tgt|)
-        grads.d_output_corrector = vec![0.0f32; d.n_bands]; // zero corrector grads for wave training
+        // Wave-target L2 loss: mean squared error between predicted and target waves.
+        // loss = mean_pos( mean_i( (pred_i - target_i)² ) )
+        // d_loss/d_pred_i = 2 * (pred_i - target_i) / (n_embd * t)
+        // L2 gradients stay strong near the optimum — no vanishing like cosine.
+        grads.d_output_corrector = vec![0.0f32; d.n_bands];
         for pos in 0..t.min(wt.len()) {
             let pred = &cache.post_ln_f[pos];
             let tgt = &wt[pos];
-            let dot: f32 = pred.iter().zip(tgt.iter()).map(|(&a, &b)| a * b).sum();
-            let np: f32 = pred.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let nt: f32 = tgt.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if np > 1e-8 && nt > 1e-8 {
-                let cos = dot / (np * nt);
-                total_loss += 1.0 - cos;
-                let np3 = np * np * np;
-                for i in 0..n_embd {
-                    let d_cos = tgt[i] / (np * nt) - pred[i] * dot / (np3 * nt);
-                    d_hidden[pos][i] = -d_cos / t as f32; // negative because loss = 1 - cos, scaled by 1/t
-                }
-            } else {
-                total_loss += 1.0;
+            let mut pos_loss = 0.0f32;
+            for i in 0..n_embd {
+                let diff = pred[i] - tgt[i];
+                pos_loss += diff * diff;
+                d_hidden[pos][i] = 2.0 * diff / (n_embd as f32 * t as f32);
             }
+            total_loss += pos_loss / n_embd as f32;
         }
         total_loss /= t.min(wt.len()).max(1) as f32;
     } else if model.phase_native {
