@@ -269,32 +269,141 @@ pub fn run_generate(config: GenerateConfig) {
     println!();
     eprintln!("---");
     eprintln!("  Generated {} tokens (total {} tokens)", config.max_tokens, tokens.len());
+}
 
-    // Wave memory: accumulate ODE states from generation and save
-    if let (Some(mem), Some(path)) = (&mut wave_mem, &config.memory_path) {
-        // Run one final forward to extract ODE states
-        let start = if tokens.len() > dims.block_size { tokens.len() - dims.block_size } else { 0 };
-        let final_input = &tokens[start..];
-        let final_cache = forward_with_cache(&mdl, final_input, dims, None, None, None, Some(&stencil), None, None,
-            mem_slices.as_deref());
-        // Extract per-layer ODE states (average r/s across positions)
-        let n_bands = config.n_bands;
-        let ode_states: Vec<(Vec<f32>, Vec<f32>)> = final_cache.block_caches.iter().map(|bc| {
-            let t = bc.ffn_out.len().max(1);
-            let mut avg_r = vec![0.0f32; n_bands];
-            let mut avg_s = vec![0.0f32; n_bands];
-            // Use normed_ffn (input to ODE) as proxy for ODE state
-            for pos in &bc.normed_ffn {
-                for k in 0..n_bands.min(pos.len() / 2) {
-                    avg_r[k] += pos[k * 2];
-                    avg_s[k] += pos[k * 2 + 1];
-                }
-            }
-            let scale = 1.0 / t as f32;
-            for k in 0..n_bands { avg_r[k] *= scale; avg_s[k] *= scale; }
-            (avg_r, avg_s)
-        }).collect();
-        crate::common::wave_memory::merge_ode_states(mem, &ode_states);
-        crate::common::wave_memory::save(path, mem);
+/// Wave-space generation: runs full attention+ODE on wave inputs,
+/// decodes output via nearest-embedding lookup. For wave-trained models.
+pub fn run_wave_generate(config: GenerateConfig) {
+    let n_embd = config.n_bands * 2;
+
+    // Load checkpoint
+    let (params, ck_vocab, ck_iter, _lr, _rng, _at, _am, _av, _groups, ck_flags, _chi) =
+        wave_checkpoint::load_checkpoint(&config.resume_path);
+
+    // Tokenize prompt
+    let (token_ids, vocab_size, detokenize): (Vec<usize>, usize, Box<dyn Fn(usize) -> String>) =
+    if config.use_bpe {
+        let tok = bpe::BpeTokenizer::from_file(&config.tokenizer_path);
+        let ids = tok.encode(&config.prompt);
+        let tok2 = bpe::BpeTokenizer::from_file(&config.tokenizer_path);
+        (ids, ck_vocab, Box::new(move |id| tok2.decode(&[id])))
+    } else {
+        let data_path = std::env::args().skip_while(|a| a != "--data").nth(1)
+            .unwrap_or_else(|| std::env::args().nth(1).unwrap_or("data/input.txt".to_string()));
+        let text = crate::common::data_loader::load_text_raw(&data_path);
+        let mut chars: Vec<char> = text.chars().collect();
+        chars.sort(); chars.dedup();
+        let vocab = chars.len().min(ck_vocab);
+        let char_map: Vec<char> = chars[..vocab].to_vec();
+        eprintln!("  Char vocab: {} chars from {}", vocab, data_path);
+        let ids: Vec<usize> = config.prompt.chars().filter_map(|c| char_map.iter().position(|&ch| ch == c)).collect();
+        let cm2 = char_map.clone();
+        (ids, vocab, Box::new(move |id| if id < cm2.len() { cm2[id].to_string() } else { "?".to_string() }))
+    };
+
+    let effective_vocab = vocab_size.max(ck_vocab);
+
+    // Build model
+    let dims = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
+        .with_learnable_ode(false).with_corrector(true);
+    let mut mdl = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims, config.alpha, config.beta);
+
+    // Try phase-native loading (same as generate)
+    mdl.phase_native = true;
+    mdl.output_corrector = vec![0.0; config.n_bands];
+    if params.len() == count_trainable_ex(&mdl, false) {
+        unflatten_params_ex(&mut mdl, &params, false);
+    } else {
+        let dims_nc = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
+            .with_corrector(false);
+        mdl = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_nc, config.alpha, config.beta);
+        mdl.phase_native = true;
+        mdl.output_corrector = vec![0.0; config.n_bands];
+        unflatten_params_ex(&mut mdl, &params, false);
     }
+    mdl.learnable_ode = false;
+
+    let stencil = fft_ode::StencilFft::new(config.n_bands);
+    let alpha = mdl.blocks[0].ffn.kerr.alpha;
+    let beta = mdl.blocks[0].ffn.kerr.beta;
+    crate::ffn_backend::init_agc(alpha, beta);
+
+    eprintln!("  Model: {}L, {}bands, {}vocab, iter {} [wave-generate]",
+        config.n_layers, config.n_bands, effective_vocab, ck_iter);
+
+    // Convert prompt tokens to wave inputs
+    let block_size = dims.block_size;
+    let mut tokens = token_ids.clone();
+
+    eprint!("  Prompt: ");
+    for &id in &token_ids { eprint!("{}", detokenize(id)); }
+    eprintln!();
+    eprintln!("  Generating {} tokens (wave-space)...", config.max_tokens);
+    eprintln!("---");
+
+    for &id in &token_ids { print!("{}", detokenize(id)); }
+
+    for _ in 0..config.max_tokens {
+        let start = if tokens.len() > block_size { tokens.len() - block_size } else { 0 };
+        let input_tokens = &tokens[start..];
+
+        // Convert tokens to wave inputs (embedding + positional)
+        let wave_inputs: Vec<Vec<f32>> = input_tokens.iter().enumerate().map(|(pos, &tok)| {
+            let mut h = vec![0.0f32; n_embd];
+            if tok < mdl.wte.len() && pos < mdl.wpe.len() {
+                for j in 0..n_embd { h[j] = mdl.wte[tok][j] + mdl.wpe[pos][j]; }
+            }
+            h
+        }).collect();
+
+        // Full forward pass through wave path (with attention across positions)
+        let cache = crate::cpu::forward::forward_with_cache_from_waves(
+            &mdl, &wave_inputs, dims, Some(&stencil),
+        );
+
+        // Get last position's output
+        let last_pos = cache.post_ln_f.len() - 1;
+        let output = &cache.post_ln_f[last_pos];
+
+        // Decode: nearest-neighbour against PURE token embeddings (no positional)
+        let mut best_tok = 0;
+        let mut best_sim = f32::NEG_INFINITY;
+        for v in 0..mdl.vocab_size {
+            let emb = &mdl.wte[v];
+            let dot: f32 = (0..n_embd).map(|j| output[j] * emb[j]).sum();
+            if dot > best_sim { best_sim = dot; best_tok = v; }
+        }
+
+        if config.temperature > 0.0 {
+            // Temperature sampling over all tokens
+            let scores: Vec<f32> = (0..mdl.vocab_size).map(|v| {
+                let emb = &mdl.wte[v];
+                (0..n_embd).map(|j| output[j] * emb[j]).sum::<f32>() / config.temperature
+            }).collect();
+            let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exp: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+            let sum: f32 = exp.iter().sum();
+
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            tokens.len().hash(&mut hasher);
+            let r = (hasher.finish() as f32) / (u64::MAX as f32);
+
+            let mut cumsum = 0.0f32;
+            best_tok = exp.len() - 1;
+            for (i, &e) in exp.iter().enumerate() {
+                cumsum += e / sum;
+                if r < cumsum { best_tok = i; break; }
+            }
+        }
+
+        tokens.push(best_tok);
+        print!("{}", detokenize(best_tok));
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+    }
+    println!();
+    eprintln!("---");
+    eprintln!("  Generated {} tokens (wave-space decode)", config.max_tokens);
 }

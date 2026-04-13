@@ -884,6 +884,32 @@ fn main() {
         return;
     }
 
+    // ─── Wave-generate mode (for wave-trained models) ───
+    if std::env::args().any(|a| a == "--wave-generate") {
+        let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)
+            .expect("--wave-generate requires --resume <checkpoint>");
+        let prompt = std::env::args().skip_while(|a| a != "--prompt").nth(1)
+            .unwrap_or("3+4=".to_string());
+        common::generate::run_wave_generate(common::generate::GenerateConfig {
+            resume_path,
+            prompt,
+            max_tokens: parse_flag("--max-tokens", 10),
+            n_layers: parse_flag("--layers", N_LAYERS),
+            n_bands: parse_flag("--n-bands", N_BANDS),
+            n_head: parse_flag("--n-head", N_HEAD),
+            out_proj_groups: parse_flag("--out-proj-groups", 6),
+            maestro_dim: parse_flag("--maestro-dim", MAESTRO_DIM),
+            use_bpe: std::env::args().any(|a| a == "--bpe"),
+            tokenizer_path: parse_flag("--tokenizer", "data/tokenizer.json".to_string()),
+            alpha: parse_flag("--alpha", 0.1),
+            beta: parse_flag("--beta", parse_flag("--alpha", 0.1)),
+            temperature: parse_flag("--temperature", 0.0),
+            phase_native: true,
+            memory_path: None,
+        });
+        return;
+    }
+
     // ─── Generate mode ───
     if std::env::args().any(|a| a == "--generate") {
         let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)
