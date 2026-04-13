@@ -923,7 +923,7 @@ fn main() {
             n_layers: parse_flag("--layers", N_LAYERS),
             n_bands: parse_flag("--n-bands", N_BANDS),
             n_head: parse_flag("--n-head", N_HEAD),
-            out_proj_groups: parse_flag("--out-proj-groups", 6),
+            out_proj_groups: parse_flag("--out-proj-groups", 1),
             maestro_dim: parse_flag("--maestro-dim", MAESTRO_DIM),
             use_bpe: std::env::args().any(|a| a == "--bpe"),
             tokenizer_path: parse_flag("--tokenizer", "data/tokenizer.json".to_string()),
