@@ -17,6 +17,7 @@ pub mod candle_tier;
 pub use common::model;
 pub use common::embed as wave_embed;
 pub use common::attn as wave_attn;
+pub use common::attn_learnable;
 pub use common::block as wave_block;
 pub use common::ffn as ffn_backend;
 pub use common::wave_model::{WavePacketModel, init_model, init_linear, count_trainable, count_trainable_ex, flatten_params, flatten_params_ex, unflatten_params, unflatten_params_ex};
