@@ -11,6 +11,9 @@
 
 use rayon::prelude::*;
 
+/// Content projection dimension for learnable attention routing.
+pub const CONTENT_DIM: usize = 16;
+
 /// Weights for harmonic coherence attention (one head).
 #[derive(Clone)]
 pub struct WaveAttnHeadWeights {
@@ -24,6 +27,12 @@ pub struct WaveAttnHeadWeights {
     /// Output projection weights for this head: [head_dim, head_dim]
     pub v_proj_w: Vec<Vec<f32>>,
     pub v_proj_b: Vec<f32>,
+    /// Content projection for learnable attention routing (wave training only).
+    /// Projects input wave to a content vector; dot product between content vectors
+    /// adds a content-dependent bias to the harmonic coherence score.
+    /// When empty, attention is pure harmonic coherence (backward-compatible).
+    pub content_proj_w: Vec<Vec<f32>>, // [CONTENT_DIM, n_embd]
+    pub content_proj_b: Vec<f32>,      // [CONTENT_DIM]
 }
 
 /// Weights for full multi-head wave attention.
@@ -75,6 +84,28 @@ pub fn wave_attention_forward(
             project_phase(&x[pos], &weights.heads[head].phase_proj_w, &weights.heads[head].phase_proj_b)
         }).collect();
 
+        // Phase 1b: Content projection (learnable attention routing)
+        // When content_proj_w is non-empty, project each position to a content vector
+        // for content-dependent attention bias. Empty = backward-compatible (no bias).
+        let has_content = !weights.heads[head].content_proj_w.is_empty();
+        let content_dim = if has_content { weights.heads[head].content_proj_w.len() } else { 0 };
+        let content_vecs: Vec<Vec<f32>> = if has_content {
+            (0..t).map(|pos| {
+                let mut cv = vec![0.0f32; content_dim];
+                for d in 0..content_dim {
+                    let mut sum = weights.heads[head].content_proj_b[d];
+                    for j in 0..n_embd {
+                        sum += weights.heads[head].content_proj_w[d][j] * x[pos][j];
+                    }
+                    cv[d] = sum;
+                }
+                cv
+            }).collect()
+        } else {
+            vec![]
+        };
+        let content_scale = if content_dim > 0 { 1.0 / (content_dim as f32).sqrt() } else { 0.0 };
+
         // Phase 2: Batch value projection
         let v_all: Vec<Vec<f32>> = (0..t).map(|pos| {
             let mut v = vec![0.0f32; head_dim];
@@ -122,13 +153,26 @@ pub fn wave_attention_forward(
                 for &ki in &bucket_positions[target_bucket] {
                     if ki > qi { continue; }
                     let delta = phases[qi] - phases[ki];
-                    scores[ki] = (harmonic_n * delta).cos();
+                    let mut score = (harmonic_n * delta).cos();
+                    // Add content-dependent bias if learnable attention is active
+                    if has_content {
+                        let dot: f32 = content_vecs[qi].iter().zip(content_vecs[ki].iter())
+                            .map(|(&a, &b)| a * b).sum();
+                        score += dot * content_scale;
+                    }
+                    scores[ki] = score;
                 }
             }
 
             if qi > 0 && scores[qi - 1] == f32::NEG_INFINITY {
                 let delta = phases[qi] - phases[qi - 1];
-                scores[qi - 1] = (harmonic_n * delta).cos();
+                let mut score = (harmonic_n * delta).cos();
+                if has_content {
+                    let dot: f32 = content_vecs[qi].iter().zip(content_vecs[qi - 1].iter())
+                        .map(|(&a, &b)| a * b).sum();
+                    score += dot * content_scale;
+                }
+                scores[qi - 1] = score;
             }
             if scores[qi] == f32::NEG_INFINITY {
                 scores[qi] = 1.0;

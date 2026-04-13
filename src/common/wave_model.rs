@@ -62,12 +62,21 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
         let heads: Vec<WaveAttnHeadWeights> = (0..d.n_head).map(|h| {
             let (phase_w, phase_b) = init_linear(&mut rng, 2, d.n_embd);
             let (v_w, v_b) = init_linear(&mut rng, head_dim, head_dim);
+            // Content projection for learnable attention routing (wave training)
+            let (content_w, content_b) = if d.learnable_ode {
+                // Initialize with small random weights — learnable during wave training
+                init_linear(&mut rng, crate::wave_attn::CONTENT_DIM, d.n_embd)
+            } else {
+                (vec![], vec![]) // empty = no content routing (backward-compatible)
+            };
             WaveAttnHeadWeights {
                 harmonic_raw: ((h + 1) as f32 * 0.5f32).ln(),
                 phase_proj_w: phase_w,
                 phase_proj_b: phase_b,
                 v_proj_w: v_w,
                 v_proj_b: v_b,
+                content_proj_w: content_w,
+                content_proj_b: content_b,
             }
         }).collect();
         let (out_w, out_b) = init_linear(&mut rng, d.n_embd, d.n_embd);
