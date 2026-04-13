@@ -55,13 +55,6 @@ pub struct Gradients {
     pub d_output_corrector: Vec<f32>,
     // Wave transduction gradients (self-contained)
     pub wd_grads: Option<crate::common::wave_decode::WaveDecodeGrads>,
-    // Learnable attention gradients (per block, per head)
-    pub d_attn_phase_proj_w: Vec<Vec<Vec<Vec<f32>>>>, // [n_layers][n_heads][2][n_embd]
-    pub d_attn_phase_proj_b: Vec<Vec<Vec<f32>>>,       // [n_layers][n_heads][2]
-    pub d_attn_v_proj_w: Vec<Vec<Vec<Vec<f32>>>>,      // [n_layers][n_heads][hd][hd]
-    pub d_attn_v_proj_b: Vec<Vec<Vec<f32>>>,           // [n_layers][n_heads][hd]
-    pub d_attn_out_proj_w: Vec<Vec<Vec<f32>>>,         // [n_layers][n_embd][n_embd]
-    pub d_attn_out_proj_b: Vec<Vec<f32>>,              // [n_layers][n_embd]
 }
 
 pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], d: Dims, gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>, ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>, full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>) -> (f32, Gradients) {
@@ -111,12 +104,6 @@ fn backward_impl(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize
         d_output_corrector: vec![],
         tied_temperature: 0.0,
         wd_grads: None, // populated by wave_decode::backward when active
-        d_attn_phase_proj_w: if d.learnable_attn { vec![vec![vec![vec![0.0; d.n_embd]; 2]; d.n_head]; n_blocks] } else { vec![] },
-        d_attn_phase_proj_b: if d.learnable_attn { vec![vec![vec![0.0; 2]; d.n_head]; n_blocks] } else { vec![] },
-        d_attn_v_proj_w: if d.learnable_attn { let hd = d.n_embd / d.n_head; vec![vec![vec![vec![0.0; hd]; hd]; d.n_head]; n_blocks] } else { vec![] },
-        d_attn_v_proj_b: if d.learnable_attn { let hd = d.n_embd / d.n_head; vec![vec![vec![0.0; hd]; d.n_head]; n_blocks] } else { vec![] },
-        d_attn_out_proj_w: if d.learnable_attn { vec![vec![vec![0.0; d.n_embd]; d.n_embd]; n_blocks] } else { vec![] },
-        d_attn_out_proj_b: if d.learnable_attn { vec![vec![0.0; d.n_embd]; n_blocks] } else { vec![] },
     };
 
     let n_embd = d.n_embd;
@@ -618,19 +605,6 @@ pub fn flatten_grads_ex(grads: &Gradients, tied: bool) -> Vec<f32> {
         // Harmonic number gradients (when dynamic)
         if !grads.d_harmonic_raw[b].is_empty() {
             g.extend_from_slice(&grads.d_harmonic_raw[b]);
-        }
-        // Learnable attention gradients
-        if !grads.d_attn_phase_proj_w.is_empty() {
-            for h in 0..grads.d_attn_phase_proj_w[b].len() {
-                for row in &grads.d_attn_phase_proj_w[b][h] { g.extend_from_slice(row); }
-                g.extend_from_slice(&grads.d_attn_phase_proj_b[b][h]);
-                for row in &grads.d_attn_v_proj_w[b][h] { g.extend_from_slice(row); }
-                g.extend_from_slice(&grads.d_attn_v_proj_b[b][h]);
-                // harmonic_raw: only if not already in d_harmonic_raw
-                if grads.d_harmonic_raw[b].is_empty() { g.push(0.0); } // placeholder for harmonic_raw when dyn_harmonics is off
-            }
-            for row in &grads.d_attn_out_proj_w[b] { g.extend_from_slice(row); }
-            g.extend_from_slice(&grads.d_attn_out_proj_b[b]);
         }
     }
     if !grads.layer_scale.is_empty() {

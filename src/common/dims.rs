@@ -38,12 +38,11 @@ pub struct Dims {
     pub use_rk4_weights: bool, // true = per-layer RK4 combination weights are learnable
     pub use_dyn_harmonics: bool, // true = per-head harmonic numbers are learnable
     pub fwm_strength: f32, // four-wave mixing chi coefficient (0.0 = off)
-    pub learnable_attn: bool, // true = attention weights (phase_proj, v_proj, out_proj) are trainable
 }
 
 impl Dims {
     pub fn from_cli(n_bands: usize, n_head: usize, maestro_dim: usize, block_size: usize, rk4_steps: usize) -> Self {
-        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false, phase_temp: 0.0, pythagorean: false, use_rk4_weights: false, use_dyn_harmonics: false, fwm_strength: 0.0, learnable_attn: false }
+        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false, phase_temp: 0.0, pythagorean: false, use_rk4_weights: false, use_dyn_harmonics: false, fwm_strength: 0.0 }
     }
     pub fn with_tied(mut self, tied: bool) -> Self {
         self.tied = tied;
@@ -87,10 +86,6 @@ impl Dims {
     }
     pub fn with_dyn_harmonics(mut self, dh: bool) -> Self {
         self.use_dyn_harmonics = dh;
-        self
-    }
-    pub fn with_learnable_attn(mut self, la: bool) -> Self {
-        self.learnable_attn = la;
         self
     }
     pub fn with_moduli(mut self, m1: Option<usize>, m2: Option<usize>) -> Self {
