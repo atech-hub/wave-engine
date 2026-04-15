@@ -365,12 +365,12 @@ pub fn write_jsonl_telemetry(
 /// Collected health data from first batch element at health intervals.
 pub struct BatchHealthData {
     pub distortion: Option<Vec<crate::common::ode_distortion::LayerDistortionSummary>>,
-    pub grad_flow: Option<Vec<crate::common::gradient_monitor::GradientFlowStats>>,
-    pub attn_stats: Option<Vec<crate::common::attn_monitor::AttentionHeadStats>>,
-    pub flow_stats: Option<Vec<crate::common::layer_flow_monitor::LayerFlowStats>>,
-    pub output_stats: Option<crate::common::output_monitor::OutputDistStats>,
-    pub ode_dynamics: Option<Vec<crate::common::ode_dynamics_monitor::OdeDynamicsStats>>,
-    pub iq_analysis: Option<crate::common::iq_monitor::IqAnalysis>,
+    pub grad_flow: Option<Vec<crate::monitors::gradient_monitor::GradientFlowStats>>,
+    pub attn_stats: Option<Vec<crate::monitors::attn_monitor::AttentionHeadStats>>,
+    pub flow_stats: Option<Vec<crate::monitors::layer_flow_monitor::LayerFlowStats>>,
+    pub output_stats: Option<crate::monitors::output_monitor::OutputDistStats>,
+    pub ode_dynamics: Option<Vec<crate::monitors::ode_dynamics_monitor::OdeDynamicsStats>>,
+    pub iq_analysis: Option<crate::monitors::iq_monitor::IqAnalysis>,
 }
 
 /// Write all health monitor data to JSONL at health intervals.
@@ -383,13 +383,13 @@ pub fn write_health_monitors(
     dims: Dims,
     stencil: &crate::fft_ode::StencilFft,
     batch_distortion_data: &Option<Vec<crate::common::ode_distortion::LayerDistortionSummary>>,
-    batch_grad_flow: &Option<Vec<crate::common::gradient_monitor::GradientFlowStats>>,
-    batch_attn_stats: &Option<Vec<crate::common::attn_monitor::AttentionHeadStats>>,
-    batch_flow_stats: &Option<Vec<crate::common::layer_flow_monitor::LayerFlowStats>>,
-    batch_output_stats: &Option<crate::common::output_monitor::OutputDistStats>,
-    batch_ode_dynamics: &Option<Vec<crate::common::ode_dynamics_monitor::OdeDynamicsStats>>,
-    batch_iq_analysis: &Option<crate::common::iq_monitor::IqAnalysis>,
-    prev_dyn_snap: &mut Option<crate::common::dyn_param_monitor::DynParamSnapshot>,
+    batch_grad_flow: &Option<Vec<crate::monitors::gradient_monitor::GradientFlowStats>>,
+    batch_attn_stats: &Option<Vec<crate::monitors::attn_monitor::AttentionHeadStats>>,
+    batch_flow_stats: &Option<Vec<crate::monitors::layer_flow_monitor::LayerFlowStats>>,
+    batch_output_stats: &Option<crate::monitors::output_monitor::OutputDistStats>,
+    batch_ode_dynamics: &Option<Vec<crate::monitors::ode_dynamics_monitor::OdeDynamicsStats>>,
+    batch_iq_analysis: &Option<crate::monitors::iq_monitor::IqAnalysis>,
+    prev_dyn_snap: &mut Option<crate::monitors::dyn_param_monitor::DynParamSnapshot>,
     batch_size: usize,
     seq_len: usize,
     iter_elapsed_secs: f32,
@@ -399,11 +399,11 @@ pub fn write_health_monitors(
     use std::io::Write;
 
     // Encoding health sample
-    if let Some(h) = crate::common::encoding_health::sample(
+    if let Some(h) = crate::monitors::encoding_health::sample(
         model, dims, config.use_bpe, &config.tokenizer_path, stencil,
         config.alpha, config.beta,
     ) {
-        let health_json = crate::common::encoding_health::to_json(&h);
+        let health_json = crate::monitors::encoding_health::to_json(&h);
         writeln!(log_writer, r#"{{"iter":{},"type":"health",{}}}"#, iter, health_json).ok();
         log_writer.flush().ok();
         // Console warning on drift
@@ -435,7 +435,7 @@ pub fn write_health_monitors(
 
     // Gradient flow per component (#3)
     if let Some(gf_stats) = batch_grad_flow {
-        let gf_json = crate::common::gradient_monitor::to_json(gf_stats);
+        let gf_json = crate::monitors::gradient_monitor::to_json(gf_stats);
         if !gf_json.is_empty() {
             writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, gf_json).ok();
             log_writer.flush().ok();
@@ -444,8 +444,8 @@ pub fn write_health_monitors(
 
     // Dynamic parameter evolution (#7)
     {
-        let snap = crate::common::dyn_param_monitor::snapshot(model, prev_dyn_snap.as_ref());
-        let dp_json = crate::common::dyn_param_monitor::to_json(&snap);
+        let snap = crate::monitors::dyn_param_monitor::snapshot(model, prev_dyn_snap.as_ref());
+        let dp_json = crate::monitors::dyn_param_monitor::to_json(&snap);
         if !dp_json.is_empty() {
             writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, dp_json).ok();
             log_writer.flush().ok();
@@ -455,14 +455,14 @@ pub fn write_health_monitors(
 
     // Throughput (#10)
     {
-        let tp_stats = crate::common::throughput_monitor::compute(
+        let tp_stats = crate::monitors::throughput_monitor::compute(
             batch_size,
             seq_len,
             iter_elapsed_secs * 1000.0,
             fwd_bwd_elapsed_secs * 1000.0,
             optim_elapsed_secs * 1000.0,
         );
-        let tp_json = crate::common::throughput_monitor::to_json(&tp_stats);
+        let tp_json = crate::monitors::throughput_monitor::to_json(&tp_stats);
         writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, tp_json).ok();
         log_writer.flush().ok();
     }
@@ -471,7 +471,7 @@ pub fn write_health_monitors(
 
     // Attention head activity (#1)
     if let Some(attn_stats) = batch_attn_stats {
-        let attn_json = crate::common::attn_monitor::to_json(attn_stats);
+        let attn_json = crate::monitors::attn_monitor::to_json(attn_stats);
         if !attn_json.is_empty() {
             writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, attn_json).ok();
             log_writer.flush().ok();
@@ -480,7 +480,7 @@ pub fn write_health_monitors(
 
     // Layer signal flow (#2)
     if let Some(flow_stats) = batch_flow_stats {
-        let flow_json = crate::common::layer_flow_monitor::to_json(flow_stats);
+        let flow_json = crate::monitors::layer_flow_monitor::to_json(flow_stats);
         if !flow_json.is_empty() {
             writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, flow_json).ok();
             log_writer.flush().ok();
@@ -489,7 +489,7 @@ pub fn write_health_monitors(
 
     // Output distribution (#5)
     if let Some(output_stats) = batch_output_stats {
-        let out_json = crate::common::output_monitor::to_json(output_stats);
+        let out_json = crate::monitors::output_monitor::to_json(output_stats);
         writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, out_json).ok();
         log_writer.flush().ok();
     }
@@ -498,15 +498,15 @@ pub fn write_health_monitors(
 
     // Embedding space (#4) — frozen embeddings, only changes at iter 0
     if iters_into_run == 0 {
-        let embed_stats = crate::common::embedding_monitor::analyze_embeddings(model);
-        let embed_json = crate::common::embedding_monitor::to_json(&embed_stats);
+        let embed_stats = crate::monitors::embedding_monitor::analyze_embeddings(model);
+        let embed_json = crate::monitors::embedding_monitor::to_json(&embed_stats);
         writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, embed_json).ok();
         log_writer.flush().ok();
     }
 
     // ODE dynamics deep (#6)
     if let Some(ode_dyn) = batch_ode_dynamics {
-        let ode_json = crate::common::ode_dynamics_monitor::to_json(ode_dyn);
+        let ode_json = crate::monitors::ode_dynamics_monitor::to_json(ode_dyn);
         if !ode_json.is_empty() {
             writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, ode_json).ok();
             log_writer.flush().ok();
@@ -528,10 +528,10 @@ pub fn write_health_monitors(
 pub fn write_curriculum_event(
     log_writer: &mut std::io::BufWriter<std::fs::File>,
     iter: usize,
-    event: &crate::common::curriculum_monitor::CurriculumStats,
+    event: &crate::monitors::curriculum_monitor::CurriculumStats,
 ) {
     use std::io::Write;
-    let cur_json = crate::common::curriculum_monitor::to_json(event);
+    let cur_json = crate::monitors::curriculum_monitor::to_json(event);
     writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, cur_json).ok();
     log_writer.flush().ok();
     eprintln!("  [curriculum {}] stage {} → {} bands, loss jump {:.4}",
@@ -542,10 +542,10 @@ pub fn write_curriculum_event(
 pub fn write_checkpoint_drift(
     log_writer: &mut std::io::BufWriter<std::fs::File>,
     iter: usize,
-    drift: &crate::common::checkpoint_monitor::CheckpointDrift,
+    drift: &crate::monitors::checkpoint_monitor::CheckpointDrift,
 ) {
     use std::io::Write;
-    let drift_json = crate::common::checkpoint_monitor::to_json(drift);
+    let drift_json = crate::monitors::checkpoint_monitor::to_json(drift);
     writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, drift_json).ok();
     log_writer.flush().ok();
     eprintln!("  [drift {}] total={:.4} relative={:.6} ode={:.4}",

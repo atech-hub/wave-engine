@@ -101,7 +101,7 @@ pub mod monitors {
                 worst_margin: 0.0, worst_pos: 0, mode_collapse: false,
             },
         };
-        let stats = crate::common::output_monitor::analyze_output(&logits_cpu, targets);
+        let stats = crate::monitors::output_monitor::analyze_output(&logits_cpu, targets);
         CandleOutputDist {
             avg_entropy: stats.avg_entropy,
             avg_margin: stats.avg_margin,

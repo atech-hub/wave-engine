@@ -15,6 +15,8 @@ mod cpu;
 mod wgpu_tier;
 #[allow(dead_code)]
 mod candle_tier;
+#[allow(dead_code)]
+mod monitors;
 #[cfg(feature = "serve")]
 mod serve_tier;
 
@@ -44,7 +46,7 @@ pub use common::bpe;
 #[allow(unused_imports)]
 pub use common::token_cache;
 #[allow(unused_imports)]
-pub use common::monitor;
+pub use monitors::monitor;
 #[allow(unused_imports)]
 pub use common::data;
 #[allow(unused_imports)]
@@ -818,11 +820,11 @@ fn main() {
 
         println!("=== ODE Monitor ===\n");
         let tokens = encode(&prompt);
-        common::ode_monitor::print_ode_summary(&model, &tokens, dims, &stencil, &prompt, &decode);
+        monitors::ode_monitor::print_ode_summary(&model, &tokens, dims, &stencil, &prompt, &decode);
 
         if let Some(ref cmp) = compare {
             let tokens_b = encode(cmp);
-            common::ode_monitor::compare_prompts(&model, &tokens, &tokens_b, dims, &stencil, &prompt, cmp);
+            monitors::ode_monitor::compare_prompts(&model, &tokens, &tokens_b, dims, &stencil, &prompt, cmp);
         }
 
         return;

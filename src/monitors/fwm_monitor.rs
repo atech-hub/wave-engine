@@ -4,7 +4,7 @@
 //! Zero cost to training path — only runs at health intervals.
 
 use crate::model::KerrWeights;
-use super::ode_deriv::{kerr_derivative_into, DerivativeCapture};
+use crate::common::ode_deriv::{kerr_derivative_into, DerivativeCapture};
 
 pub struct FwmDiagnostics {
     pub layer: usize,

@@ -17,7 +17,7 @@ pub struct AttentionHeadStats {
     pub self_attn_frac: f32,
 }
 
-use super::math::softplus;
+use crate::common::math::softplus;
 
 /// Analyze attention heads from a forward cache.
 ///

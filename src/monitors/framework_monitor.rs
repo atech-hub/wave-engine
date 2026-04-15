@@ -6,7 +6,7 @@
 //!
 //! Reuses wave_analysis.rs primitives. Cost: ~5-10ms per health interval.
 
-use super::wave_analysis as wa;
+use crate::common::wave_analysis as wa;
 
 /// Per-layer framework statistics.
 pub struct FrameworkStats {

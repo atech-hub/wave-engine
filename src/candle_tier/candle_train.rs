@@ -691,7 +691,7 @@ pub mod train {
                     );
 
                     // Embedding space (static — same analysis as CPU)
-                    let embed_stats = crate::common::embedding_monitor::analyze_embeddings(&crate::WavePacketModel {
+                    let embed_stats = crate::monitors::embedding_monitor::analyze_embeddings(&crate::WavePacketModel {
                         wte: model.wte.to_vec2::<f32>().unwrap_or_default(),
                         wpe: vec![], blocks: vec![], ln_f: crate::model::LayerNormWeights { weight: vec![], bias: vec![] },
                         lm_head: vec![], lm_down: vec![], lm_up: vec![], lm_rank: 0, vocab_size,
@@ -701,7 +701,7 @@ pub mod train {
                         phase_native: false, output_corrector: vec![],
                     });
                     let _ = writeln!(writer, r#"{{"iter":{},"type":"monitor",{}}}"#,
-                        iter, crate::common::embedding_monitor::to_json(&embed_stats));
+                        iter, crate::monitors::embedding_monitor::to_json(&embed_stats));
 
                     // Output distribution (#5)
                     if let Some(ref od) = output_dist {

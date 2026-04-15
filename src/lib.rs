@@ -12,6 +12,8 @@ pub mod cpu;
 pub mod wgpu_tier;
 #[allow(dead_code)]
 pub mod candle_tier;
+#[allow(dead_code)]
+pub mod monitors;
 
 // Re-export shim — matches main.rs re-exports
 pub use common::model;
@@ -28,7 +30,7 @@ pub use common::checkpoint as wave_checkpoint;
 pub use common::rng;
 pub use common::bpe;
 pub use common::token_cache;
-pub use common::monitor;
+pub use monitors::monitor;
 pub use common::data;
 pub use common::data_loader;
 pub use common::fft_ode;

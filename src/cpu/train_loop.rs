@@ -238,13 +238,13 @@ pub fn run_training(config: TrainConfig) {
 
     // Framework monitor — build canonical pairs once (reused at every health interval)
     let fw_test_tokens = {
-        let (ids, _vs) = crate::common::framework_monitor::tokenize_test_text(vocab_size);
+        let (ids, _vs) = crate::monitors::framework_monitor::tokenize_test_text(vocab_size);
         ids
     };
-    let fw_test_strings: Vec<String> = crate::common::framework_monitor::FRAMEWORK_TEST_TEXT
+    let fw_test_strings: Vec<String> = crate::monitors::framework_monitor::FRAMEWORK_TEST_TEXT
         .chars().map(|c| c.to_string()).collect();
     let (fw_related, fw_random, fw_labels) =
-        crate::common::framework_monitor::build_canonical_pairs(&fw_test_strings);
+        crate::monitors::framework_monitor::build_canonical_pairs(&fw_test_strings);
 
     // JSONL telemetry — derive from checkpoint name or use explicit --log-name
     let log_name = config.log_name.clone().unwrap_or_else(|| {
@@ -282,13 +282,13 @@ pub fn run_training(config: TrainConfig) {
     let min_lr_ratio = 0.1f32; // decay to 10% of base LR
 
     // Monitor state: dynamic parameter evolution tracking
-    let mut prev_dyn_snap: Option<crate::common::dyn_param_monitor::DynParamSnapshot> = None;
+    let mut prev_dyn_snap: Option<crate::monitors::dyn_param_monitor::DynParamSnapshot> = None;
 
     // Monitor state: curriculum transition tracking (#8)
-    let mut curriculum_tracker = crate::common::curriculum_monitor::CurriculumTracker::new();
+    let mut curriculum_tracker = crate::monitors::curriculum_monitor::CurriculumTracker::new();
 
     // Monitor state: checkpoint drift tracking (#9)
-    let mut checkpoint_tracker = crate::common::checkpoint_monitor::CheckpointTracker::new(model.blocks.len());
+    let mut checkpoint_tracker = crate::monitors::checkpoint_monitor::CheckpointTracker::new(model.blocks.len());
 
     for iter in start_iter..total_iters {
         let iter_start = std::time::Instant::now();
@@ -359,14 +359,14 @@ pub fn run_training(config: TrainConfig) {
 
                     // Attention head activity (#1)
                     let attn_stats = if is_health {
-                        Some(crate::common::attn_monitor::analyze_attention(model_ref, &cache))
+                        Some(crate::monitors::attn_monitor::analyze_attention(model_ref, &cache))
                     } else {
                         None
                     };
 
                     // Layer signal flow (#2)
                     let flow_stats = if is_health {
-                        Some(crate::common::layer_flow_monitor::analyze_flow(&cache, dims))
+                        Some(crate::monitors::layer_flow_monitor::analyze_flow(&cache, dims))
                     } else {
                         None
                     };
@@ -374,21 +374,21 @@ pub fn run_training(config: TrainConfig) {
                     // Output distribution (#5)
                     let output_stats = if is_health {
                         let targets_vec: Vec<usize> = target.to_vec();
-                        Some(crate::common::output_monitor::analyze_output(&cache.logits, &targets_vec))
+                        Some(crate::monitors::output_monitor::analyze_output(&cache.logits, &targets_vec))
                     } else {
                         None
                     };
 
                     // ODE dynamics deep (#6)
                     let ode_dynamics = if is_health {
-                        Some(crate::common::ode_dynamics_monitor::analyze_ode_dynamics(&cache, dims))
+                        Some(crate::monitors::ode_dynamics_monitor::analyze_ode_dynamics(&cache, dims))
                     } else {
                         None
                     };
 
                     // I/Q channel monitor — observation only, no learnable params
                     let iq_analysis = if is_health {
-                        Some(crate::common::iq_monitor::analyze_iq_batch(
+                        Some(crate::monitors::iq_monitor::analyze_iq_batch(
                             &cache.post_ln_f, &model_ref.wte, target,
                             dims.n_bands, &model_ref.output_corrector, &vec![1.0; dims.n_bands], 10,
                         ))
@@ -399,7 +399,7 @@ pub fn run_training(config: TrainConfig) {
                     let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref);
                     // Gradient flow analysis on first batch element at health intervals
                     let grad_flow = if is_health {
-                        Some(crate::common::gradient_monitor::analyze_gradients(&grads, dims))
+                        Some(crate::monitors::gradient_monitor::analyze_gradients(&grads, dims))
                     } else {
                         None
                     };
@@ -417,12 +417,12 @@ pub fn run_training(config: TrainConfig) {
         let mut total_loss = 0.0f32;
         let mut total_grads = vec![0.0f32; n_trainable];
         let mut batch_distortion_data: Option<Vec<crate::common::ode_distortion::LayerDistortionSummary>> = None;
-        let mut batch_grad_flow: Option<Vec<crate::common::gradient_monitor::GradientFlowStats>> = None;
-        let mut batch_attn_stats: Option<Vec<crate::common::attn_monitor::AttentionHeadStats>> = None;
-        let mut batch_flow_stats: Option<Vec<crate::common::layer_flow_monitor::LayerFlowStats>> = None;
-        let mut batch_output_stats: Option<crate::common::output_monitor::OutputDistStats> = None;
-        let mut batch_ode_dynamics: Option<Vec<crate::common::ode_dynamics_monitor::OdeDynamicsStats>> = None;
-        let mut batch_iq_analysis: Option<crate::common::iq_monitor::IqAnalysis> = None;
+        let mut batch_grad_flow: Option<Vec<crate::monitors::gradient_monitor::GradientFlowStats>> = None;
+        let mut batch_attn_stats: Option<Vec<crate::monitors::attn_monitor::AttentionHeadStats>> = None;
+        let mut batch_flow_stats: Option<Vec<crate::monitors::layer_flow_monitor::LayerFlowStats>> = None;
+        let mut batch_output_stats: Option<crate::monitors::output_monitor::OutputDistStats> = None;
+        let mut batch_ode_dynamics: Option<Vec<crate::monitors::ode_dynamics_monitor::OdeDynamicsStats>> = None;
+        let mut batch_iq_analysis: Option<crate::monitors::iq_monitor::IqAnalysis> = None;
         for (loss, fg, health) in &batch_results {
             total_loss += loss;
             for (a, g) in total_grads.iter_mut().zip(fg.iter()) { *a += g; }
@@ -431,7 +431,7 @@ pub fn run_training(config: TrainConfig) {
             }
             if batch_grad_flow.is_none() {
                 if let Some(ref gf) = health.grad_flow {
-                    batch_grad_flow = Some(gf.iter().map(|s| crate::common::gradient_monitor::GradientFlowStats {
+                    batch_grad_flow = Some(gf.iter().map(|s| crate::monitors::gradient_monitor::GradientFlowStats {
                         layer: s.layer,
                         ln_grad_norm: s.ln_grad_norm,
                         maestro_in_grad_norm: s.maestro_in_grad_norm,
@@ -448,7 +448,7 @@ pub fn run_training(config: TrainConfig) {
             // Extract batch 2 monitor data from first element that has it
             if batch_attn_stats.is_none() {
                 if let Some(ref stats) = health.attn_stats {
-                    batch_attn_stats = Some(stats.iter().map(|s| crate::common::attn_monitor::AttentionHeadStats {
+                    batch_attn_stats = Some(stats.iter().map(|s| crate::monitors::attn_monitor::AttentionHeadStats {
                         layer: s.layer, head: s.head, harmonic: s.harmonic,
                         entropy: s.entropy, max_weight: s.max_weight,
                         top_position: s.top_position, self_attn_frac: s.self_attn_frac,
@@ -457,7 +457,7 @@ pub fn run_training(config: TrainConfig) {
             }
             if batch_flow_stats.is_none() {
                 if let Some(ref stats) = health.flow_stats {
-                    batch_flow_stats = Some(stats.iter().map(|s| crate::common::layer_flow_monitor::LayerFlowStats {
+                    batch_flow_stats = Some(stats.iter().map(|s| crate::monitors::layer_flow_monitor::LayerFlowStats {
                         layer: s.layer, input_norm: s.input_norm,
                         attn_output_norm: s.attn_output_norm, ffn_output_norm: s.ffn_output_norm,
                         output_norm: s.output_norm, attn_ratio: s.attn_ratio,
@@ -470,7 +470,7 @@ pub fn run_training(config: TrainConfig) {
             }
             if batch_output_stats.is_none() {
                 if let Some(ref stats) = health.output_stats {
-                    batch_output_stats = Some(crate::common::output_monitor::OutputDistStats {
+                    batch_output_stats = Some(crate::monitors::output_monitor::OutputDistStats {
                         avg_entropy: stats.avg_entropy, avg_margin: stats.avg_margin,
                         avg_correct_rank: stats.avg_correct_rank, worst_margin: stats.worst_margin,
                         worst_prompt_pos: stats.worst_prompt_pos, mode_collapse: stats.mode_collapse,
@@ -479,7 +479,7 @@ pub fn run_training(config: TrainConfig) {
             }
             if batch_ode_dynamics.is_none() {
                 if let Some(ref stats) = health.ode_dynamics {
-                    batch_ode_dynamics = Some(stats.iter().map(|s| crate::common::ode_dynamics_monitor::OdeDynamicsStats {
+                    batch_ode_dynamics = Some(stats.iter().map(|s| crate::monitors::ode_dynamics_monitor::OdeDynamicsStats {
                         layer: s.layer, phase_velocity: s.phase_velocity,
                         energy_in: s.energy_in, energy_out: s.energy_out,
                         energy_ratio: s.energy_ratio, band_energy_std: s.band_energy_std,
@@ -489,7 +489,7 @@ pub fn run_training(config: TrainConfig) {
             }
             if batch_iq_analysis.is_none() {
                 if let Some(ref iq) = health.iq_analysis {
-                    batch_iq_analysis = Some(crate::common::iq_monitor::IqAnalysis {
+                    batch_iq_analysis = Some(crate::monitors::iq_monitor::IqAnalysis {
                         i_discrim: iq.i_discrim, q_discrim: iq.q_discrim,
                         iq_ratio: iq.iq_ratio, phase_mean: iq.phase_mean,
                         phase_std: iq.phase_std, i_correct_rank: iq.i_correct_rank,
@@ -526,7 +526,7 @@ pub fn run_training(config: TrainConfig) {
             } else {
                 scan_cache.block_caches[0].ffn_precond[0].clone()
             };
-            let scan = crate::common::fwm_monitor::fwm_stability_scan(
+            let scan = crate::monitors::fwm_monitor::fwm_stability_scan(
                 &scan_precond,
                 &model.blocks[0].ffn.kerr, config.n_bands,
                 &[0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
@@ -560,7 +560,7 @@ pub fn run_training(config: TrainConfig) {
                     // Fallback to legacy cache
                     sample_cache.block_caches[layer_idx].ffn_precond[0].clone()
                 };
-                let diag = crate::common::fwm_monitor::measure_fwm(
+                let diag = crate::monitors::fwm_monitor::measure_fwm(
                     &precond_data, &block.ffn.kerr, config.n_bands, layer_idx,
                 );
                 fwm_layers.push(format!(
@@ -592,14 +592,14 @@ pub fn run_training(config: TrainConfig) {
                 } else {
                     sample_cache.block_caches[layer_idx].ffn_precond[0].clone()
                 };
-                let bwd = crate::common::ode_backward_monitor::measure_layer_backward(
+                let bwd = crate::monitors::ode_backward_monitor::measure_layer_backward(
                     &precond_data, &block.ffn.kerr, layer_idx,
                 );
                 eprintln!("  [BWD L{}] damp={:.3} phase={:.3} fwm={:.3} d_chi={:.6}",
                     layer_idx, bwd.damping_frac, bwd.phase_frac, bwd.fwm_frac, bwd.d_chi_norm);
                 bwd_stats.push(bwd);
             }
-            let bwd_json = crate::common::ode_backward_monitor::to_json(&bwd_stats, compute_tier);
+            let bwd_json = crate::monitors::ode_backward_monitor::to_json(&bwd_stats, compute_tier);
             let _ = writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, bwd_json);
             let _ = log_writer.flush();
 
@@ -624,11 +624,11 @@ pub fn run_training(config: TrainConfig) {
                     if j != i { rand.push((vec![i], vec![j])); }
                 }
 
-                let fw_report = crate::common::framework_monitor::run_framework_scan(
+                let fw_report = crate::monitors::framework_monitor::run_framework_scan(
                     &all_layer_hidden, &sample_cache.post_ln_f,
                     config.n_bands, &rel, &rand, &labs,
                 );
-                let fw_json = crate::common::framework_monitor::to_json(&fw_report);
+                let fw_json = crate::monitors::framework_monitor::to_json(&fw_report);
                 let _ = writeln!(log_writer, r#"{{"iter":{},"type":"monitor",{}}}"#, iter, fw_json);
                 let _ = log_writer.flush();
                 if let Some(final_stats) = fw_report.per_layer.last() {

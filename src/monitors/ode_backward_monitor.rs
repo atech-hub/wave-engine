@@ -9,7 +9,7 @@
 //! intervals. Does not touch the training-path deriv_backward.
 
 use crate::model::KerrWeights;
-use super::ode_backward::{ode_forward_with_cache, ode_backward, OdeParamGrads};
+use crate::common::ode_backward::{ode_forward_with_cache, ode_backward, OdeParamGrads};
 
 /// Per-layer backward decomposition stats.
 pub struct BackwardDecompStats {
