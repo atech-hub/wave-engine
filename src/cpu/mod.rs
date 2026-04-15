@@ -5,3 +5,4 @@ pub mod train_health;
 pub mod backward;
 pub mod forward;
 pub mod model_backward;
+pub mod grad_check_wrapper;

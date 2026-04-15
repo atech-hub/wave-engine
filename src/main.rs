@@ -912,6 +912,75 @@ fn main() {
         return;
     }
 
+    // ─── Gradient check mode ───
+    if std::env::args().any(|a| a == "--grad-check") {
+        let mode = std::env::args().skip_while(|a| a != "--grad-check").nth(1)
+            .unwrap_or("phase-native".to_string());
+        let scope = std::env::args().skip_while(|a| a != "--grad-check-scope").nth(1)
+            .unwrap_or("sampled".to_string());
+        let check_eps: f32 = parse_flag("--grad-check-eps", 1e-4);
+        let check_tol: f32 = parse_flag("--grad-check-tol", 0.01);
+        let verbose = std::env::args().any(|a| a == "--grad-check-verbose");
+        let n_layers: usize = parse_flag("--layers", 1);
+        let n_bands: usize = parse_flag("--n-bands", 4);
+        let n_head: usize = parse_flag("--n-head", 2);
+        let alpha: f32 = parse_flag("--alpha", 0.1);
+        let beta: f32 = parse_flag("--beta", 0.2);
+
+        let check_mode = match scope.as_str() {
+            "tiny" | "exhaustive" => monitors::junctions::grad_check::CheckMode::Exhaustive,
+            "sampled" => monitors::junctions::grad_check::CheckMode::PerSection { n_per_section: 5 },
+            other => { eprintln!("Unknown scope: {}. Use tiny, sampled, or exhaustive.", other); return; }
+        };
+        let config = monitors::junctions::grad_check::GradCheckConfig {
+            eps: check_eps, rel_tol: check_tol, mode: check_mode, verbose,
+            section_filter: None,
+        };
+
+        crate::ffn_backend::init_agc(alpha, beta);
+
+        match mode.as_str() {
+            "phase-native" => {
+                println!("Gradient check: phase-native, {}L, {}bands, {}head", n_layers, n_bands, n_head);
+                let vocab = 15usize;
+                let n_embd = n_bands * 2;
+                // Generate tiny token sequence
+                let tokens: Vec<usize> = (0..8).map(|i| i % vocab).collect();
+                let targets: Vec<usize> = (1..9).map(|i| i % vocab).collect();
+                let (fwd, fwd_bwd, params, labels) = cpu::grad_check_wrapper::phase_native_check(
+                    tokens, targets, n_layers, n_bands, n_head, vocab, alpha, beta,
+                );
+                let result = monitors::junctions::grad_check::check_gradients(
+                    "phase-native", fwd, fwd_bwd, &params, &labels, config,
+                );
+                monitors::junctions::grad_check::print_result(&result);
+                if !result.passed() { std::process::exit(1); }
+            }
+            "wave-input" => {
+                println!("Gradient check: wave-input, {}L, {}bands, {}head", n_layers, n_bands, n_head);
+                let vocab = 15usize;
+                let n_embd = n_bands * 2;
+                // Generate tiny wave inputs/targets
+                let mut rng = crate::rng::Rng::new(42);
+                let inputs: Vec<Vec<f32>> = (0..4).map(|_| (0..n_embd).map(|_| rng.uniform(1.0)).collect()).collect();
+                let targets: Vec<Vec<f32>> = (0..4).map(|_| (0..n_embd).map(|_| rng.uniform(1.0)).collect()).collect();
+                let (fwd, fwd_bwd, params, labels) = cpu::grad_check_wrapper::wave_input_check(
+                    inputs, targets, n_layers, n_bands, n_head, vocab, alpha, beta,
+                );
+                let result = monitors::junctions::grad_check::check_gradients(
+                    "wave-input", fwd, fwd_bwd, &params, &labels, config,
+                );
+                monitors::junctions::grad_check::print_result(&result);
+                if !result.passed() { std::process::exit(1); }
+            }
+            other => {
+                eprintln!("Unknown grad-check mode: {}. Supported: phase-native, wave-input", other);
+                return;
+            }
+        }
+        return;
+    }
+
     // ─── Wave-generate mode (for wave-trained models) ───
     if std::env::args().any(|a| a == "--wave-generate") {
         let resume_path = std::env::args().skip_while(|a| a != "--resume").nth(1)

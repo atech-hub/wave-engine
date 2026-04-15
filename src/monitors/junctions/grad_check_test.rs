@@ -3,7 +3,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::monitors::grad_check::*;
+    use crate::monitors::junctions::grad_check::*;
 
     fn simple_labels(n: usize) -> SectionLabels {
         SectionLabels::new(vec![(0, "all_params".to_string())])
