@@ -21,3 +21,6 @@ pub mod ode_dynamics_monitor;
 pub mod ode_monitor;
 pub mod output_monitor;
 pub mod throughput_monitor;
+pub mod grad_check;
+#[cfg(test)]
+mod grad_check_test;
