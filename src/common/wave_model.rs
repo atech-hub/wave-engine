@@ -33,7 +33,6 @@ pub struct WavePacketModel {
     pub agc_headroom: Vec<f32>, // per-layer AGC headroom (3.0 = 3-sigma default, training only)
     pub phase_native: bool, // true = use phase coherence loss instead of lm_head
     pub output_corrector: Vec<f32>, // [n_bands] per-band phase rotation before phase comparison
-    pub learnable_attn: bool, // true = attention weights are trainable (parallel path via attn_learnable.rs)
 }
 
 pub fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
@@ -171,7 +170,6 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
         agc_headroom: vec![3.0; n_layers], // 3-sigma default per layer
         phase_native: false,
         output_corrector: vec![0.0; d.n_bands], // 84 phase rotations, zero = transparent
-        learnable_attn: d.learnable_attn,
     }
 }
 
