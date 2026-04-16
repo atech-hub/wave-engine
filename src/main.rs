@@ -92,11 +92,47 @@ pub use candle_tier::block_diag as block_diagonal;
 
 // ─── Main ───────────────────────────────────────────────────────
 
-fn print_help() { common::help::print_help(); }
-
 fn main() {
+    // Try clap first. If no subcommand given, fall back to legacy dispatch.
+    // This allows incremental migration — modes migrate one at a time.
+    let args: Vec<String> = std::env::args().collect();
+
+    // Check if first real arg (after binary name) is a known subcommand
+    let known_subcommands = [
+        "train", "train-waves", "generate", "wave-generate", "encode",
+        "scan-memory", "galaxy-scan", "verify", "analyze", "ode-monitor",
+        "phase-decode", "convert-dataset", "recommend", "scale-checkpoint",
+        "serve", "help",
+    ];
+
+    let has_subcommand = args.get(1)
+        .map(|a| known_subcommands.contains(&a.as_str()))
+        .unwrap_or(false);
+
+    if has_subcommand {
+        // New clap-based dispatch
+        use clap::Parser;
+        let cli = cli::Cli::parse();
+        match cli.command {
+            cli::Command::Verify(verify_args) => cmd_verify(verify_args),
+            cli::Command::Recommend(args) => cmd_recommend(args),
+            cli::Command::ScaleCheckpoint(args) => cmd_scale_checkpoint(args),
+            // TODO: migrate remaining commands from legacy dispatch
+            _ => {
+                eprintln!("Subcommand recognized but not yet migrated to clap dispatch.");
+                eprintln!("Remove the subcommand name and use legacy --flags for now.");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // ─── Legacy dispatch (original flag-based parsing) ───
+    // Modes migrate to clap one at a time. Once all are migrated,
+    // this section and the legacy parse_flag functions are deleted.
+
     if std::env::args().any(|a| a == "--help" || a == "-h") {
-        print_help();
+        common::help::print_help();
         return;
     }
 
@@ -1348,4 +1384,78 @@ fn main() {
             }
         },
     });
+}
+
+// ─── Clap command handlers ─────────────────────────────────────
+
+fn cmd_verify(args: cli::VerifyArgs) {
+    // Init thread pool
+    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
+
+    match args.command {
+        cli::VerifyCommand::Grad(ga) => {
+            let check_mode = match ga.scope.as_str() {
+                "tiny" | "exhaustive" => monitors::junctions::grad_check::CheckMode::Exhaustive,
+                "sampled" => monitors::junctions::grad_check::CheckMode::PerSection { n_per_section: 5 },
+                other => { eprintln!("Unknown scope: {}. Use tiny, sampled, or exhaustive.", other); return; }
+            };
+            let config = monitors::junctions::grad_check::GradCheckConfig {
+                eps: ga.eps, rel_tol: ga.tol, mode: check_mode, verbose: ga.verbose,
+                section_filter: None,
+            };
+            let m = &ga.model;
+            crate::ffn_backend::init_agc(m.alpha, m.beta);
+
+            match ga.mode.as_str() {
+                "phase-native" => {
+                    println!("Gradient check: phase-native, {}L, {}bands, {}head", m.layers, m.n_bands, m.n_head);
+                    let tokens: Vec<usize> = (0..8).map(|i| i % m.vocab).collect();
+                    let targets: Vec<usize> = (1..9).map(|i| i % m.vocab).collect();
+                    let (fwd, bwd, params, labels) = cpu::grad_check_wrapper::phase_native_check(
+                        tokens, targets, m.layers, m.n_bands, m.n_head, m.vocab, m.alpha, m.beta,
+                    );
+                    let result = monitors::junctions::grad_check::check_gradients(
+                        "phase-native", fwd, bwd, &params, &labels, config,
+                    );
+                    monitors::junctions::grad_check::print_result(&result);
+                    if !result.passed() { std::process::exit(1); }
+                }
+                "wave-input" => {
+                    println!("Gradient check: wave-input, {}L, {}bands, {}head", m.layers, m.n_bands, m.n_head);
+                    let n_embd = m.n_bands * 2;
+                    let mut rng = crate::rng::Rng::new(42);
+                    let inputs: Vec<Vec<f32>> = (0..4).map(|_| (0..n_embd).map(|_| rng.uniform(1.0)).collect()).collect();
+                    let targets: Vec<Vec<f32>> = (0..4).map(|_| (0..n_embd).map(|_| rng.uniform(1.0)).collect()).collect();
+                    let (fwd, bwd, params, labels) = cpu::grad_check_wrapper::wave_input_check(
+                        inputs, targets, m.layers, m.n_bands, m.n_head, m.vocab, m.alpha, m.beta,
+                    );
+                    let result = monitors::junctions::grad_check::check_gradients(
+                        "wave-input", fwd, bwd, &params, &labels, config,
+                    );
+                    monitors::junctions::grad_check::print_result(&result);
+                    if !result.passed() { std::process::exit(1); }
+                }
+                other => {
+                    eprintln!("Unknown grad-check mode: {}. Supported: phase-native, wave-input", other);
+                }
+            }
+        }
+    }
+}
+
+fn cmd_recommend(args: cli::RecommendArgs) {
+    common::recommend::run_recommend(&args.data);
+}
+
+fn cmd_scale_checkpoint(args: cli::ScaleCheckpointArgs) {
+    common::scale::scale_checkpoint(&common::scale::ScaleConfig {
+        source_path: args.checkpoint.resume,
+        target_bands: args.tgt_bands,
+        target_head: 0, // TODO: add to clap args
+        target_layers: None,
+        output_path: args.output,
+        target_groups: 1,
+        seed: 42,
+    }).unwrap_or_else(|e| { eprintln!("Scale error: {e}"); std::process::exit(1); });
 }

@@ -465,8 +465,8 @@ pub struct ConvertDatasetArgs {
 
 #[derive(clap::Args)]
 pub struct RecommendArgs {
-    #[command(flatten)]
-    pub model: ModelArgs,
+    /// Data file to analyze for recommendations
+    pub data: String,
 }
 
 #[derive(clap::Args)]
