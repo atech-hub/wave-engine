@@ -275,8 +275,9 @@ pub struct WaveGenerateArgs {
 
 #[derive(clap::Args)]
 pub struct EncodeArgs {
-    #[command(flatten)]
-    pub checkpoint: CheckpointArgs,
+    /// Checkpoint to load (omit with --blank for untrained model)
+    #[arg(long)]
+    pub resume: Option<String>,
 
     #[command(flatten)]
     pub model: ModelArgs,
@@ -285,33 +286,61 @@ pub struct EncodeArgs {
     #[arg(long, default_value = "data/input.txt")]
     pub data: String,
 
-    /// Use BPE tokenizer
+    /// Use untrained (blank) model instead of checkpoint
     #[arg(long)]
-    pub bpe: bool,
+    pub blank: bool,
 
-    /// BPE tokenizer path
-    #[arg(long, default_value = "data/tokenizer.json")]
-    pub tokenizer: String,
+    /// Multi-grid modulus 1
+    #[arg(long, default_value_t = 5)]
+    pub m1: usize,
 
-    /// Tokens/phrases to encode
+    /// Multi-grid modulus 2
+    #[arg(long, default_value_t = 7)]
+    pub m2: usize,
+
+    /// Layer to inject encoding at
+    #[arg(long, default_value_t = 0)]
+    pub inject_layer: usize,
+
+    /// Run galaxy scan on encode output
     #[arg(long)]
-    pub tokens: Vec<String>,
+    pub scan: bool,
 
-    /// Run relate-vocab scan
+    /// Run relate-vocab: full vocabulary relationship scan
     #[arg(long)]
     pub relate_vocab: bool,
 
-    /// Relate two tokens pairwise
+    /// Relate items pairwise (repeat for each item: --relate "a" --relate "b")
     #[arg(long)]
     pub relate: Vec<String>,
 
+    /// Relate a number (used with --relate)
+    #[arg(long)]
+    pub relate_number: Vec<u64>,
+
+    /// Relate a catalog spec (used with --relate)
+    #[arg(long)]
+    pub relate_catalog: Vec<String>,
+
+    /// Encode text (single item)
+    #[arg(long)]
+    pub encode: Option<String>,
+
     /// Encode a number
     #[arg(long)]
-    pub encode_number: Option<f32>,
+    pub encode_number: Option<u64>,
 
-    /// Encode from catalog
+    /// Encode from catalog specification
     #[arg(long)]
-    pub catalog: bool,
+    pub encode_catalog: Option<String>,
+
+    /// Encode raw phases
+    #[arg(long)]
+    pub encode_phases: Option<String>,
+
+    /// Output file for relate-vocab JSON
+    #[arg(long, default_value = "vocab_relations.json")]
+    pub output: String,
 }
 
 #[derive(clap::Args)]

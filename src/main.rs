@@ -1845,12 +1845,198 @@ fn cmd_train(args: cli::TrainArgs) {
     });
 }
 
-fn cmd_encode(_args: cli::EncodeArgs) {
-    // Encode has complex multi-mode logic (relate-vocab, relate, encode-number, encode-catalog, encode-phases).
-    // Still on legacy dispatch — use --encode, --relate-vocab, --relate flags.
-    eprintln!("encode: use legacy flags (--encode, --relate-vocab, --relate) for now.");
-    eprintln!("This is the last command to migrate — complex multi-mode logic.");
-    std::process::exit(1);
+fn cmd_encode(args: cli::EncodeArgs) {
+    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
+
+    let m = &args.model;
+    let n_bands = m.n_bands;
+    let n_embd = n_bands * 2;
+    let dims = Dims::from_cli(n_bands, m.n_head, 16, 128, 16);
+
+    // Load model or create blank
+    let model = if args.blank {
+        println!("Creating blank (untrained) model: {}L, {}bands", m.layers, n_bands);
+        init_model(128, 42, m.layers, m.out_proj_groups, dims, m.alpha, m.beta)
+    } else {
+        let resume = args.resume.as_ref().expect("encode requires --resume <checkpoint> or --blank");
+        println!("Loading checkpoint: {}", resume);
+        let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(resume);
+        let mut model = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims, m.alpha, m.beta);
+        let ext_count = count_trainable_ex(&model, false);
+        if params.len() < ext_count {
+            model.phase_native = true;
+            model.output_corrector = vec![0.0; n_bands];
+        }
+        unflatten_params_ex(&mut model, &params, false);
+        println!("  Model: {}L, {}bands, {}vocab, phase_native={}",
+            m.layers, n_bands, ck_vocab, model.phase_native);
+        model
+    };
+
+    crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+
+    // Build char map
+    let char_map: Vec<char> = if !args.blank && std::path::Path::new(&args.data).exists() {
+        let text = common::data_loader::load_text_raw(&args.data);
+        let mut chars: Vec<char> = text.chars().collect();
+        chars.sort(); chars.dedup();
+        chars.truncate(model.vocab_size);
+        println!("  Char map: {} chars from {}", chars.len(), args.data);
+        chars
+    } else {
+        (0..model.vocab_size.min(128)).map(|i| i as u8 as char).collect()
+    };
+    let encode_char = |c: char| -> Option<usize> { char_map.iter().position(|&ch| ch == c) };
+    let decode_tok = |tok: usize| -> String {
+        if tok < char_map.len() {
+            let c = char_map[tok];
+            if c.is_ascii_graphic() || c == ' ' { format!("'{}'", c) } else { format!("t{}", tok) }
+        } else { format!("t{}", tok) }
+    };
+
+    // ─── Relate-vocab ───
+    if args.relate_vocab {
+        let (labels, reports, dist, profiles) = common::phase_encode::run_relate_vocab(&model, n_bands, Some(&char_map));
+        println!("\n=== Vocabulary Relationship Map ===");
+        println!("  {} tokens, {} pairs", labels.len(), reports.len());
+        println!("\n  Catalog distribution:");
+        let mut entries: Vec<_> = dist.iter().collect();
+        entries.sort_by_key(|e| std::cmp::Reverse(*e.1));
+        for (name, count) in &entries { println!("    {:20} {:5}", name, count); }
+        println!("\n  Energy signatures (top amplifiers / dampeners):");
+        let mut sorted_profiles: Vec<&common::phase_encode::EnergyProfile> = profiles.iter().collect();
+        sorted_profiles.sort_by(|a, b| b.peak_ratio.partial_cmp(&a.peak_ratio).unwrap_or(std::cmp::Ordering::Equal));
+        for p in sorted_profiles.iter().take(5) {
+            println!("    {:>4}  energy={:.2}x  peak=band{}({:.1}x)  damp=band{}({:.2}x)",
+                p.label, p.total_energy_ratio, p.peak_band, p.peak_ratio, p.damp_band, p.damp_ratio);
+        }
+        let phase_scores: std::collections::HashMap<String, f32> = labels.iter().enumerate().map(|(_i, label)| {
+            let total = reports.iter().filter(|r| r.label_a == *label || r.label_b == *label).count();
+            let non_conj = reports.iter().filter(|r| {
+                (r.label_a == *label || r.label_b == *label)
+                && r.catalog_match.as_ref().map(|(n, _)| &**n != "conjunction").unwrap_or(false)
+            }).count();
+            (label.clone(), if total > 0 { non_conj as f32 / total as f32 } else { 0.0 })
+        }).collect();
+        let axis_scores = common::catalog_axes::compute_all_axes(&model, n_bands, &char_map, &phase_scores);
+        let corr = common::catalog_axes::correlation_matrix(&axis_scores);
+        common::catalog_axes::print_axes_summary(&axis_scores, &corr);
+        let destruction_profile = common::catalog_axes::compute_destruction_profile(&model, n_bands, args.m1, args.m2);
+        println!("\n  Targeted destruction profile:");
+        for l in &destruction_profile.per_layer {
+            println!("    L{}: on={:.3} off={:.3} ratio={:.2}x", l.layer, l.on_grid_cos, l.off_grid_cos, l.ratio);
+        }
+        if let Err(e) = common::phase_encode::write_vocab_relations_json(&args.output, &labels, &reports, &dist, Some(&profiles)) {
+            eprintln!("Error writing {}: {}", args.output, e);
+        } else { println!("\n  Written to: {}", args.output); }
+        return;
+    }
+
+    // ─── Relate pairwise ───
+    if !args.relate.is_empty() || !args.relate_number.is_empty() || !args.relate_catalog.is_empty() {
+        let mut items: Vec<(String, Vec<f32>)> = Vec::new();
+        for text in &args.relate {
+            let tokens: Vec<usize> = text.chars().filter_map(|c| encode_char(c)).collect();
+            let mut h = vec![0.0f32; n_embd];
+            if let Some(&tok) = tokens.last() {
+                let pos = (tokens.len() - 1).min(model.wpe.len() - 1);
+                for j in 0..n_embd { h[j] = model.wte[tok][j] + model.wpe[pos][j]; }
+            }
+            items.push((text.clone(), h));
+        }
+        for n in &args.relate_number {
+            let state = common::phase_encode::encode_number(*n, n_bands, args.m1, args.m2);
+            items.push((format!("{}", n), state));
+        }
+        for spec in &args.relate_catalog {
+            let configs = common::phase_encode::parse_catalog_spec(spec);
+            let state = common::phase_encode::encode_catalog_state(&configs, n_bands);
+            items.push((spec.clone(), state));
+        }
+        if items.len() < 2 {
+            eprintln!("Relate requires at least 2 items.");
+            std::process::exit(1);
+        }
+        let reports = common::phase_encode::run_relate(&model, &items, n_bands);
+        for r in &reports { common::phase_encode::print_relate_report(r); }
+        if items.len() > 2 {
+            let labels: Vec<String> = items.iter().map(|(l, _)| l.clone()).collect();
+            common::phase_encode::print_relate_matrix(&labels, &reports);
+        }
+        return;
+    }
+
+    // ─── Single encode ───
+    let (_label, encoded, configs) = if let Some(ref text) = args.encode {
+        let tokens: Vec<usize> = text.chars().filter_map(|c| encode_char(c)).collect();
+        println!("  Tokens: {:?} (from \"{}\")", tokens, text);
+        let mut states: Vec<Vec<f32>> = Vec::new();
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let mut h = vec![0.0f32; n_embd];
+            if pos < model.wpe.len() { for j in 0..n_embd { h[j] = model.wte[tok][j] + model.wpe[pos][j]; } }
+            states.push(h);
+        }
+        (format!("Text: \"{}\"", text), states.last().cloned().unwrap_or(vec![0.0; n_embd]), vec![])
+    } else if let Some(n) = args.encode_number {
+        let state = common::phase_encode::encode_number(n, n_bands, args.m1, args.m2);
+        (format!("Number: {}", n), state, vec![])
+    } else if let Some(ref spec) = args.encode_catalog {
+        let configs = common::phase_encode::parse_catalog_spec(spec);
+        let state = common::phase_encode::encode_catalog_state(&configs, n_bands);
+        (format!("Catalog: {}", spec), state, configs)
+    } else if let Some(ref spec) = args.encode_phases {
+        let phases = common::phase_encode::parse_raw_phases(spec);
+        let state = common::phase_encode::encode_raw_phases(&phases, n_bands);
+        (format!("Raw phases: {}", spec), state, vec![])
+    } else {
+        eprintln!("No encoding specified. Use --encode, --encode-number, --encode-catalog, --encode-phases, --relate, or --relate-vocab.");
+        std::process::exit(1);
+    };
+
+    let highlight: Vec<usize> = configs.iter().flat_map(|c| c.bands.iter().copied()).collect();
+    common::phase_encode::print_encoded_state(&format!("Encoded state (input to layer {})", args.inject_layer), &encoded, &highlight);
+
+    let (final_out, per_layer) = common::phase_encode::run_encode(&model, &encoded, args.inject_layer, n_bands);
+    common::phase_encode::print_layer_cosines(&encoded, &per_layer);
+    common::phase_encode::print_encoded_state(&format!("After ODE evolution (output of layer {})", per_layer.len().saturating_sub(1)), &final_out, &highlight);
+    common::phase_encode::print_comparison(&encoded, &final_out, &configs);
+
+    if !args.blank {
+        println!("\n=== Decoder readout ===");
+        let mut scores: Vec<(usize, f32)> = (0..model.vocab_size).map(|tok| {
+            let dot: f32 = (0..n_embd).map(|i| model.lm_head[tok][i] * final_out[i]).sum();
+            (tok, dot)
+        }).collect();
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        print!("  lm_head top 5:");
+        for (tok, score) in scores.iter().take(5) { print!("  {} ({:.3})", decode_tok(*tok), score); }
+        println!();
+        let mut phase_scores: Vec<(usize, f32)> = (0..model.vocab_size).map(|tok| {
+            let dot: f32 = (0..n_embd).map(|i| model.wte[tok][i] * final_out[i]).sum();
+            (tok, dot)
+        }).collect();
+        phase_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        print!("  phase-native top 5:");
+        for (tok, score) in phase_scores.iter().take(5) { print!("  {} ({:.3})", decode_tok(*tok), score); }
+        println!();
+    }
+
+    if args.scan {
+        println!("\n  Running galaxy scan on output...");
+        let all_hidden: Vec<Vec<Vec<f32>>> = per_layer.iter().map(|h| vec![h.clone()]).collect();
+        let post_ln_f = vec![final_out.clone()];
+        let per_layer_ceilings: Vec<f32> = model.blocks.iter()
+            .map(|b| (std::f32::consts::FRAC_PI_2 / (b.ffn.kerr.alpha + 4.0 * b.ffn.kerr.beta)).sqrt().max(0.5))
+            .collect();
+        let scan_dir = std::path::PathBuf::from("encode_output_galaxy");
+        match common::galaxy_scan::run_and_write_full_scan(
+            &all_hidden, &post_ln_f, n_bands, &per_layer_ceilings, args.m1, args.m2, &scan_dir,
+        ) {
+            Ok(scan) => { println!("Galaxy map written to: {}", scan_dir.display()); common::galaxy_scan::print_summary(&scan); }
+            Err(e) => { eprintln!("Error: {}", e); }
+        }
+    }
 }
 
 fn cmd_ode_monitor(args: cli::OdeMonitorArgs) {
