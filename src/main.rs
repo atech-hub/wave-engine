@@ -1846,27 +1846,147 @@ fn cmd_train(args: cli::TrainArgs) {
 }
 
 fn cmd_encode(_args: cli::EncodeArgs) {
-    // TODO: migrate encode modes — complex with multiple sub-modes
-    eprintln!("encode: not yet migrated to clap. Use legacy --encode flags.");
+    // Encode has complex multi-mode logic (relate-vocab, relate, encode-number, encode-catalog, encode-phases).
+    // Still on legacy dispatch — use --encode, --relate-vocab, --relate flags.
+    eprintln!("encode: use legacy flags (--encode, --relate-vocab, --relate) for now.");
+    eprintln!("This is the last command to migrate — complex multi-mode logic.");
     std::process::exit(1);
 }
 
-fn cmd_ode_monitor(_args: cli::OdeMonitorArgs) {
-    // TODO: migrate ODE monitor
-    eprintln!("ode-monitor: not yet migrated to clap. Use legacy --ode-monitor flags.");
-    std::process::exit(1);
+fn cmd_ode_monitor(args: cli::OdeMonitorArgs) {
+    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
+    println!("wave-engine v0.1.0\n");
+
+    let m = &args.model;
+    let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&args.checkpoint.resume);
+
+    // Try multiple layout variants
+    let mut model = {
+        let dims_try = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true).with_layer_scale(true);
+        let mut mdl = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims_try, m.alpha, m.beta);
+        if params.len() == count_trainable_ex(&mdl, false) {
+            unflatten_params_ex(&mut mdl, &params, false); mdl
+        } else {
+            let dims2 = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true);
+            let mut mdl2 = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims2, m.alpha, m.beta);
+            if params.len() == count_trainable_ex(&mdl2, false) {
+                unflatten_params_ex(&mut mdl2, &params, false); mdl2
+            } else {
+                let dims3 = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+                    .with_learnable_ode(false).with_corrector(false);
+                let mut mdl3 = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims3, m.alpha, m.beta);
+                unflatten_params(&mut mdl3, &params); mdl3
+            }
+        }
+    };
+    model.learnable_ode = false;
+
+    let dims = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+        .with_learnable_ode(false).with_corrector(true);
+    let stencil = fft_ode::StencilFft::new(m.n_bands);
+    crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+
+    let text = common::data_loader::load_text_raw(&args.data);
+    let mut chars: Vec<char> = text.chars().collect();
+    chars.sort(); chars.dedup();
+    let char_map: Vec<char> = chars[..chars.len().min(ck_vocab)].to_vec();
+    let encode = |s: &str| -> Vec<usize> {
+        s.chars().filter_map(|c| char_map.iter().position(|&ch| ch == c)).collect()
+    };
+    let decode = |id: usize| -> String {
+        if id < char_map.len() { char_map[id].to_string() } else { "?".to_string() }
+    };
+
+    let prompt = args.prompt.unwrap_or("3+4=".to_string());
+    println!("=== ODE Monitor ===\n");
+    let tokens = encode(&prompt);
+    monitors::ode_monitor::print_ode_summary(&model, &tokens, dims, &stencil, &prompt, &decode);
+
+    if args.compare.len() >= 1 {
+        let tokens_b = encode(&args.compare[0]);
+        monitors::ode_monitor::compare_prompts(&model, &tokens, &tokens_b, dims, &stencil, &prompt, &args.compare[0]);
+    }
 }
 
-fn cmd_phase_decode(_args: cli::PhaseDecodeArgs) {
-    // TODO: migrate phase-decode
-    eprintln!("phase-decode: not yet migrated to clap. Use legacy --phase-decode flags.");
-    std::process::exit(1);
+fn cmd_phase_decode(args: cli::PhaseDecodeArgs) {
+    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
+    println!("wave-engine v0.1.0\n");
+
+    let m = &args.model;
+    let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&args.checkpoint.resume);
+
+    let mut model = {
+        let dims_try = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true).with_layer_scale(true);
+        let mut mdl = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims_try, m.alpha, m.beta);
+        if params.len() == count_trainable_ex(&mdl, false) {
+            unflatten_params_ex(&mut mdl, &params, false); mdl
+        } else {
+            let dims2 = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true);
+            let mut mdl2 = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims2, m.alpha, m.beta);
+            if params.len() == count_trainable_ex(&mdl2, false) {
+                unflatten_params_ex(&mut mdl2, &params, false); mdl2
+            } else {
+                let dims3 = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+                    .with_learnable_ode(false).with_corrector(false);
+                let mut mdl3 = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims3, m.alpha, m.beta);
+                unflatten_params(&mut mdl3, &params); mdl3
+            }
+        }
+    };
+    model.learnable_ode = false;
+
+    let dims = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
+        .with_learnable_ode(false).with_corrector(true);
+    let stencil = fft_ode::StencilFft::new(m.n_bands);
+    crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+
+    let text = common::data_loader::load_text_raw(&args.data);
+    let mut chars: Vec<char> = text.chars().collect();
+    chars.sort(); chars.dedup();
+    let char_map: Vec<char> = chars[..chars.len().min(ck_vocab)].to_vec();
+    let encode = |s: &str| -> Vec<usize> {
+        s.chars().filter_map(|c| char_map.iter().position(|&ch| ch == c)).collect()
+    };
+    let decode = |id: usize| -> String {
+        if id < char_map.len() { char_map[id].to_string() } else { "?".to_string() }
+    };
+
+    println!("Phase decode diagnostic: {} params, {} vocab", params.len(), ck_vocab);
+    println!("{:<10} {:<10} {:<10} {:<10}", "Prompt", "Expected", "LM_Head", "Phase");
+    println!("{}", "-".repeat(45));
+
+    let prompts = ["9-1=", "3+4=", "5-2=", "7+2=", "1+1=", "8-3=", "6+3=", "4-0=", "0+5=", "9-9="];
+    let expected = ["8", "7", "3", "9", "2", "5", "9", "4", "5", "0"];
+    let mut lm_correct = 0;
+    let mut phase_correct = 0;
+
+    for (prompt, exp) in prompts.iter().zip(expected.iter()) {
+        let tokens = encode(prompt);
+        let (phase_tok, lm_tok, _coherences) = common::phase_decode::phase_decode_compare(
+            &model, &tokens, dims, &stencil,
+        );
+        let lm_ans = decode(lm_tok);
+        let ph_ans = decode(phase_tok);
+        let lm_ok = lm_ans == *exp;
+        let ph_ok = ph_ans == *exp;
+        if lm_ok { lm_correct += 1; }
+        if ph_ok { phase_correct += 1; }
+        println!("{:<10} {:<10} {:<10} {:<10}",
+            prompt, exp,
+            format!("{}{}", lm_ans, if lm_ok { " ✓" } else { " ✗" }),
+            format!("{}{}", ph_ans, if ph_ok { " ✓" } else { " ✗" }),
+        );
+    }
+    println!("{}", "-".repeat(45));
+    println!("LM Head: {}/10    Phase decode: {}/10", lm_correct, phase_correct);
 }
 
 #[cfg(feature = "serve")]
 fn cmd_serve(_args: cli::ServeArgs) {
-    // TODO: migrate serve
-    eprintln!("serve: not yet migrated to clap. Use legacy --serve flags.");
+    // Serve requires the full serve_tier infrastructure — keep on legacy for now
+    eprintln!("serve: use legacy --serve flag for now.");
     std::process::exit(1);
 }
 
