@@ -17,6 +17,7 @@ mod wgpu_tier;
 mod candle_tier;
 #[allow(dead_code)]
 mod monitors;
+mod cli;
 #[cfg(feature = "serve")]
 mod serve_tier;
 
