@@ -537,3 +537,82 @@ fn print_wave_diagnosis(
     }
     eprintln!();
 }
+
+/// Teacher-forced accuracy test: feed correct KWDS waves, check decode accuracy.
+pub fn run_teacher_force(
+    checkpoint_path: &str,
+    kwds_path: &str,
+    data_path: &str,
+    n_layers: usize,
+    n_head: usize,
+    vocab: usize,
+    alpha: f32,
+    beta: f32,
+) {
+    let mut f = std::fs::File::open(kwds_path).expect("Cannot open KWDS file");
+    let header = super::kwds::read_header(&mut f).unwrap();
+    let n_bands = header.n_bands as usize;
+    let n_embd = n_bands * 2;
+
+    let (params, ck_vocab, ck_iter, _, _, _, _, _, _, _, _) = crate::wave_checkpoint::load_checkpoint(checkpoint_path);
+    let variants: [(bool, bool); 4] = [(false, true), (false, false), (true, true), (true, false)];
+    let effective_vocab = vocab.max(ck_vocab);
+    let mut dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
+    let mut model = crate::init_model(effective_vocab, 42, n_layers, 1, dims, alpha, beta);
+    for (use_ode, use_corr) in &variants {
+        let d = Dims::from_cli(n_bands, n_head, 16, 128, 16)
+            .with_learnable_ode(*use_ode).with_corrector(*use_corr);
+        let mut mdl = crate::init_model(effective_vocab, 42, n_layers, 1, d, alpha, beta);
+        mdl.phase_native = true; mdl.output_corrector = vec![0.0; n_bands];
+        if params.len() == count_trainable_ex(&mdl, false) {
+            unflatten_params_ex(&mut mdl, &params, false); model = mdl; dims = d; break;
+        }
+    }
+    crate::ffn_backend::init_agc(alpha, beta);
+    let stencil = fft_ode::StencilFft::new(n_bands);
+
+    let text = super::data_loader::load_text_raw(data_path);
+    let mut chars: Vec<char> = text.chars().collect();
+    chars.sort(); chars.dedup();
+    let char_map: Vec<char> = chars[..chars.len().min(effective_vocab)].to_vec();
+    let detok = |id: usize| -> String {
+        if id < char_map.len() { char_map[id].to_string() } else { format!("?{}", id) }
+    };
+
+    let seq_len = 64usize;
+    println!("Teacher-forced accuracy test: {} positions, seq_len={}", header.n_positions, seq_len);
+    println!("  Checkpoint: {} (iter {})", checkpoint_path, ck_iter);
+
+    let test_len = seq_len.min(header.n_positions as usize - 1);
+    let inputs = super::kwds::read_input_window(&mut f, &header, 0, test_len).unwrap();
+    let targets = super::kwds::read_target_window(&mut f, &header, 0, test_len).unwrap();
+    let cache = crate::cpu::forward::forward_with_cache_from_waves(&model, &inputs, dims, Some(&stencil));
+
+    let mut correct = 0usize;
+    let mut total = 0usize;
+    for pos in 0..cache.post_ln_f.len().min(targets.len()) {
+        let output = &cache.post_ln_f[pos];
+        let target = &targets[pos];
+        let mut target_tok = 0;
+        let mut target_best = f32::NEG_INFINITY;
+        for v in 0..effective_vocab {
+            let dot: f32 = (0..n_embd).map(|j| target[j] * model.wte[v][j]).sum();
+            if dot > target_best { target_best = dot; target_tok = v; }
+        }
+        let mut scores: Vec<(usize, f32)> = (0..effective_vocab).map(|v| {
+            let dot: f32 = (0..n_embd).map(|j| output[j] * model.wte[v][j]).sum();
+            (v, dot)
+        }).collect();
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let chosen = scores[0].0;
+        if chosen == target_tok { correct += 1; }
+        total += 1;
+        if pos < 20 || chosen == target_tok {
+            let target_rank = scores.iter().position(|s| s.0 == target_tok).unwrap_or(999) + 1;
+            println!("  pos {:3}: output='{}' target='{}' {}  rank={}",
+                pos, detok(chosen).replace('\n', "\\n"), detok(target_tok).replace('\n', "\\n"),
+                if chosen == target_tok { "✓" } else { "✗" }, target_rank);
+        }
+    }
+    println!("\n  Teacher-forced accuracy: {}/{} ({:.1}%)", correct, total, correct as f64 / total as f64 * 100.0);
+}

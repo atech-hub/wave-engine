@@ -115,6 +115,12 @@ fn main() {
     }
 }
 
+// ─── Runtime init ──────────────────────────────────────────────
+
+fn init_runtime() {
+    init_runtime();
+}
+
 // ─── Clap command handlers ─────────────────────────────────────
 
 fn cmd_verify(args: cli::VerifyArgs) {
@@ -186,60 +192,16 @@ fn cmd_scan_memory(args: cli::ScanMemoryArgs) {
 }
 
 fn cmd_galaxy_scan(args: cli::GalaxyScanArgs) {
-    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
-    println!("wave-engine v0.1.0\n");
-
+    init_runtime();
     let m = &args.model;
-    let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&args.checkpoint.resume);
-    let variants: [(bool, bool); 4] = [(false, true), (false, false), (true, true), (true, false)];
-    let mut dims = Dims::from_cli(m.n_bands, m.n_head, 16, 128, 16);
-    let mut model = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims, m.alpha, m.beta);
-    let mut loaded = false;
-    for (use_ode, use_corr) in &variants {
-        let d = Dims::from_cli(m.n_bands, m.n_head, 16, 128, 16)
-            .with_learnable_ode(*use_ode).with_corrector(*use_corr);
-        let mut mdl = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, d, m.alpha, m.beta);
-        mdl.phase_native = true;
-        mdl.output_corrector = vec![0.0; m.n_bands];
-        if params.len() == count_trainable_ex(&mdl, false) {
-            unflatten_params_ex(&mut mdl, &params, false);
-            eprintln!("  [galaxy-scan] Loaded: ode={}, corrector={}", use_ode, use_corr);
-            model = mdl; dims = d; loaded = true; break;
-        }
-        let mut m2 = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, d, m.alpha, m.beta);
-        if params.len() == count_trainable_ex(&m2, false) {
-            unflatten_params_ex(&mut m2, &params, false);
-            eprintln!("  [galaxy-scan] Loaded (non-PN): ode={}, corrector={}", use_ode, use_corr);
-            model = m2; dims = d; loaded = true; break;
-        }
-    }
-    if !loaded { panic!("Cannot match checkpoint param count {} to any model variant", params.len()); }
-
-    let data_path = args.scan_corpus.unwrap_or("data/input.txt".to_string());
-    let (tokens, _) = common::data_loader::load_data(&data_path, false, None);
-    let scan_len = tokens.len().min(200).min(128);
-    let stencil = fft_ode::StencilFft::new(m.n_bands * 2);
-    let cache = crate::cpu::forward::forward_with_cache(
-        &model, &tokens[..scan_len], dims, None, None, None, Some(&stencil), None, None, None,
+    common::galaxy_scan::run_galaxy_scan_cli(
+        &args.checkpoint.resume, m.n_bands, m.n_head, m.layers,
+        m.out_proj_groups, m.alpha, m.beta, args.scan_corpus, args.m1, args.m2,
     );
-    let all_hidden: Vec<Vec<Vec<f32>>> = cache.block_caches.iter().map(|bc| bc.input.clone()).collect();
-    let per_layer_ceilings: Vec<f32> = model.blocks.iter()
-        .map(|b| (std::f32::consts::FRAC_PI_2 / (b.ffn.kerr.alpha + 4.0 * b.ffn.kerr.beta)).sqrt().max(0.5))
-        .collect();
-    let galaxy_dir = std::path::PathBuf::from(args.checkpoint.resume.replace(".bin", "_galaxy"));
-    match common::galaxy_scan::run_and_write_full_scan(
-        &all_hidden, &cache.post_ln_f, m.n_bands, &per_layer_ceilings, args.m1, args.m2, &galaxy_dir,
-    ) {
-        Ok(scan) => { println!("Galaxy map written to: {}", galaxy_dir.display()); common::galaxy_scan::print_summary(&scan); }
-        Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
-    }
 }
 
 fn cmd_generate(args: cli::GenerateArgs) {
-    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
-    println!("wave-engine v0.1.0\n");
+    init_runtime();
 
     let m = &args.model;
     common::generate::run_generate(common::generate::GenerateConfig {
@@ -263,9 +225,7 @@ fn cmd_generate(args: cli::GenerateArgs) {
 }
 
 fn cmd_wave_generate(args: cli::WaveGenerateArgs) {
-    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
-    println!("wave-engine v0.1.0\n");
+    init_runtime();
 
     let m = &args.model;
 
@@ -297,79 +257,14 @@ fn cmd_wave_generate(args: cli::WaveGenerateArgs) {
 
 fn cmd_teacher_force(kwds_path: &str, args: &cli::WaveGenerateArgs) {
     let m = &args.model;
-    let n_embd = m.n_bands * 2;
-    let mut f = std::fs::File::open(kwds_path).expect("Cannot open KWDS file");
-    let header = common::kwds::read_header(&mut f).unwrap();
-    let n_bands = header.n_bands as usize;
-
-    let (params, ck_vocab, ck_iter, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&args.checkpoint.resume);
-    let variants: [(bool, bool); 4] = [(false, true), (false, false), (true, true), (true, false)];
-    let effective_vocab = m.vocab.max(ck_vocab);
-    let mut dims = Dims::from_cli(n_bands, m.n_head, 16, 128, 16);
-    let mut model = init_model(effective_vocab, 42, m.layers, 1, dims, m.alpha, m.beta);
-    for (use_ode, use_corr) in &variants {
-        let d = Dims::from_cli(n_bands, m.n_head, 16, 128, 16)
-            .with_learnable_ode(*use_ode).with_corrector(*use_corr);
-        let mut mdl = init_model(effective_vocab, 42, m.layers, 1, d, m.alpha, m.beta);
-        mdl.phase_native = true; mdl.output_corrector = vec![0.0; n_bands];
-        if params.len() == count_trainable_ex(&mdl, false) {
-            unflatten_params_ex(&mut mdl, &params, false); model = mdl; dims = d; break;
-        }
-    }
-    crate::ffn_backend::init_agc(m.alpha, m.beta);
-    let stencil = fft_ode::StencilFft::new(n_bands);
-
-    let text = common::data_loader::load_text_raw(&args.data);
-    let mut chars: Vec<char> = text.chars().collect();
-    chars.sort(); chars.dedup();
-    let char_map: Vec<char> = chars[..chars.len().min(effective_vocab)].to_vec();
-    let detok = |id: usize| -> String {
-        if id < char_map.len() { char_map[id].to_string() } else { format!("?{}", id) }
-    };
-
-    let seq_len = 64usize; // default
-    println!("Teacher-forced accuracy test: {} positions, seq_len={}", header.n_positions, seq_len);
-    println!("  Checkpoint: {} (iter {})", args.checkpoint.resume, ck_iter);
-
-    let test_len = seq_len.min(header.n_positions as usize - 1);
-    let inputs = common::kwds::read_input_window(&mut f, &header, 0, test_len).unwrap();
-    let targets = common::kwds::read_target_window(&mut f, &header, 0, test_len).unwrap();
-    let cache = crate::cpu::forward::forward_with_cache_from_waves(&model, &inputs, dims, Some(&stencil));
-
-    let mut correct = 0usize;
-    let mut total = 0usize;
-    let n_embd = n_bands * 2;
-    for pos in 0..cache.post_ln_f.len().min(targets.len()) {
-        let output = &cache.post_ln_f[pos];
-        let target = &targets[pos];
-        let mut target_tok = 0;
-        let mut target_best = f32::NEG_INFINITY;
-        for v in 0..effective_vocab {
-            let dot: f32 = (0..n_embd).map(|j| target[j] * model.wte[v][j]).sum();
-            if dot > target_best { target_best = dot; target_tok = v; }
-        }
-        let mut scores: Vec<(usize, f32)> = (0..effective_vocab).map(|v| {
-            let dot: f32 = (0..n_embd).map(|j| output[j] * model.wte[v][j]).sum();
-            (v, dot)
-        }).collect();
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let chosen = scores[0].0;
-        if chosen == target_tok { correct += 1; }
-        total += 1;
-        if pos < 20 || chosen == target_tok {
-            let target_rank = scores.iter().position(|s| s.0 == target_tok).unwrap_or(999) + 1;
-            println!("  pos {:3}: output='{}' target='{}' {}  rank={}",
-                pos, detok(chosen).replace('\n', "\\n"), detok(target_tok).replace('\n', "\\n"),
-                if chosen == target_tok { "✓" } else { "✗" }, target_rank);
-        }
-    }
-    println!("\n  Teacher-forced accuracy: {}/{} ({:.1}%)", correct, total, correct as f64 / total as f64 * 100.0);
+    common::generate::run_teacher_force(
+        &args.checkpoint.resume, kwds_path, &args.data,
+        m.layers, m.n_head, m.vocab, m.alpha, m.beta,
+    );
 }
 
 fn cmd_analyze(args: cli::AnalyzeArgs) {
-    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
-    println!("wave-engine v0.1.0\n");
+    init_runtime();
 
     let m = &args.model;
     common::analyze::run_analyze(&args.checkpoint.resume, m.layers, m.out_proj_groups,
@@ -397,125 +292,22 @@ fn cmd_convert_dataset(args: cli::ConvertDatasetArgs) {
 }
 
 fn cmd_train_waves(args: cli::TrainWavesArgs) {
-    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
-    println!("wave-engine v0.1.0\n");
-
-    // Re-use the existing inline KWDS training code by setting env args
-    // This is a temporary bridge — the training logic should eventually move to its own module
-    eprintln!("train-waves: delegating to legacy KWDS training path");
-    // For now, construct the args and call the legacy code directly
-    // TODO: extract KWDS training loop into a callable function
+    init_runtime();
     let m = &args.model;
-
-    let mut f = std::fs::File::open(&args.kwds).expect("Cannot open KWDS file");
-    let header = common::kwds::read_header(&mut f).unwrap();
-    let n_bands = header.n_bands as usize;
-    let n_embd = n_bands * 2;
-    let n_positions = header.n_positions as usize;
-    println!("Training from KWDS: {} positions, {} bands, {:.1} MB",
-        n_positions, n_bands, header.file_size() as f64 / (1024.0 * 1024.0));
-
-    let dims = Dims::from_cli(n_bands, m.n_head, 16, 128, 16);
-    let mut start_iter = 0usize;
-    let mut model = init_model(m.vocab, 42, m.layers, m.out_proj_groups, dims, m.alpha, m.beta);
-    model.phase_native = true;
-    model.output_corrector = vec![0.0; n_bands];
-    model.learnable_ode = true;
-
-    if let Some(ref ckpt) = args.resume {
-        let (params, _ck_vocab, ck_iter, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(ckpt);
-        let ext_count = count_trainable_ex(&model, false);
-        if params.len() == ext_count {
-            unflatten_params_ex(&mut model, &params, false);
-            start_iter = ck_iter;
-            println!("  Resumed from {} at iter {}", ckpt, ck_iter);
-        } else {
-            eprintln!("  WARNING: param count mismatch ({} vs {}), starting fresh", params.len(), ext_count);
-        }
-    }
-
-    crate::ffn_backend::init_agc(m.alpha, m.beta);
-    let stencil = fft_ode::StencilFft::new(n_bands);
-    let mut rng = crate::rng::Rng::new(1337);
-    let n_trainable = count_trainable_ex(&model, false);
-    println!("  Model: {}L, {}bands, {} trainable params", m.layers, n_bands, n_trainable);
-
-    // Adam state
-    let mut adam_m = vec![0.0f32; n_trainable];
-    let mut adam_v = vec![0.0f32; n_trainable];
-    let mut adam_t = 0u64;
-    let beta1 = 0.9f32;
-    let beta2 = 0.999f32;
-    let adam_eps = 1e-8f32;
-
-    let total_iters = start_iter + args.iters;
-    println!("  Training for {} iters ({}→{}), seq_len={}, lr={}", args.iters, start_iter, total_iters, args.seq, args.lr);
-    let mut best_loss = f32::MAX;
-    let t0 = std::time::Instant::now();
-
-    for iter in start_iter..total_iters {
-        let max_start = n_positions.saturating_sub(args.seq + 1);
-        let start = (rng.next_u64() as usize) % max_start.max(1);
-        let window_len = args.seq.min(n_positions - start - 1);
-        let inputs = common::kwds::read_input_window(&mut f, &header, start as u64, window_len).unwrap();
-        let targets = common::kwds::read_target_window(&mut f, &header, start as u64, window_len).unwrap();
-        let cache = crate::cpu::forward::forward_with_cache_from_waves(&model, &inputs, dims, Some(&stencil));
-        let (loss, grads) = crate::cpu::model_backward::backward_wave(&model, &cache, &targets, dims);
-
-        let cos_sim = {
-            let mut sum = 0.0f32;
-            let ct = cache.post_ln_f.len().min(targets.len());
-            for pos in 0..ct {
-                let pred = &cache.post_ln_f[pos];
-                let tgt = &targets[pos];
-                let dot: f32 = pred.iter().zip(tgt.iter()).map(|(&a, &b)| a * b).sum();
-                let np: f32 = pred.iter().map(|x| x * x).sum::<f32>().sqrt();
-                let nt: f32 = tgt.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if np > 1e-8 && nt > 1e-8 { sum += dot / (np * nt); }
-            }
-            sum / ct.max(1) as f32
-        };
-
-        if loss < best_loss { best_loss = loss; }
-        let flat_grads = crate::cpu::model_backward::flatten_grads_ex(&grads, false);
-        adam_t += 1;
-        let mut params = flatten_params_ex(&model, false);
-        for i in 0..params.len() {
-            adam_m[i] = beta1 * adam_m[i] + (1.0 - beta1) * flat_grads[i];
-            adam_v[i] = beta2 * adam_v[i] + (1.0 - beta2) * flat_grads[i] * flat_grads[i];
-            let m_hat = adam_m[i] / (1.0 - beta1.powi(adam_t as i32));
-            let v_hat = adam_v[i] / (1.0 - beta2.powi(adam_t as i32));
-            params[i] -= args.lr * m_hat / (v_hat.sqrt() + adam_eps);
-        }
-        unflatten_params_ex(&mut model, &params, false);
-
-        if iter % 100 == 0 || iter == total_iters - 1 {
-            let elapsed = t0.elapsed().as_millis();
-            let ms_per = if iter > start_iter { elapsed / (iter - start_iter) as u128 } else { 0 };
-            println!("  iter {:6}  l2_loss {:.6}  cos_sim {:.4}  best_l2 {:.6}  {}ms/iter",
-                iter, loss, cos_sim, best_loss, ms_per);
-        }
-    }
-
-    println!("\n=== Wave Training Complete ===");
-    println!("  Best L2 loss: {:.6}", best_loss);
-
-    let final_params = flatten_params_ex(&model, false);
-    let n_params = final_params.len();
-    let dummy_adam = train::Adam::new(args.lr, n_params);
-    wave_checkpoint::save_checkpoint(
-        &final_params, m.vocab, m.layers, m.out_proj_groups,
-        total_iters, args.lr, &dummy_adam, rng.state(), &args.checkpoint_name, dims,
-    );
-    println!("  Saved to: {}", args.checkpoint_name);
+    cpu::wave_training::run(cpu::wave_training::WaveTrainConfig {
+        kwds_path: args.kwds,
+        n_layers: m.layers, n_head: m.n_head, n_bands: m.n_bands,
+        out_proj_groups: m.out_proj_groups, vocab: m.vocab,
+        alpha: m.alpha, beta: m.beta,
+        iters: args.iters, lr: args.lr, seq: args.seq,
+        checkpoint_name: args.checkpoint_name,
+        resume: args.resume,
+    });
 }
 
 fn cmd_train(args: cli::TrainArgs) {
     // Init thread pool
-    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
-    println!("wave-engine v0.1.0\n");
+    init_runtime();
 
     let m = &args.model;
     // Map clap args to TrainConfig
@@ -762,9 +554,7 @@ fn cmd_encode(args: cli::EncodeArgs) {
 }
 
 fn cmd_ode_monitor(args: cli::OdeMonitorArgs) {
-    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
-    println!("wave-engine v0.1.0\n");
+    init_runtime();
 
     let m = &args.model;
     let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&args.checkpoint.resume);
@@ -818,9 +608,7 @@ fn cmd_ode_monitor(args: cli::OdeMonitorArgs) {
 }
 
 fn cmd_phase_decode(args: cli::PhaseDecodeArgs) {
-    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
-    println!("wave-engine v0.1.0\n");
+    init_runtime();
 
     let m = &args.model;
     let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&args.checkpoint.resume);
@@ -861,34 +649,7 @@ fn cmd_phase_decode(args: cli::PhaseDecodeArgs) {
         if id < char_map.len() { char_map[id].to_string() } else { "?".to_string() }
     };
 
-    println!("Phase decode diagnostic: {} params, {} vocab", params.len(), ck_vocab);
-    println!("{:<10} {:<10} {:<10} {:<10}", "Prompt", "Expected", "LM_Head", "Phase");
-    println!("{}", "-".repeat(45));
-
-    let prompts = ["9-1=", "3+4=", "5-2=", "7+2=", "1+1=", "8-3=", "6+3=", "4-0=", "0+5=", "9-9="];
-    let expected = ["8", "7", "3", "9", "2", "5", "9", "4", "5", "0"];
-    let mut lm_correct = 0;
-    let mut phase_correct = 0;
-
-    for (prompt, exp) in prompts.iter().zip(expected.iter()) {
-        let tokens = encode(prompt);
-        let (phase_tok, lm_tok, _coherences) = common::phase_decode::phase_decode_compare(
-            &model, &tokens, dims, &stencil,
-        );
-        let lm_ans = decode(lm_tok);
-        let ph_ans = decode(phase_tok);
-        let lm_ok = lm_ans == *exp;
-        let ph_ok = ph_ans == *exp;
-        if lm_ok { lm_correct += 1; }
-        if ph_ok { phase_correct += 1; }
-        println!("{:<10} {:<10} {:<10} {:<10}",
-            prompt, exp,
-            format!("{}{}", lm_ans, if lm_ok { " ✓" } else { " ✗" }),
-            format!("{}{}", ph_ans, if ph_ok { " ✓" } else { " ✗" }),
-        );
-    }
-    println!("{}", "-".repeat(45));
-    println!("LM Head: {}/10    Phase decode: {}/10", lm_correct, phase_correct);
+    common::phase_decode::run_diagnostic(&model, dims, &stencil, &encode, &decode, params.len(), ck_vocab);
 }
 
 #[cfg(feature = "serve")]

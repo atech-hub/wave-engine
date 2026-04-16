@@ -63,3 +63,41 @@ pub fn phase_decode_compare(
 
     (phase_token, lm_head_token, coherences)
 }
+
+/// Run the arithmetic phase-decode diagnostic (10 prompts, compare lm_head vs phase).
+pub fn run_diagnostic(
+    model: &WavePacketModel,
+    dims: Dims,
+    stencil: &crate::common::fft_ode::StencilFft,
+    encode: &dyn Fn(&str) -> Vec<usize>,
+    decode: &dyn Fn(usize) -> String,
+    n_params: usize,
+    vocab_size: usize,
+) {
+    println!("Phase decode diagnostic: {} params, {} vocab", n_params, vocab_size);
+    println!("{:<10} {:<10} {:<10} {:<10}", "Prompt", "Expected", "LM_Head", "Phase");
+    println!("{}", "-".repeat(45));
+
+    let prompts = ["9-1=", "3+4=", "5-2=", "7+2=", "1+1=", "8-3=", "6+3=", "4-0=", "0+5=", "9-9="];
+    let expected = ["8", "7", "3", "9", "2", "5", "9", "4", "5", "0"];
+    let mut lm_correct = 0;
+    let mut phase_correct = 0;
+
+    for (prompt, exp) in prompts.iter().zip(expected.iter()) {
+        let tokens = encode(prompt);
+        let (phase_tok, lm_tok, _) = phase_decode_compare(model, &tokens, dims, stencil);
+        let lm_ans = decode(lm_tok);
+        let ph_ans = decode(phase_tok);
+        let lm_ok = lm_ans == *exp;
+        let ph_ok = ph_ans == *exp;
+        if lm_ok { lm_correct += 1; }
+        if ph_ok { phase_correct += 1; }
+        println!("{:<10} {:<10} {:<10} {:<10}",
+            prompt, exp,
+            format!("{}{}", lm_ans, if lm_ok { " ✓" } else { " ✗" }),
+            format!("{}{}", ph_ans, if ph_ok { " ✓" } else { " ✗" }),
+        );
+    }
+    println!("{}", "-".repeat(45));
+    println!("LM Head: {}/10    Phase decode: {}/10", lm_correct, phase_correct);
+}

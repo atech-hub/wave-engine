@@ -7,6 +7,7 @@
 //! Output: galaxy_map.json + galaxy_matrix.bin + phases.bin + scan_metadata.json
 
 use super::wave_analysis as wa;
+use crate::common::wave_model::*;
 use std::path::Path;
 
 // ─── Relationship catalog ───
@@ -660,5 +661,57 @@ pub fn print_summary(scan: &GalaxyScan) {
         eprintln!("  Grid: g1={:.1}% g2={:.1}% comp={:.1}% approx={:.1}%",
             s.grid1_frac * 100.0, s.grid2_frac * 100.0,
             s.composite_frac * 100.0, s.approximate_frac * 100.0);
+    }
+}
+
+/// CLI entry point for galaxy-scan subcommand.
+pub fn run_galaxy_scan_cli(
+    checkpoint_path: &str,
+    n_bands: usize, n_head: usize, n_layers: usize,
+    out_proj_groups: usize, alpha: f32, beta: f32,
+    scan_corpus: Option<String>, m1: usize, m2: usize,
+) {
+    let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = crate::wave_checkpoint::load_checkpoint(checkpoint_path);
+    let variants: [(bool, bool); 4] = [(false, true), (false, false), (true, true), (true, false)];
+    let mut dims = crate::Dims::from_cli(n_bands, n_head, 16, 128, 16);
+    let mut model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims, alpha, beta);
+    let mut loaded = false;
+    for (use_ode, use_corr) in &variants {
+        let d = crate::Dims::from_cli(n_bands, n_head, 16, 128, 16)
+            .with_learnable_ode(*use_ode).with_corrector(*use_corr);
+        let mut mdl = init_model(ck_vocab, 42, n_layers, out_proj_groups, d, alpha, beta);
+        mdl.phase_native = true;
+        mdl.output_corrector = vec![0.0; n_bands];
+        if params.len() == count_trainable_ex(&mdl, false) {
+            unflatten_params_ex(&mut mdl, &params, false);
+            eprintln!("  [galaxy-scan] Loaded: ode={}, corrector={}", use_ode, use_corr);
+            model = mdl; dims = d; loaded = true; break;
+        }
+        let mut m2_mdl = init_model(ck_vocab, 42, n_layers, out_proj_groups, d, alpha, beta);
+        if params.len() == count_trainable_ex(&m2_mdl, false) {
+            unflatten_params_ex(&mut m2_mdl, &params, false);
+            eprintln!("  [galaxy-scan] Loaded (non-PN): ode={}, corrector={}", use_ode, use_corr);
+            model = m2_mdl; dims = d; loaded = true; break;
+        }
+    }
+    if !loaded { panic!("Cannot match checkpoint param count {} to any model variant", params.len()); }
+
+    let data_path = scan_corpus.unwrap_or("data/input.txt".to_string());
+    let (tokens, _) = super::data_loader::load_data(&data_path, false, None);
+    let scan_len = tokens.len().min(200).min(128);
+    let stencil = crate::fft_ode::StencilFft::new(n_bands * 2);
+    let cache = crate::cpu::forward::forward_with_cache(
+        &model, &tokens[..scan_len], dims, None, None, None, Some(&stencil), None, None, None,
+    );
+    let all_hidden: Vec<Vec<Vec<f32>>> = cache.block_caches.iter().map(|bc| bc.input.clone()).collect();
+    let per_layer_ceilings: Vec<f32> = model.blocks.iter()
+        .map(|b| (std::f32::consts::FRAC_PI_2 / (b.ffn.kerr.alpha + 4.0 * b.ffn.kerr.beta)).sqrt().max(0.5))
+        .collect();
+    let galaxy_dir = std::path::PathBuf::from(checkpoint_path.replace(".bin", "_galaxy"));
+    match run_and_write_full_scan(
+        &all_hidden, &cache.post_ln_f, n_bands, &per_layer_ceilings, m1, m2, &galaxy_dir,
+    ) {
+        Ok(scan) => { println!("Galaxy map written to: {}", galaxy_dir.display()); print_summary(&scan); }
+        Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
     }
 }
