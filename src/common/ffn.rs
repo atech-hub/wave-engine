@@ -47,6 +47,7 @@ pub fn ffn_forward_via_backend(
     use_corrector: bool,
     layer_agc: Option<&mut crate::common::agc::OdeAgc>,
     memory: Option<(&[f32], &[f32])>,
+    ode_pathway: bool,
 ) -> (Vec<Vec<f32>>, FfnCache) {
     let t = x.len();
     let n_embd = x[0].len();
@@ -98,8 +99,8 @@ pub fn ffn_forward_via_backend(
         let gpu_be = ping_pong.unwrap().1;
         let out = gpu_be.gpu_kerr_ode_batch_fused(&weights.kerr, &precond);
         (out, None, "GPU-learnable")
-    } else if !freeze_ode {
-        // CPU caching forward — stores intermediates for backward
+    } else if !freeze_ode || ode_pathway {
+        // CPU caching forward — stores intermediates for backward (also when ode_pathway forces caching)
         let mut outs = Vec::with_capacity(t);
         let mut caches = Vec::with_capacity(t);
         for p in &precond {

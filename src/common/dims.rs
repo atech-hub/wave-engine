@@ -39,11 +39,12 @@ pub struct Dims {
     pub use_dyn_harmonics: bool, // true = per-head harmonic numbers are learnable
     pub fwm_strength: f32, // four-wave mixing chi coefficient (0.0 = off)
     pub attention_pathway: bool, // true = attention backward computes d_normed (fixes bugs #5, #6)
+    pub ode_pathway: bool, // true = frozen ODE uses real Jacobian backward (fixes bug #9)
 }
 
 impl Dims {
     pub fn from_cli(n_bands: usize, n_head: usize, maestro_dim: usize, block_size: usize, rk4_steps: usize) -> Self {
-        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false, phase_temp: 0.0, pythagorean: false, use_rk4_weights: false, use_dyn_harmonics: false, fwm_strength: 0.0, attention_pathway: false }
+        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false, phase_temp: 0.0, pythagorean: false, use_rk4_weights: false, use_dyn_harmonics: false, fwm_strength: 0.0, attention_pathway: false, ode_pathway: false }
     }
     pub fn with_tied(mut self, tied: bool) -> Self {
         self.tied = tied;
@@ -87,6 +88,10 @@ impl Dims {
     }
     pub fn with_dyn_harmonics(mut self, dh: bool) -> Self {
         self.use_dyn_harmonics = dh;
+        self
+    }
+    pub fn with_ode_pathway(mut self, op: bool) -> Self {
+        self.ode_pathway = op;
         self
     }
     pub fn with_attention_pathway(mut self, ap: bool) -> Self {

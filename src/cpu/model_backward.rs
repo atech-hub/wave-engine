@@ -284,12 +284,16 @@ fn backward_impl(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize
             for i in 0..fg.d_mae_in_sq_b.len() { grads.block_ffn_mae_in_sq_b[block_idx][i] += fg.d_mae_in_sq_b[i]; }
             // ODE param gradients
             if let Some(ref d_gr) = fg.d_kerr_gamma_raw {
-                for k in 0..d_gr.len() { grads.block_ffn_kerr_gamma_raw[block_idx][k] += d_gr[k]; }
+                if !grads.block_ffn_kerr_gamma_raw[block_idx].is_empty() {
+                    for k in 0..d_gr.len() { grads.block_ffn_kerr_gamma_raw[block_idx][k] += d_gr[k]; }
+                }
             }
             if let Some(d_a) = fg.d_kerr_alpha { grads.block_ffn_kerr_alpha[block_idx] += d_a; }
             if let Some(d_b) = fg.d_kerr_beta { grads.block_ffn_kerr_beta[block_idx] += d_b; }
             if let Some(ref d_pc) = fg.d_phase_correction {
-                for k in 0..d_pc.len() { grads.block_ffn_phase_correction[block_idx][k] += d_pc[k]; }
+                if !grads.block_ffn_phase_correction[block_idx].is_empty() {
+                    for k in 0..d_pc.len() { grads.block_ffn_phase_correction[block_idx][k] += d_pc[k]; }
+                }
             }
             if let Some(ref d_rw) = fg.d_rk4_weights {
                 for w in 0..4 { grads.block_ffn_rk4_weights[block_idx][w] += d_rw[w]; }

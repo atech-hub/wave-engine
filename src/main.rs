@@ -151,7 +151,7 @@ fn cmd_verify(args: cli::VerifyArgs) {
                     let targets: Vec<usize> = (1..9).map(|i| i % m.vocab).collect();
                     let (fwd, bwd, params, labels) = cpu::grad_check_wrapper::phase_native_check(
                         tokens, targets, m.layers, m.n_bands, m.n_head, m.vocab, m.alpha, m.beta,
-                        ga.attention_pathway, ga.learnable_ode,
+                        ga.attention_pathway, ga.learnable_ode, ga.ode_pathway,
                     );
                     let result = monitors::junctions::grad_check::check_gradients(
                         "phase-native", fwd, bwd, &params, &labels, config,

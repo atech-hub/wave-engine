@@ -199,7 +199,7 @@ pub fn prefill(
         let layer_mem = memory.and_then(|m| m.get(layer_idx).copied());
         let (ffn_out, _) = crate::ffn_backend::ffn_forward_via_backend(
             &block.ffn, &normed_ffn, &crate::backend::CpuBackend,
-            Some(stencil), None, None, true, dims.use_corrector, None, layer_mem,
+            Some(stencil), None, None, true, dims.use_corrector, None, layer_mem, false,
         );
 
         // Residual
@@ -332,7 +332,7 @@ pub fn forward_one(
         let layer_mem = memory.and_then(|m| m.get(layer_idx).copied());
         let (ffn_out, _) = crate::ffn_backend::ffn_forward_via_backend(
             &block.ffn, &[normed_ffn], &crate::backend::CpuBackend,
-            Some(stencil), None, None, true, dims.use_corrector, None, layer_mem,
+            Some(stencil), None, None, true, dims.use_corrector, None, layer_mem, false,
         );
 
         // Residual

@@ -418,6 +418,10 @@ pub struct VerifyGradArgs {
     /// Enable learnable ODE (ODE backward computes real Jacobian)
     #[arg(long)]
     pub learnable_ode: bool,
+
+    /// Enable ODE pathway (frozen ODE uses real Jacobian for gradient flow)
+    #[arg(long)]
+    pub ode_pathway: bool,
 }
 
 #[derive(clap::Args)]
