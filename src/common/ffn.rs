@@ -93,10 +93,6 @@ pub fn ffn_forward_via_backend(
     //    When freeze_ode, use the fast path (GPU/FFT/sequential, no cache).
     //    When !freeze_ode AND GPU available, use GPU forward (backward recomputes internally).
     let _t_ode = std::time::Instant::now();
-    if std::env::var("FFN_FWD_DEBUG").is_ok() {
-        eprintln!("[FFN-FWD] freeze_ode={} ode_pathway={} ping_pong={} stencil={}",
-            freeze_ode, ode_pathway, ping_pong.is_some(), stencil.is_some());
-    }
     let (kerr_out, ode_caches, ode_device): (Vec<Vec<f32>>, Option<Vec<crate::common::ode_backward::OdeForwardCache>>, &str) =
     if !freeze_ode && ping_pong.is_some() {
         // GPU forward for learnable ODE — backward will recompute via gpu_kerr_ode_backward_batch
@@ -132,7 +128,7 @@ pub fn ffn_forward_via_backend(
     };
     let _ode_dur = _t_ode.elapsed();
 
-    // DIAGNOSTIC: bypass ODE in forward (identity: kerr_out = precond)
+    // Debug: ODE_BYPASS=1 forces identity forward for gradient diagnostics
     let (kerr_out, ode_caches) = if std::env::var("ODE_BYPASS").is_ok() {
         (precond.clone(), None)
     } else {
@@ -217,13 +213,6 @@ pub fn ffn_backward_via_backend(
     let cpu = &crate::backend::CpuBackend;
     let profiling = crate::PROFILE.load(std::sync::atomic::Ordering::Relaxed);
 
-    if std::env::var("CACHE_DIAG").is_ok() {
-        let ko = &cache.kerr_out[0];
-        let mo = &cache.mae_out_act[0];
-        let pc = &cache.precond[0];
-        eprintln!("[CACHE-DIAG] kerr_out[0][0..4]={:.6?} mae_out_act[0][0..4]={:.6?} precond[0][0..4]={:.6?}",
-            &ko[..4.min(ko.len())], &mo[..4.min(mo.len())], &pc[..4.min(pc.len())]);
-    }
 
     // ─── Out_proj backward via OutProjWeights enum ───
     let _t_bwd_proj = std::time::Instant::now();
