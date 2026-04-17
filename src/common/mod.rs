@@ -7,6 +7,7 @@ pub mod model_forward;
 pub mod ode_deriv;
 pub mod embed;
 pub mod attn;
+pub mod attn_backward;
 pub mod block;
 pub mod ffn;
 pub mod checkpoint;
