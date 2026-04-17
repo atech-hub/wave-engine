@@ -97,6 +97,7 @@ pub fn phase_native_check(
     alpha: f32,
     beta: f32,
     attention_pathway: bool,
+    learnable_ode: bool,
 ) -> (
     impl Fn(&[f32]) -> f32,
     impl Fn(&[f32]) -> (f32, Vec<f32>),
@@ -104,8 +105,8 @@ pub fn phase_native_check(
     SectionLabels,
 ) {
     let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16)
-        .with_learnable_ode(false)
-        .with_corrector(false)
+        .with_learnable_ode(learnable_ode)
+        .with_corrector(learnable_ode) // corrector follows ODE
         .with_attention_pathway(attention_pathway);
     let mut model = init_model(vocab_size, 42, n_layers, 1, dims, alpha, beta);
     model.phase_native = true;

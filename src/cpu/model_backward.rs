@@ -373,6 +373,12 @@ fn backward_impl(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize
                 bc.attn_pathway.as_ref().expect("attention_pathway requires populated cache"),
                 &d_ffn_out,
             );
+            let attn_mag: f32 = d_normed_from_attn.iter().flat_map(|r| r.iter()).map(|x| x.abs()).sum::<f32>();
+            let ffn_mag: f32 = d_normed_from_ffn.iter().flat_map(|r| r.iter()).map(|x| x.abs()).sum::<f32>();
+            if block_idx == 0 {
+                eprintln!("[PATHWAY] block {} d_normed_from_attn mag={:.6} d_normed_from_ffn mag={:.6} ratio={:.4}",
+                    block_idx, attn_mag, ffn_mag, if ffn_mag > 0.0 { attn_mag / ffn_mag } else { 0.0 });
+            }
             (0..t).map(|pos| {
                 (0..d.n_embd).map(|j| d_normed_from_ffn[pos][j] + d_normed_from_attn[pos][j]).collect()
             }).collect()

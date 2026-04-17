@@ -414,6 +414,10 @@ pub struct VerifyGradArgs {
     /// Enable attention pathway (fixes d_normed bug #6)
     #[arg(long)]
     pub attention_pathway: bool,
+
+    /// Enable learnable ODE (ODE backward computes real Jacobian)
+    #[arg(long)]
+    pub learnable_ode: bool,
 }
 
 #[derive(clap::Args)]
