@@ -411,17 +411,25 @@ pub struct VerifyGradArgs {
     #[arg(long)]
     pub verbose: bool,
 
-    /// Enable attention pathway (fixes d_normed bug #6)
-    #[arg(long)]
+    /// Attention pathway: attention backward contributes to d_normed (default on)
+    #[arg(long, default_value_t = true)]
     pub attention_pathway: bool,
 
-    /// Enable learnable ODE (ODE backward computes real Jacobian)
+    /// Enable learnable ODE (ODE backward computes real Jacobian + trains ODE params)
     #[arg(long)]
     pub learnable_ode: bool,
 
-    /// Enable ODE pathway (frozen ODE uses real Jacobian for gradient flow)
-    #[arg(long)]
+    /// ODE pathway: frozen ODE uses real Jacobian for gradient flow (default on)
+    #[arg(long, default_value_t = true)]
     pub ode_pathway: bool,
+
+    /// Disable attention pathway (for baseline comparison)
+    #[arg(long)]
+    pub no_attention_pathway: bool,
+
+    /// Disable ODE pathway (for baseline comparison)
+    #[arg(long)]
+    pub no_ode_pathway: bool,
 }
 
 #[derive(clap::Args)]

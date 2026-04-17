@@ -44,7 +44,7 @@ pub struct Dims {
 
 impl Dims {
     pub fn from_cli(n_bands: usize, n_head: usize, maestro_dim: usize, block_size: usize, rk4_steps: usize) -> Self {
-        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false, phase_temp: 0.0, pythagorean: false, use_rk4_weights: false, use_dyn_harmonics: false, fwm_strength: 0.0, attention_pathway: false, ode_pathway: false }
+        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false, phase_temp: 0.0, pythagorean: false, use_rk4_weights: false, use_dyn_harmonics: false, fwm_strength: 0.0, attention_pathway: true, ode_pathway: true }
     }
     pub fn with_tied(mut self, tied: bool) -> Self {
         self.tied = tied;

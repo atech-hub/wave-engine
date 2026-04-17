@@ -132,6 +132,9 @@ fn cmd_verify(args: cli::VerifyArgs) {
 
     match args.command {
         cli::VerifyCommand::Grad(ga) => {
+            // Apply --no- overrides
+            let attn_path = ga.attention_pathway && !ga.no_attention_pathway;
+            let ode_path = ga.ode_pathway && !ga.no_ode_pathway;
             let check_mode = match ga.scope.as_str() {
                 "tiny" | "exhaustive" => monitors::junctions::grad_check::CheckMode::Exhaustive,
                 "sampled" => monitors::junctions::grad_check::CheckMode::PerSection { n_per_section: 5 },
@@ -154,9 +157,9 @@ fn cmd_verify(args: cli::VerifyArgs) {
                     {
                         let dims = Dims::from_cli(m.n_bands, m.n_head, 16, 128, 16)
                             .with_learnable_ode(ga.learnable_ode)
-                            .with_corrector(ga.learnable_ode || ga.ode_pathway)
-                            .with_attention_pathway(ga.attention_pathway)
-                            .with_ode_pathway(ga.ode_pathway);
+                            .with_corrector(ga.learnable_ode || ode_path)
+                            .with_attention_pathway(attn_path)
+                            .with_ode_pathway(ode_path);
                         let mut model = init_model(m.vocab, 42, m.layers, 1, dims, m.alpha, m.beta);
                         model.phase_native = true;
                         model.output_corrector = vec![0.0; m.n_bands];
@@ -185,7 +188,7 @@ fn cmd_verify(args: cli::VerifyArgs) {
 
                     let (fwd, bwd, params, labels) = cpu::grad_check_wrapper::phase_native_check(
                         tokens, targets, m.layers, m.n_bands, m.n_head, m.vocab, m.alpha, m.beta,
-                        ga.attention_pathway, ga.learnable_ode, ga.ode_pathway,
+                        attn_path, ga.learnable_ode, ode_path,
                     );
                     let result = monitors::junctions::grad_check::check_gradients(
                         "phase-native", fwd, bwd, &params, &labels, config,
