@@ -154,7 +154,7 @@ fn cmd_verify(args: cli::VerifyArgs) {
                     {
                         let dims = Dims::from_cli(m.n_bands, m.n_head, 16, 128, 16)
                             .with_learnable_ode(ga.learnable_ode)
-                            .with_corrector(ga.learnable_ode)
+                            .with_corrector(ga.learnable_ode || ga.ode_pathway)
                             .with_attention_pathway(ga.attention_pathway)
                             .with_ode_pathway(ga.ode_pathway);
                         let mut model = init_model(m.vocab, 42, m.layers, 1, dims, m.alpha, m.beta);

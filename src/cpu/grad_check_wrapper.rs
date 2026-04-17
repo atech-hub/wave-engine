@@ -107,7 +107,7 @@ pub fn phase_native_check(
 ) {
     let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16)
         .with_learnable_ode(learnable_ode)
-        .with_corrector(learnable_ode) // corrector follows ODE
+        .with_corrector(learnable_ode || ode_pathway) // corrector on when ODE backward is active
         .with_attention_pathway(attention_pathway)
         .with_ode_pathway(ode_pathway);
     let mut model = init_model(vocab_size, 42, n_layers, 1, dims, alpha, beta);

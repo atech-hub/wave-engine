@@ -93,6 +93,10 @@ pub fn ffn_forward_via_backend(
     //    When freeze_ode, use the fast path (GPU/FFT/sequential, no cache).
     //    When !freeze_ode AND GPU available, use GPU forward (backward recomputes internally).
     let _t_ode = std::time::Instant::now();
+    if std::env::var("FFN_FWD_DEBUG").is_ok() {
+        eprintln!("[FFN-FWD] freeze_ode={} ode_pathway={} ping_pong={} stencil={}",
+            freeze_ode, ode_pathway, ping_pong.is_some(), stencil.is_some());
+    }
     let (kerr_out, ode_caches, ode_device): (Vec<Vec<f32>>, Option<Vec<crate::common::ode_backward::OdeForwardCache>>, &str) =
     if !freeze_ode && ping_pong.is_some() {
         // GPU forward for learnable ODE — backward will recompute via gpu_kerr_ode_backward_batch
