@@ -149,6 +149,40 @@ fn cmd_verify(args: cli::VerifyArgs) {
                     println!("Gradient check: phase-native, {}L, {}bands, {}head", m.layers, m.n_bands, m.n_head);
                     let tokens: Vec<usize> = (0..8).map(|i| i % m.vocab).collect();
                     let targets: Vec<usize> = (1..9).map(|i| i % m.vocab).collect();
+
+                    // ─── Component monitors: gradient flow analysis ───
+                    {
+                        let dims = Dims::from_cli(m.n_bands, m.n_head, 16, 128, 16)
+                            .with_learnable_ode(ga.learnable_ode)
+                            .with_corrector(ga.learnable_ode)
+                            .with_attention_pathway(ga.attention_pathway)
+                            .with_ode_pathway(ga.ode_pathway);
+                        let mut model = init_model(m.vocab, 42, m.layers, 1, dims, m.alpha, m.beta);
+                        model.phase_native = true;
+                        model.output_corrector = vec![0.0; m.n_bands];
+                        let stencil = fft_ode::StencilFft::new(m.n_bands);
+                        let cache = crate::cpu::forward::forward_with_cache(
+                            &model, &tokens, dims, None, None, None, Some(&stencil), None, None, None,
+                        );
+                        let (_loss, grads) = crate::cpu::model_backward::backward(
+                            &model, &cache, &targets, dims, None, None, None,
+                        );
+                        let flow = monitors::gradient_monitor::analyze_gradients(&grads, dims);
+                        eprintln!("\n[gradient_monitor] Per-component gradient norms:");
+                        for s in &flow {
+                            eprintln!("  layer {}:", s.layer);
+                            eprintln!("    ln_grad_norm          {:.2e}", s.ln_grad_norm);
+                            eprintln!("    maestro_in_grad_norm  {:.2e}", s.maestro_in_grad_norm);
+                            eprintln!("    ode_grad_norm         {:.2e}", s.ode_grad_norm);
+                            eprintln!("    maestro_out_grad_norm {:.2e}", s.maestro_out_grad_norm);
+                            eprintln!("    out_proj_grad_norm    {:.2e}", s.out_proj_grad_norm);
+                            eprintln!("    alpha_grad            {:.2e}", s.alpha_grad);
+                            eprintln!("    beta_grad             {:.2e}", s.beta_grad);
+                            eprintln!("    corrector_grad_norm   {:.2e}", s.corrector_grad_norm);
+                        }
+                        eprintln!();
+                    }
+
                     let (fwd, bwd, params, labels) = cpu::grad_check_wrapper::phase_native_check(
                         tokens, targets, m.layers, m.n_bands, m.n_head, m.vocab, m.alpha, m.beta,
                         ga.attention_pathway, ga.learnable_ode, ga.ode_pathway,
