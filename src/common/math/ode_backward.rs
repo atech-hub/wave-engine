@@ -34,7 +34,7 @@ pub struct OdeParamGrads {
 
 // ─── Helpers ───────────────────────────────────────────────
 
-use super::math::{softplus, softplus_derivative};
+use super::core::{softplus, softplus_derivative};
 
 /// Compute neighbour sum of mag_sq for band k (stencil ±2).
 /// Kept here for deriv_backward (Jacobian computation).

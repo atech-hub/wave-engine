@@ -1,13 +1,10 @@
 pub mod math;
-pub mod backward;
 pub mod compute;
 pub mod model;
 pub mod out_proj;
 pub mod model_forward;
-pub mod ode_deriv;
 pub mod embed;
 pub mod attn;
-pub mod attn_backward;
 pub mod block;
 pub mod ffn;
 pub mod checkpoint;
@@ -31,12 +28,18 @@ pub mod kv_cache;
 pub mod phase_decode;
 pub mod kwds;
 pub mod wave_loss;
-pub mod phase_loss;
 pub mod recommend;
 pub mod data_loader;
-pub mod ode_backward;
 pub mod ode_parity;
 pub mod galaxy_scan;
 pub mod wave_memory;
 pub mod phase_encode;
 pub mod catalog_axes;
+
+// Re-export moved math modules for backward compatibility.
+// Callers can still use crate::common::backward, crate::common::ode_deriv, etc.
+pub use math::backward;
+pub use math::ode_deriv;
+pub use math::ode_backward;
+pub use math::attn_backward;
+pub use math::phase_loss;
