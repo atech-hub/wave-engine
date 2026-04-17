@@ -210,6 +210,14 @@ pub fn ffn_backward_via_backend(
     let cpu = &crate::backend::CpuBackend;
     let profiling = crate::PROFILE.load(std::sync::atomic::Ordering::Relaxed);
 
+    if std::env::var("CACHE_DIAG").is_ok() {
+        let ko = &cache.kerr_out[0];
+        let mo = &cache.mae_out_act[0];
+        let pc = &cache.precond[0];
+        eprintln!("[CACHE-DIAG] kerr_out[0][0..4]={:.6?} mae_out_act[0][0..4]={:.6?} precond[0][0..4]={:.6?}",
+            &ko[..4.min(ko.len())], &mo[..4.min(mo.len())], &pc[..4.min(pc.len())]);
+    }
+
     // ─── Out_proj backward via OutProjWeights enum ───
     let _t_bwd_proj = std::time::Instant::now();
     let d_regulated: Vec<Vec<f32>> = d_ffn_out.iter()
