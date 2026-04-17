@@ -132,6 +132,13 @@ pub fn ffn_forward_via_backend(
     };
     let _ode_dur = _t_ode.elapsed();
 
+    // DIAGNOSTIC: bypass ODE in forward (identity: kerr_out = precond)
+    let (kerr_out, ode_caches) = if std::env::var("ODE_BYPASS").is_ok() {
+        (precond.clone(), None)
+    } else {
+        (kerr_out, ode_caches)
+    };
+
     // No energy conservation — AGC handles magnitude regulation.
     // Coupling at α=0.1 with AGC ceiling=2.0 matches kerr-engine recipe.
 
@@ -392,4 +399,153 @@ pub struct FfnGrads {
     pub d_kerr_beta: Option<f32>,
     pub d_phase_correction: Option<Vec<f32>>,  // [n_bands] corrector plate gradient
     pub d_rk4_weights: Option<[f32; 4]>,  // RK4 combination weights gradient
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::wave_model::init_linear;
+    use crate::common::rng::Rng;
+
+    #[test]
+    fn test_ffn_isolated_grad_check() {
+        let n_bands = 4;
+        let n_embd = n_bands * 2;
+        let maestro_dim = 4;
+        let t = 2;
+
+        let mut rng = Rng::new(42);
+        let (sq_w, sq_b) = init_linear(&mut rng, maestro_dim, n_embd);
+        let (pr_w, pr_b) = init_linear(&mut rng, n_embd, maestro_dim);
+        let maestro_in = crate::model::MaestroWeights {
+            squeeze: crate::model::LinearWeights { w: sq_w, b: sq_b },
+            process_1: crate::model::LinearWeights { w: pr_w, b: pr_b },
+        };
+
+        let (sq_w2, sq_b2) = init_linear(&mut rng, maestro_dim, n_embd);
+        let (pr_w2, pr_b2) = init_linear(&mut rng, n_embd, maestro_dim);
+        let maestro_out = crate::model::MaestroWeights {
+            squeeze: crate::model::LinearWeights { w: sq_w2, b: sq_b2 },
+            process_1: crate::model::LinearWeights { w: pr_w2, b: pr_b2 },
+        };
+
+        let gamma_raw_val = ((0.1f32).exp() - 1.0).ln();
+        let kerr = crate::model::KerrWeights {
+            gamma_raw: vec![gamma_raw_val; n_bands],
+            omega: (0..n_bands).map(|k| (k + 1) as f32 / n_bands as f32).collect(),
+            alpha: 0.1, beta: 0.2, rk4_n_steps: 16,
+            phase_correction: vec![0.0; n_bands],
+            rk4_weights: [1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0],
+            chi: 0.0,
+        };
+
+        let (op_w, op_b) = init_linear(&mut rng, n_embd, n_embd);
+        let out_proj = crate::common::out_proj::OutProjWeights::Dense(
+            crate::model::LinearWeights { w: op_w, b: op_b }
+        );
+
+        let ffn = KerrDualMaestroWeights { kerr, maestro_in, maestro_out, out_proj };
+        let x: Vec<Vec<f32>> = vec![
+            vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8],
+            vec![-0.3, 0.4, -0.5, 0.6, -0.7, 0.8, -0.9, 1.0],
+        ];
+
+        init_agc(0.1, 0.2);
+        let cpu = crate::backend::CpuBackend;
+
+        // Forward
+        let (output, cache) = ffn_forward_via_backend(
+            &ffn, &x, &cpu, None, None, None, true, false, None, None, false,
+        );
+
+        // d_output = 1.0 everywhere (loss = sum)
+        let d_output: Vec<Vec<f32>> = vec![vec![1.0f32; n_embd]; t];
+        let (_d_input, grads) = ffn_backward_via_backend(&ffn, &d_output, &cache, &cpu, None);
+
+        let eps = 1e-4f32;
+        let tol = 1e-2f32;
+
+        println!("\n=== FFN Isolated Gradient Check ===\n");
+
+        // mae_in_sq_w
+        let mut pass = 0usize;
+        let mut fail = 0usize;
+        for i in 0..maestro_dim {
+            for j in 0..n_embd {
+                let mut ffn_p = ffn.clone();
+                ffn_p.maestro_in.squeeze.w[i][j] += eps;
+                let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false);
+                let loss_p: f32 = out_p.iter().flat_map(|v| v.iter()).sum();
+
+                let mut ffn_m = ffn.clone();
+                ffn_m.maestro_in.squeeze.w[i][j] -= eps;
+                let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false);
+                let loss_m: f32 = out_m.iter().flat_map(|v| v.iter()).sum();
+
+                let fd = (loss_p - loss_m) / (2.0 * eps);
+                let an = grads.d_mae_in_sq_w[i][j];
+                let denom = fd.abs().max(an.abs()).max(1e-7);
+                let rel = (fd - an).abs() / denom;
+
+                if rel > tol {
+                    if fail < 10 { println!("  FAIL sq_w[{}][{}]: fd={:.6} an={:.6} rel={:.4}", i, j, fd, an, rel); }
+                    fail += 1;
+                } else { pass += 1; }
+            }
+        }
+        println!("  mae_in_sq_w: {}/{} passed", pass, pass + fail);
+
+        // mae_in_sq_b
+        let (mut bp, mut bf) = (0usize, 0usize);
+        for i in 0..maestro_dim {
+            let mut ffn_p = ffn.clone();
+            ffn_p.maestro_in.squeeze.b[i] += eps;
+            let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false);
+            let loss_p: f32 = out_p.iter().flat_map(|v| v.iter()).sum();
+            let mut ffn_m = ffn.clone();
+            ffn_m.maestro_in.squeeze.b[i] -= eps;
+            let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false);
+            let loss_m: f32 = out_m.iter().flat_map(|v| v.iter()).sum();
+            let fd = (loss_p - loss_m) / (2.0 * eps);
+            let an = grads.d_mae_in_sq_b[i];
+            let denom = fd.abs().max(an.abs()).max(1e-7);
+            let rel = (fd - an).abs() / denom;
+            if rel > tol {
+                println!("  FAIL sq_b[{}]: fd={:.6} an={:.6} rel={:.4}", i, fd, an, rel);
+                bf += 1;
+            } else { bp += 1; }
+        }
+        println!("  mae_in_sq_b: {}/{} passed", bp, bp + bf);
+
+        // mae_out_sq_w
+        let (mut op, mut of2) = (0usize, 0usize);
+        for i in 0..maestro_dim {
+            for j in 0..n_embd {
+                let mut ffn_p = ffn.clone();
+                ffn_p.maestro_out.squeeze.w[i][j] += eps;
+                let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false);
+                let loss_p: f32 = out_p.iter().flat_map(|v| v.iter()).sum();
+                let mut ffn_m = ffn.clone();
+                ffn_m.maestro_out.squeeze.w[i][j] -= eps;
+                let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false);
+                let loss_m: f32 = out_m.iter().flat_map(|v| v.iter()).sum();
+                let fd = (loss_p - loss_m) / (2.0 * eps);
+                let an = grads.d_mae_out_sq_w[i][j];
+                let denom = fd.abs().max(an.abs()).max(1e-7);
+                let rel = (fd - an).abs() / denom;
+                if rel > tol {
+                    if of2 < 5 { println!("  FAIL out_sq_w[{}][{}]: fd={:.6} an={:.6} rel={:.4}", i, j, fd, an, rel); }
+                    of2 += 1;
+                } else { op += 1; }
+            }
+        }
+        println!("  mae_out_sq_w: {}/{} passed", op, op + of2);
+
+        println!("\n=== End FFN Isolated Check ===\n");
+
+        // Don't assert — just report
+        let total_pass = pass + bp + op;
+        let total = (pass + fail) + (bp + bf) + (op + of2);
+        println!("Total: {}/{} passed", total_pass, total);
+    }
 }
