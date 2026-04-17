@@ -113,8 +113,11 @@ pub fn check_param_completeness(model: &WavePacketModel) -> WeightInventory {
         // Layer norms — always trainable
         entries.push(WeightEntry { path: format!("{}.ln.weight", prefix), n_elements: n_embd, status: WeightStatus::Trainable });
         entries.push(WeightEntry { path: format!("{}.ln.bias", prefix), n_elements: n_embd, status: WeightStatus::Trainable });
-        entries.push(WeightEntry { path: format!("{}.ln_ffn.weight", prefix), n_elements: n_embd, status: WeightStatus::Trainable });
-        entries.push(WeightEntry { path: format!("{}.ln_ffn.bias", prefix), n_elements: n_embd, status: WeightStatus::Trainable });
+        // ln_ffn is in the param vector but never applied in forward — dead code (findings #11).
+        // Classified as Trainable because it IS serialized, but receives zero gradient.
+        // Will be flagged by J6 (live gradient) as a dead section during training.
+        entries.push(WeightEntry { path: format!("{}.ln_ffn.weight (dead — #11)", prefix), n_elements: n_embd, status: WeightStatus::Trainable });
+        entries.push(WeightEntry { path: format!("{}.ln_ffn.bias (dead — #11)", prefix), n_elements: n_embd, status: WeightStatus::Trainable });
 
         // Maestro in — always trainable
         add_linear(&mut entries, &format!("{}.ffn.maestro_in.squeeze", prefix), &block.ffn.maestro_in.squeeze, WeightStatus::Trainable);
