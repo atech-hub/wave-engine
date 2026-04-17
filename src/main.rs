@@ -597,31 +597,11 @@ fn cmd_ode_monitor(args: cli::OdeMonitorArgs) {
     init_runtime();
 
     let m = &args.model;
-    let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&args.checkpoint.resume);
-
-    // Try multiple layout variants
-    let mut model = {
-        let dims_try = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true).with_layer_scale(true);
-        let mut mdl = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims_try, m.alpha, m.beta);
-        if params.len() == count_trainable_ex(&mdl, false) {
-            unflatten_params_ex(&mut mdl, &params, false); mdl
-        } else {
-            let dims2 = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true);
-            let mut mdl2 = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims2, m.alpha, m.beta);
-            if params.len() == count_trainable_ex(&mdl2, false) {
-                unflatten_params_ex(&mut mdl2, &params, false); mdl2
-            } else {
-                let dims3 = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-                    .with_learnable_ode(false).with_corrector(false);
-                let mut mdl3 = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims3, m.alpha, m.beta);
-                unflatten_params(&mut mdl3, &params); mdl3
-            }
-        }
-    };
+    let (mut model, dims) = common::wave_model::load_checkpoint_auto(
+        &args.checkpoint.resume, m.n_bands, m.n_head, m.layers, m.out_proj_groups, m.alpha, m.beta,
+    );
     model.learnable_ode = false;
-
-    let dims = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-        .with_learnable_ode(false).with_corrector(true);
+    let ck_vocab = model.vocab_size;
     let stencil = fft_ode::StencilFft::new(m.n_bands);
     crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
 
@@ -651,30 +631,11 @@ fn cmd_phase_decode(args: cli::PhaseDecodeArgs) {
     init_runtime();
 
     let m = &args.model;
-    let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = wave_checkpoint::load_checkpoint(&args.checkpoint.resume);
-
-    let mut model = {
-        let dims_try = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true).with_layer_scale(true);
-        let mut mdl = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims_try, m.alpha, m.beta);
-        if params.len() == count_trainable_ex(&mdl, false) {
-            unflatten_params_ex(&mut mdl, &params, false); mdl
-        } else {
-            let dims2 = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS).with_corrector(true);
-            let mut mdl2 = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims2, m.alpha, m.beta);
-            if params.len() == count_trainable_ex(&mdl2, false) {
-                unflatten_params_ex(&mut mdl2, &params, false); mdl2
-            } else {
-                let dims3 = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-                    .with_learnable_ode(false).with_corrector(false);
-                let mut mdl3 = init_model(ck_vocab, 42, m.layers, m.out_proj_groups, dims3, m.alpha, m.beta);
-                unflatten_params(&mut mdl3, &params); mdl3
-            }
-        }
-    };
+    let (mut model, dims) = common::wave_model::load_checkpoint_auto(
+        &args.checkpoint.resume, m.n_bands, m.n_head, m.layers, m.out_proj_groups, m.alpha, m.beta,
+    );
     model.learnable_ode = false;
-
-    let dims = Dims::from_cli(m.n_bands, m.n_head, MAESTRO_DIM, BLOCK_SIZE, RK4_STEPS)
-        .with_learnable_ode(false).with_corrector(true);
+    let ck_vocab = model.vocab_size;
     let stencil = fft_ode::StencilFft::new(m.n_bands);
     crate::ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
 
@@ -689,7 +650,7 @@ fn cmd_phase_decode(args: cli::PhaseDecodeArgs) {
         if id < char_map.len() { char_map[id].to_string() } else { "?".to_string() }
     };
 
-    common::phase_decode::run_diagnostic(&model, dims, &stencil, &encode, &decode, params.len(), ck_vocab);
+    common::phase_decode::run_diagnostic(&model, dims, &stencil, &encode, &decode, count_trainable_ex(&model, false), ck_vocab);
 }
 
 #[cfg(feature = "serve")]

@@ -173,6 +173,39 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
     }
 }
 
+/// Load a checkpoint with auto-detection of layout variant.
+/// Tries {ode,no-ode} × {corrector,no-corrector}, both phase-native and non-PN.
+/// Returns (model, dims) or panics if no variant matches.
+pub fn load_checkpoint_auto(
+    checkpoint_path: &str,
+    n_bands: usize, n_head: usize, n_layers: usize,
+    out_proj_groups: usize, alpha: f32, beta: f32,
+) -> (WavePacketModel, crate::Dims) {
+    let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = crate::wave_checkpoint::load_checkpoint(checkpoint_path);
+    let variants: [(bool, bool); 4] = [(false, true), (false, false), (true, true), (true, false)];
+    for (use_ode, use_corr) in &variants {
+        let d = crate::Dims::from_cli(n_bands, n_head, 16, 128, 16)
+            .with_learnable_ode(*use_ode).with_corrector(*use_corr);
+        // Try phase-native
+        let mut mdl = init_model(ck_vocab, 42, n_layers, out_proj_groups, d, alpha, beta);
+        mdl.phase_native = true;
+        mdl.output_corrector = vec![0.0; n_bands];
+        if params.len() == count_trainable_ex(&mdl, false) {
+            unflatten_params_ex(&mut mdl, &params, false);
+            eprintln!("  Loaded: ode={}, corrector={}, phase_native=true", use_ode, use_corr);
+            return (mdl, d);
+        }
+        // Try non-phase-native
+        let mut mdl2 = init_model(ck_vocab, 42, n_layers, out_proj_groups, d, alpha, beta);
+        if params.len() == count_trainable_ex(&mdl2, false) {
+            unflatten_params_ex(&mut mdl2, &params, false);
+            eprintln!("  Loaded: ode={}, corrector={}, phase_native=false", use_ode, use_corr);
+            return (mdl2, d);
+        }
+    }
+    panic!("Cannot match checkpoint param count {} to any model variant", params.len());
+}
+
 pub fn count_trainable(model: &WavePacketModel) -> usize {
     count_trainable_ex(model, false)
 }
