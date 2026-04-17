@@ -75,6 +75,10 @@ pub fn forward_with_cache(
             .collect();
         _ln_total += _tln.elapsed();
 
+        // NOTE: block.ln_ffn exists but is NOT applied here — dead code (findings #11).
+        // FFN receives the shared LN output. Removing ln_ffn from the param vector
+        // would break checkpoint loading (offset shift). See J2 param_completeness.
+
         // FFN + Attention: parallel dispatch through ComputeBackend
         let _tpar = std::time::Instant::now();
 
