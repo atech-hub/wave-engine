@@ -34,6 +34,8 @@ pub struct BlockCache {
     pub ffn_mae_out_sq: Vec<Vec<f32>>,
     pub ffn_mae_out_act: Vec<Vec<f32>>,
     pub ffn_regulated: Vec<Vec<f32>>,
+    /// Attention pathway cache — populated only when dims.attention_pathway is true.
+    pub attn_pathway: Option<crate::common::attn::WaveAttnCache>,
 }
 
 pub struct ForwardCache {
@@ -123,6 +125,7 @@ pub fn forward_with_cache(
             ffn_mae_in_sq: vec![], ffn_mae_in_act: vec![], ffn_precond: vec![],
             ffn_kerr_out: vec![], ffn_mae_out_sq: vec![], ffn_mae_out_act: vec![],
             ffn_regulated: vec![],
+            attn_pathway: None, // populated in forward_with_cache_from_waves when flag is on
         });
 
         hidden = output;
@@ -240,6 +243,7 @@ pub fn forward_with_cache_from_waves(
             ffn_mae_in_sq: vec![], ffn_mae_in_act: vec![], ffn_precond: vec![],
             ffn_kerr_out: vec![], ffn_mae_out_sq: vec![], ffn_mae_out_act: vec![],
             ffn_regulated: vec![],
+            attn_pathway: None,
         });
 
         hidden = output;

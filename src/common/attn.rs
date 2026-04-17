@@ -45,6 +45,28 @@ pub struct WaveAttnWeights {
     pub out_proj_b: Vec<f32>,
 }
 
+/// Forward intermediates for pathway-only backward.
+/// Populated only when dims.attention_pathway is true.
+#[derive(Clone)]
+pub struct WaveAttnCache {
+    /// Per-head phase angles per position: [n_head][t]
+    pub phases: Vec<Vec<f32>>,
+    /// Per-head raw (r, s) for atan2 backward: [n_head][t] of (r, s)
+    pub phase_rs: Vec<Vec<(f32, f32)>>,
+    /// Per-head value projections per position: [n_head][t][head_dim]
+    pub v_all: Vec<Vec<Vec<f32>>>,
+    /// Per-head content vectors per position (empty vec if no content_proj): [n_head][t][content_dim]
+    pub content_vecs: Vec<Vec<Vec<f32>>>,
+    /// Content scale per head: [n_head]
+    pub content_scale: Vec<f32>,
+    /// Per-head attention weights post-softmax: [n_head][t][t]
+    pub att_w: Vec<Vec<Vec<f32>>>,
+    /// Merged head outputs before out_proj: [t][n_embd]
+    pub out_merged: Vec<Vec<f32>>,
+    /// n_bands for dimension info
+    pub n_bands: usize,
+}
+
 /// Precompute phase angle for a position via learned projection.
 /// Projects [n_embd] → [2] (r, s), returns atan2(s, r) as scalar phase.
 pub fn project_phase(x: &[f32], proj_w: &[Vec<f32>], proj_b: &[f32]) -> f32 {
