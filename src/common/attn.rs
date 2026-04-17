@@ -90,7 +90,8 @@ pub fn wave_attention_forward(
     x: &[Vec<f32>],
     n_bands: usize,
     backend: Option<&(dyn crate::backend::ComputeBackend + Send + Sync)>,
-) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>) {
+    return_pathway_cache: bool,
+) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>, Option<WaveAttnCache>) {
     let t = x.len();
     let n_embd = n_bands * 2;
     let n_head = weights.heads.len();
@@ -98,14 +99,33 @@ pub fn wave_attention_forward(
 
     // Parallel over attention heads — each head is fully independent.
     // 12 heads on 28 threads: ~4-6x speedup at 24 layers.
-    let head_results: Vec<(Vec<Vec<f32>>, Vec<Vec<f32>>)> = (0..n_head).into_par_iter().map(|head| {
+    // Per-head result type depends on whether we need the pathway cache
+    struct HeadResult {
+        head_out: Vec<Vec<f32>>,
+        att_w: Vec<Vec<f32>>,
+        // Pathway cache intermediates (only populated when return_pathway_cache is true)
+        phases: Vec<f32>,
+        phase_rs: Vec<(f32, f32)>,
+        v_all: Vec<Vec<f32>>,
+        content_vecs: Vec<Vec<f32>>,
+        content_scale: f32,
+    }
+
+    let head_results: Vec<HeadResult> = (0..n_head).into_par_iter().map(|head| {
         let harmonic_n = super::math::softplus(weights.heads[head].harmonic_raw);
         let offset = head * head_dim;
 
-        // Phase 1: Precompute phase angles
-        let phases: Vec<f32> = (0..t).map(|pos| {
-            project_phase(&x[pos], &weights.heads[head].phase_proj_w, &weights.heads[head].phase_proj_b)
+        // Phase 1: Precompute phase angles (and raw r,s for backward when caching)
+        let phase_data: Vec<(f32, f32, f32)> = (0..t).map(|pos| {
+            let pw = &weights.heads[head].phase_proj_w;
+            let pb = &weights.heads[head].phase_proj_b;
+            let mut r = pb[0];
+            let mut s = pb[1];
+            for j in 0..n_embd { r += pw[0][j] * x[pos][j]; s += pw[1][j] * x[pos][j]; }
+            (s.atan2(r), r, s)
         }).collect();
+        let phases: Vec<f32> = phase_data.iter().map(|&(p, _, _)| p).collect();
+        let phase_rs: Vec<(f32, f32)> = phase_data.iter().map(|&(_, r, s)| (r, s)).collect();
 
         // Phase 1b: Frozen content projection (symmetry-breaking)
         // When content_proj_w is non-empty, project each position to a content vector
@@ -226,7 +246,11 @@ pub fn wave_attention_forward(
             }
         }
 
-        (head_out, att_w)
+        let cs = if content_dim > 0 { 1.0 / (content_dim as f32).sqrt() } else { 0.0 };
+        HeadResult {
+            head_out, att_w,
+            phases, phase_rs, v_all, content_vecs, content_scale: cs,
+        }
     }).collect();
 
     // Merge head outputs into combined arrays
@@ -234,12 +258,12 @@ pub fn wave_attention_forward(
     let mut out = vec![vec![0.0f32; n_embd]; t];
     for head in 0..n_head {
         let offset = head * head_dim;
-        let (ref head_out, ref att_w) = head_results[head];
+        let hr = &head_results[head];
         for qi in 0..t {
             for d in 0..head_dim {
-                out[qi][offset + d] = head_out[qi][d];
+                out[qi][offset + d] = hr.head_out[qi][d];
             }
-            att_weights_all[head][qi] = att_w[qi].clone();
+            att_weights_all[head][qi] = hr.att_w[qi].clone();
         }
     }
 
@@ -258,5 +282,21 @@ pub fn wave_attention_forward(
         }).collect()
     };
 
-    (result, att_weights_all)
+    // Build pathway cache if requested
+    let pathway_cache = if return_pathway_cache {
+        Some(WaveAttnCache {
+            phases: head_results.iter().map(|hr| hr.phases.clone()).collect(),
+            phase_rs: head_results.iter().map(|hr| hr.phase_rs.clone()).collect(),
+            v_all: head_results.iter().map(|hr| hr.v_all.clone()).collect(),
+            content_vecs: head_results.iter().map(|hr| hr.content_vecs.clone()).collect(),
+            content_scale: head_results.iter().map(|hr| hr.content_scale).collect(),
+            att_w: head_results.iter().map(|hr| hr.att_w.clone()).collect(),
+            out_merged: out.clone(),
+            n_bands,
+        })
+    } else {
+        None
+    };
+
+    (result, att_weights_all, pathway_cache)
 }

@@ -101,7 +101,7 @@ pub fn forward_with_cache(
 
         // Attention (CPU — frozen, harmonic coherence scoring)
         let _ta = std::time::Instant::now();
-        let (attn_out, att_weights) = wave_attention_forward(&block.attn, &normed, d.n_bands, gpu);
+        let (attn_out, att_weights, _) = wave_attention_forward(&block.attn, &normed, d.n_bands, gpu, false);
         let attn_dur = _ta.elapsed();
         _attn_total += attn_dur;
         _ffn_total += ffn_dur;
@@ -223,7 +223,9 @@ pub fn forward_with_cache_from_waves(
             &block.ffn, &normed, be, stencil, None, None, freeze_ode, use_corrector, None, None,
         );
 
-        let (attn_out, att_weights) = wave_attention_forward(&block.attn, &normed, d.n_bands, None);
+        let (attn_out, att_weights, attn_cache) = wave_attention_forward(
+            &block.attn, &normed, d.n_bands, None, d.attention_pathway,
+        );
 
         let scale = if model.use_layer_scale { model.layer_scale[block_idx] } else { 1.0 };
         let output: Vec<Vec<f32>> = (0..t).map(|i| {
@@ -243,7 +245,7 @@ pub fn forward_with_cache_from_waves(
             ffn_mae_in_sq: vec![], ffn_mae_in_act: vec![], ffn_precond: vec![],
             ffn_kerr_out: vec![], ffn_mae_out_sq: vec![], ffn_mae_out_act: vec![],
             ffn_regulated: vec![],
-            attn_pathway: None,
+            attn_pathway: attn_cache,
         });
 
         hidden = output;

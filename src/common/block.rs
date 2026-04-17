@@ -44,7 +44,7 @@ pub fn wave_block_forward(
         .collect();
 
     // Attention path (CPU) — harmonic coherence scoring
-    let (attn_out, att_weights) = wave_attention_forward(&weights.attn, &normed, n_bands, None);
+    let (attn_out, att_weights, _) = wave_attention_forward(&weights.attn, &normed, n_bands, None, false);
 
     // FFN path — dual-maestro Kerr-ODE (same normed input)
     let (ffn_out, _cache) = dual_maestro_forward_cached(&weights.ffn, &normed, None, None);
