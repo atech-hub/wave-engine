@@ -118,7 +118,9 @@ fn main() {
 // ─── Runtime init ──────────────────────────────────────────────
 
 fn init_runtime() {
-    init_runtime();
+    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
+    println!("wave-engine v0.1.0\n");
 }
 
 // ─── Clap command handlers ─────────────────────────────────────
@@ -149,6 +151,7 @@ fn cmd_verify(args: cli::VerifyArgs) {
                     let targets: Vec<usize> = (1..9).map(|i| i % m.vocab).collect();
                     let (fwd, bwd, params, labels) = cpu::grad_check_wrapper::phase_native_check(
                         tokens, targets, m.layers, m.n_bands, m.n_head, m.vocab, m.alpha, m.beta,
+                        ga.attention_pathway,
                     );
                     let result = monitors::junctions::grad_check::check_gradients(
                         "phase-native", fwd, bwd, &params, &labels, config,

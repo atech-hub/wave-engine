@@ -101,7 +101,7 @@ pub fn forward_with_cache(
 
         // Attention (CPU — frozen, harmonic coherence scoring)
         let _ta = std::time::Instant::now();
-        let (attn_out, att_weights, _) = wave_attention_forward(&block.attn, &normed, d.n_bands, gpu, false);
+        let (attn_out, att_weights, attn_cache_main) = wave_attention_forward(&block.attn, &normed, d.n_bands, gpu, d.attention_pathway);
         let attn_dur = _ta.elapsed();
         _attn_total += attn_dur;
         _ffn_total += ffn_dur;
@@ -125,7 +125,7 @@ pub fn forward_with_cache(
             ffn_mae_in_sq: vec![], ffn_mae_in_act: vec![], ffn_precond: vec![],
             ffn_kerr_out: vec![], ffn_mae_out_sq: vec![], ffn_mae_out_act: vec![],
             ffn_regulated: vec![],
-            attn_pathway: None, // populated in forward_with_cache_from_waves when flag is on
+            attn_pathway: attn_cache_main,
         });
 
         hidden = output;

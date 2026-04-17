@@ -410,6 +410,10 @@ pub struct VerifyGradArgs {
     /// Print every parameter check
     #[arg(long)]
     pub verbose: bool,
+
+    /// Enable attention pathway (fixes d_normed bug #6)
+    #[arg(long)]
+    pub attention_pathway: bool,
 }
 
 #[derive(clap::Args)]

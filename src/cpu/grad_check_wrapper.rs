@@ -96,6 +96,7 @@ pub fn phase_native_check(
     vocab_size: usize,
     alpha: f32,
     beta: f32,
+    attention_pathway: bool,
 ) -> (
     impl Fn(&[f32]) -> f32,
     impl Fn(&[f32]) -> (f32, Vec<f32>),
@@ -104,7 +105,8 @@ pub fn phase_native_check(
 ) {
     let dims = Dims::from_cli(n_bands, n_head, 16, 128, 16)
         .with_learnable_ode(false)
-        .with_corrector(false);
+        .with_corrector(false)
+        .with_attention_pathway(attention_pathway);
     let mut model = init_model(vocab_size, 42, n_layers, 1, dims, alpha, beta);
     model.phase_native = true;
     model.output_corrector = vec![0.0; n_bands];

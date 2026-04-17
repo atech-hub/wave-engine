@@ -63,6 +63,8 @@ pub struct WaveAttnCache {
     pub att_w: Vec<Vec<Vec<f32>>>,
     /// Merged head outputs before out_proj: [t][n_embd]
     pub out_merged: Vec<Vec<f32>>,
+    /// The normed input that attention read from: [t][n_embd]
+    pub normed: Vec<Vec<f32>>,
     /// n_bands for dimension info
     pub n_bands: usize,
 }
@@ -292,6 +294,7 @@ pub fn wave_attention_forward(
             content_scale: head_results.iter().map(|hr| hr.content_scale).collect(),
             att_w: head_results.iter().map(|hr| hr.att_w.clone()).collect(),
             out_merged: out.clone(),
+            normed: x.to_vec(),
             n_bands,
         })
     } else {
@@ -299,4 +302,92 @@ pub fn wave_attention_forward(
     };
 
     (result, att_weights_all, pathway_cache)
+}
+
+/// Pathway-only backward for wave coherence attention.
+///
+/// Computes d_normed_from_attention without accumulating attention weight gradients.
+/// Used when attention is frozen (default) but gradient pathway correctness is required
+/// (flag --attention-pathway). Calls shared primitives from attn_backward.rs.
+///
+/// Returns d_normed_from_attention shaped [t][n_embd].
+pub fn wave_attention_backward_pathway(
+    weights: &WaveAttnWeights,
+    cache: &WaveAttnCache,
+    d_attn_out: &[Vec<f32>],
+) -> Vec<Vec<f32>> {
+    let n_bands = cache.n_bands;
+    let n_embd = n_bands * 2;
+    let n_head = weights.heads.len();
+    let head_dim = n_embd / n_head;
+    let t = d_attn_out.len();
+
+    use super::attn_backward as ab;
+
+    // Step 1: out_proj backward
+    let (d_out, _d_op_w, _d_op_b) = ab::out_proj_backward(
+        d_attn_out, &cache.out_merged, &weights.out_proj_w, n_embd,
+    );
+
+    // Step 2: split into per-head
+    let d_heads = ab::split_heads(&d_out, n_head, head_dim);
+
+    // Per-head backward, accumulate d_normed
+    let mut d_x_from_phase_all = Vec::with_capacity(n_head);
+    let mut d_x_from_v_all = Vec::with_capacity(n_head);
+    let mut d_x_from_content_all = Vec::with_capacity(n_head);
+
+    for h in 0..n_head {
+        let harmonic_n = super::math::softplus(weights.heads[h].harmonic_raw);
+        let offset = h * head_dim;
+
+        // Step 3: value aggregation backward
+        let (d_att_w, d_v_all) = ab::value_aggregation_backward(
+            &d_heads[h], &cache.att_w[h], &cache.v_all[h],
+        );
+
+        // Step 4: softmax backward
+        let d_scores = ab::softmax_backward(&d_att_w, &cache.att_w[h]);
+
+        // Step 5: score backward
+        let cv_opt = if !cache.content_vecs[h].is_empty() { Some(cache.content_vecs[h].as_slice()) } else { None };
+        let (d_delta, d_content_opt, _d_harmonic_n) = ab::score_backward(
+            &d_scores, &cache.phases[h], harmonic_n, &cache.att_w[h], cv_opt, cache.content_scale[h],
+        );
+
+        // Step 6: phase subtraction backward
+        let d_phases = ab::phase_subtraction_backward(&d_delta, &cache.att_w[h]);
+
+        // Step 7: phase projection backward (d_normed contribution from phases)
+        let (d_x_phase, _d_pp_w, _d_pp_b) = ab::phase_projection_backward(
+            &d_phases, &cache.normed,
+            &weights.heads[h].phase_proj_w, &weights.heads[h].phase_proj_b, n_embd,
+        );
+
+        // Step 8: value projection backward (d_normed contribution from values)
+        let (d_x_v, _d_vp_w, _d_vp_b) = ab::value_projection_backward(
+            &d_v_all,
+            &cache.normed,
+            offset, head_dim, n_embd, &weights.heads[h].v_proj_w,
+        );
+
+        // Step 9: content projection backward (when active)
+        let d_x_content = if let Some(ref dcv) = d_content_opt {
+            let (d_x_c, _d_cp_w, _d_cp_b) = ab::content_projection_backward(
+                dcv,
+                &cache.normed,
+                &weights.heads[h].content_proj_w, n_embd,
+            );
+            d_x_c
+        } else {
+            vec![vec![0.0f32; n_embd]; t]
+        };
+
+        d_x_from_phase_all.push(d_x_phase);
+        d_x_from_v_all.push(d_x_v);
+        d_x_from_content_all.push(d_x_content);
+    }
+
+    // Step 10: combine
+    ab::combine_d_normed(&d_x_from_phase_all, &d_x_from_v_all, &d_x_from_content_all, t, n_embd)
 }

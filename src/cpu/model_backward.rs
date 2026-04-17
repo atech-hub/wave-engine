@@ -364,11 +364,26 @@ fn backward_impl(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize
             }
         }
 
-        // ─── LN backward (shared LN, FFN gradients only — attention frozen) ───
+        // ─── LN backward (shared LN) ───
+        // When attention_pathway is on, combine FFN and attention contributions to d_normed.
+        // When off, attention contribution is dropped (known bug #6, preserved for baseline).
+        let d_normed_combined: Vec<Vec<f32>> = if d.attention_pathway {
+            let d_normed_from_attn = crate::common::attn::wave_attention_backward_pathway(
+                &block.attn,
+                bc.attn_pathway.as_ref().expect("attention_pathway requires populated cache"),
+                &d_ffn_out,
+            );
+            (0..t).map(|pos| {
+                (0..d.n_embd).map(|j| d_normed_from_ffn[pos][j] + d_normed_from_attn[pos][j]).collect()
+            }).collect()
+        } else {
+            d_normed_from_ffn
+        };
+
         let mut d_input = Vec::with_capacity(t);
         for pos in 0..t {
             let (d_x, d_w, d_b) = layer_norm_backward(
-                &d_normed_from_ffn[pos], &bc.input[pos], &block.ln.weight,
+                &d_normed_combined[pos], &bc.input[pos], &block.ln.weight,
             );
             for i in 0..d.n_embd {
                 grads.block_ln_w[block_idx][i] += d_w[i];
