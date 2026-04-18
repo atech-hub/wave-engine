@@ -13,3 +13,6 @@ pub mod vector_length;     // J5: params.len() == count_trainable == grads.len()
 pub mod live_gradient;     // J6: every trainable param sees nonzero gradient
 pub mod pathway_completeness; // J3: forward fan-out == backward fan-in
 pub mod tensor_shape;       // J9: tensor dimensions match at every boundary
+pub mod value_range;        // J7: named tensors must stay within declared bounds
+pub mod train_infer_alignment; // J8: train loss vs inference metric correlation tracker
+pub mod tier_parity;        // J10: CPU/GPU forward outputs must agree to tolerance
