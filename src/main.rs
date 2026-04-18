@@ -654,10 +654,70 @@ fn cmd_phase_decode(args: cli::PhaseDecodeArgs) {
 }
 
 #[cfg(feature = "serve")]
-fn cmd_serve(_args: cli::ServeArgs) {
-    // Serve requires the full serve_tier infrastructure — keep on legacy for now
-    eprintln!("serve: use legacy --serve flag for now.");
-    std::process::exit(1);
+fn cmd_serve(args: cli::ServeArgs) {
+    init_runtime();
+
+    let m = &args.model;
+    let resume = args.checkpoint.resume.clone();
+    println!("Loading checkpoint: {resume}");
+
+    // Use the shared 4-variant auto-loader — handles phase-native × ODE × corrector.
+    let (model, dims_serve) = common::wave_model::load_checkpoint_auto(
+        &resume, m.n_bands, m.n_head, m.layers, m.out_proj_groups, m.alpha, m.beta,
+    );
+    let ck_vocab = model.vocab_size;
+    println!("  Model: {}L, {}bands, {}dim, {}vocab",
+        m.layers, m.n_bands, m.n_bands * 2, ck_vocab);
+
+    ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+
+    let vocab = if args.bpe {
+        let bpe = common::bpe::BpeTokenizer::from_file(&args.tokenizer);
+        println!("  BPE tokenizer: {} vocab from {}", ck_vocab, args.tokenizer);
+        serve_tier::prompt::Vocab::from_bpe(bpe, ck_vocab)
+    } else {
+        // Char-level vocab must mirror the training tokenizer: sorted unique chars
+        // from the training data file. Without this, ASCII-default chars (e.g.
+        // control bytes at vocab=15) don't match the model's embedding table and
+        // decoding produces garbage.
+        let data_path = args.data.clone().unwrap_or_else(|| {
+            eprintln!("ERROR: serve without --bpe requires --data <path-to-training-file>");
+            std::process::exit(1);
+        });
+        let text = common::data_loader::load_text_raw(&data_path);
+        let mut chars: Vec<char> = text.chars().collect();
+        chars.sort();
+        chars.dedup();
+        let n = chars.len().min(ck_vocab);
+        let char_map: Vec<char> = chars[..n].to_vec();
+        println!("  Char-level vocab: {} chars from {}", n, data_path);
+        serve_tier::prompt::Vocab {
+            vocab_size: ck_vocab,
+            bpe: None,
+            char_map,
+        }
+    };
+
+    let stencil = fft_ode::StencilFft::new(m.n_bands);
+
+    let wave_mem = args.memory.as_ref().map(|path| {
+        std::sync::Mutex::new(common::wave_memory::load_or_create(path, m.layers, m.n_bands))
+    });
+
+    let state = std::sync::Arc::new(serve_tier::server::AppState {
+        model: std::sync::Arc::new(model),
+        vocab: std::sync::Arc::new(vocab),
+        dims: dims_serve,
+        stencil: std::sync::Arc::new(stencil),
+        model_name: "wave-engine".to_string(),
+        api_key: args.token.clone(),
+        host: "127.0.0.1".to_string(),
+        port: args.port,
+        memory: wave_mem,
+        memory_path: args.memory.clone(),
+    });
+
+    serve_tier::server::run_server(state);
 }
 
 fn cmd_scale_checkpoint(args: cli::ScaleCheckpointArgs) {

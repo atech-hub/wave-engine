@@ -561,6 +561,10 @@ pub struct ServeArgs {
     #[arg(long, default_value = "data/tokenizer.json")]
     pub tokenizer: String,
 
+    /// Training data file (required for char-level vocab; ignored with --bpe)
+    #[arg(long)]
+    pub data: Option<String>,
+
     /// Wave memory file
     #[arg(long)]
     pub memory: Option<String>,

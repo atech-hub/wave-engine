@@ -50,16 +50,23 @@ impl Vocab {
 }
 
 /// Format chat messages into a token sequence.
+/// Separator "\n\n" goes BETWEEN messages, not after the last one — the last
+/// message should sit at the cursor so the model continues directly from it
+/// (so completion-style single-user prompts like "88-65=" work without the
+/// formatter appending tokens that put the model in an off-training-distribution
+/// state).
 pub fn format_chat(messages: &[ChatMessage], vocab: &Vocab) -> Vec<usize> {
     let mut text = String::new();
+    let mut first = true;
     for msg in messages {
-        match msg.role.as_str() {
-            "system" | "user" | "assistant" => {
-                text.push_str(&msg.content);
-                text.push_str("\n\n");
-            }
-            _ => {}
+        if !matches!(msg.role.as_str(), "system" | "user" | "assistant") {
+            continue;
         }
+        if !first {
+            text.push_str("\n\n");
+        }
+        text.push_str(&msg.content);
+        first = false;
     }
     vocab.encode(&text)
 }
