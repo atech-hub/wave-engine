@@ -15,7 +15,7 @@ mod tests {
         let n = 10;
         let params: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.1).collect();
 
-        let forward = |p: &[f32]| -> f32 { p.iter().map(|x| x * x).sum() };
+        let forward = |p: &[f32]| -> f64 { p.iter().map(|x| (*x as f64) * (*x as f64)).sum() };
         let backward = |p: &[f32]| -> (f32, Vec<f32>) {
             let loss: f32 = p.iter().map(|x| x * x).sum();
             let grads: Vec<f32> = p.iter().map(|x| 2.0 * x).collect();
@@ -39,7 +39,7 @@ mod tests {
         let n = 10;
         let params: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.1).collect();
 
-        let forward = |p: &[f32]| -> f32 { p.iter().map(|x| x * x).sum() };
+        let forward = |p: &[f32]| -> f64 { p.iter().map(|x| (*x as f64) * (*x as f64)).sum() };
         let buggy_backward = |p: &[f32]| -> (f32, Vec<f32>) {
             let loss: f32 = p.iter().map(|x| x * x).sum();
             let grads: Vec<f32> = p.iter().map(|x| *x).collect(); // BUG: missing 2×
@@ -68,7 +68,7 @@ mod tests {
         let n = 10;
         let params: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.1).collect();
 
-        let forward = |p: &[f32]| -> f32 { p.iter().map(|x| x * x).sum() };
+        let forward = |p: &[f32]| -> f64 { p.iter().map(|x| (*x as f64) * (*x as f64)).sum() };
         let dead_backward = |p: &[f32]| -> (f32, Vec<f32>) {
             let loss: f32 = p.iter().map(|x| x * x).sum();
             (loss, vec![0.0; p.len()]) // All dead
@@ -93,7 +93,7 @@ mod tests {
         let n = 8;
         let params: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.1).collect();
 
-        let forward = |p: &[f32]| -> f32 { p.iter().map(|x| x * x).sum() };
+        let forward = |p: &[f32]| -> f64 { p.iter().map(|x| (*x as f64) * (*x as f64)).sum() };
         let mixed_backward = |p: &[f32]| -> (f32, Vec<f32>) {
             let loss: f32 = p.iter().map(|x| x * x).sum();
             let mut grads: Vec<f32> = p.iter().map(|x| 2.0 * x).collect();

@@ -100,7 +100,7 @@ pub fn phase_native_check(
     learnable_ode: bool,
     ode_pathway: bool,
 ) -> (
-    impl Fn(&[f32]) -> f32,
+    impl Fn(&[f32]) -> f64,
     impl Fn(&[f32]) -> (f32, Vec<f32>),
     Vec<f32>,
     SectionLabels,
@@ -125,7 +125,10 @@ pub fn phase_native_check(
     let tokens_bwd = tokens_fwd.clone();
     let targets_bwd = targets_fwd.clone();
 
-    let forward_fn = move |params: &[f32]| -> f32 {
+    // J1 verification: accumulate loss at f64 so the FD subtraction in
+    // grad_check doesn't cancel against f32 quantization. Model weights stay
+    // f32; only the loss arithmetic is lifted.
+    let forward_fn = move |params: &[f32]| -> f64 {
         let mut m = init_model(vocab_size, 42, n_layers, 1, dims, alpha, beta);
         m.phase_native = true;
         m.output_corrector = vec![0.0; n_bands];
@@ -134,16 +137,14 @@ pub fn phase_native_check(
         let cache = crate::cpu::forward::forward_with_cache(
             &m, &tokens_fwd, dims, None, None, None, Some(&stencil), None, None, None,
         );
-        // Use the same loss function as backward: phase_native_loss
         let t = tokens_fwd.len();
-        let mut total_loss = 0.0f32;
+        let mut total_loss = 0.0_f64;
         for pos in 0..t {
-            let (loss, _, _) = crate::common::phase_loss::phase_native_loss(
+            total_loss += crate::common::phase_loss::phase_native_loss_value_f64(
                 &cache.post_ln_f[pos], &m.wte, targets_fwd[pos], n_bands, 1.0, &m.output_corrector,
             );
-            total_loss += loss;
         }
-        total_loss / t.max(1) as f32
+        total_loss / t.max(1) as f64
     };
 
     let forward_backward_fn = move |params: &[f32]| -> (f32, Vec<f32>) {
@@ -176,7 +177,7 @@ pub fn wave_input_check(
     alpha: f32,
     beta: f32,
 ) -> (
-    impl Fn(&[f32]) -> f32,
+    impl Fn(&[f32]) -> f64,
     impl Fn(&[f32]) -> (f32, Vec<f32>),
     Vec<f32>,
     SectionLabels,
@@ -197,7 +198,8 @@ pub fn wave_input_check(
     let inputs_bwd = inputs_fwd.clone();
     let targets_bwd = targets_fwd.clone();
 
-    let forward_fn = move |params: &[f32]| -> f32 {
+    // J1 verification: accumulate L2 loss at f64. See phase_native_check for rationale.
+    let forward_fn = move |params: &[f32]| -> f64 {
         let mut m = init_model(vocab_size, 42, n_layers, 1, dims, alpha, beta);
         m.phase_native = true;
         m.output_corrector = vec![0.0; n_bands];
@@ -209,16 +211,16 @@ pub fn wave_input_check(
         );
         let t = cache.post_ln_f.len().min(targets_fwd.len());
         let n_embd = n_bands * 2;
-        let mut total = 0.0f32;
+        let mut total = 0.0_f64;
         for pos in 0..t {
-            let mut pos_loss = 0.0f32;
+            let mut pos_loss = 0.0_f64;
             for i in 0..n_embd {
-                let diff = cache.post_ln_f[pos][i] - targets_fwd[pos][i];
+                let diff = (cache.post_ln_f[pos][i] as f64) - (targets_fwd[pos][i] as f64);
                 pos_loss += diff * diff;
             }
-            total += pos_loss / n_embd as f32;
+            total += pos_loss / n_embd as f64;
         }
-        total / t.max(1) as f32
+        total / t.max(1) as f64
     };
 
     let forward_backward_fn = move |params: &[f32]| -> (f32, Vec<f32>) {

@@ -123,7 +123,7 @@ pub fn check_gradients<F1, F2>(
     config: GradCheckConfig,
 ) -> GradCheckResult
 where
-    F1: Fn(&[f32]) -> f32,
+    F1: Fn(&[f32]) -> f64,
     F2: Fn(&[f32]) -> (f32, Vec<f32>),
 {
     let n_total = initial_params.len();
@@ -154,11 +154,16 @@ where
         // restore
         params_buf[idx] = initial_params[idx];
 
-        let fd = (loss_plus - loss_minus) / (2.0 * config.eps);
+        // forward_fn now returns f64 — the loss is accumulated at f64 inside
+        // the forward closure so the FD subtraction doesn't cancel against f32
+        // quantization. Analytical gradient is promoted to f64 for comparison.
+        let fd64 = (loss_plus - loss_minus) / (2.0_f64 * config.eps as f64);
+        let an64 = analytical[idx] as f64;
+        let denom64 = fd64.abs().max(an64.abs()).max(1e-8_f64);
+        let rel_err = ((fd64 - an64).abs() / denom64) as f32;
+        let abs_err = (fd64 - an64).abs() as f32;
+        let fd = fd64 as f32;
         let an = analytical[idx];
-        let denom = fd.abs().max(an.abs()).max(1e-8);
-        let rel_err = (fd - an).abs() / denom;
-        let abs_err = (fd - an).abs();
 
         let section = section_labels.label_for(idx).to_string();
 
