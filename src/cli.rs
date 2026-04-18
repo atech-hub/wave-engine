@@ -430,6 +430,10 @@ pub struct VerifyGradArgs {
     /// Disable ODE pathway (for baseline comparison)
     #[arg(long)]
     pub no_ode_pathway: bool,
+
+    /// Split-band ODE integration (freeze-and-decouple). Phase A requires chi=0.
+    #[arg(long)]
+    pub split_band: bool,
 }
 
 #[derive(clap::Args)]

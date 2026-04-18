@@ -8,6 +8,7 @@ pub mod core;           // softplus, cross_entropy_backward (was common/math.rs)
 pub mod backward;       // linear, layer_norm, gelu, softplus backward
 pub mod ode_deriv;      // Kerr derivative, RK4 step, FWM coupling
 pub mod ode_backward;   // ODE forward-with-cache, ODE backward, FWM Jacobian
+pub mod ode_split_band; // split-band orchestrator (freeze-and-decouple)
 pub mod attn_backward;  // attention backward ten-step pipe
 pub mod phase_loss;     // phase-native loss function
 

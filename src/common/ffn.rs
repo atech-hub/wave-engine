@@ -48,6 +48,7 @@ pub fn ffn_forward_via_backend(
     layer_agc: Option<&mut crate::common::agc::OdeAgc>,
     memory: Option<(&[f32], &[f32])>,
     ode_pathway: bool,
+    split_band: bool,
 ) -> (Vec<Vec<f32>>, FfnCache) {
     let t = x.len();
     let n_embd = x[0].len();
@@ -93,12 +94,32 @@ pub fn ffn_forward_via_backend(
     //    When freeze_ode, use the fast path (GPU/FFT/sequential, no cache).
     //    When !freeze_ode AND GPU available, use GPU forward (backward recomputes internally).
     let _t_ode = std::time::Instant::now();
-    let (kerr_out, ode_caches, ode_device): (Vec<Vec<f32>>, Option<Vec<crate::common::ode_backward::OdeForwardCache>>, &str) =
-    if !freeze_ode && ping_pong.is_some() {
+    // Split-band takes precedence over monolithic CPU cached forward when enabled.
+    // Requires chi=0 (Phase A). Doesn't currently combine with GPU paths.
+    let use_split_band = split_band && (!freeze_ode || ode_pathway);
+
+    let (kerr_out, ode_caches, split_band_caches, ode_device): (
+        Vec<Vec<f32>>,
+        Option<Vec<crate::common::ode_backward::OdeForwardCache>>,
+        Option<Vec<crate::common::ode_split_band::SplitBandForwardCache>>,
+        &str,
+    ) =
+    if use_split_band {
+        // Split-band CPU forward: freeze-and-decouple integration.
+        // Each position gets its own SplitBandForwardCache for the backward.
+        let mut outs = Vec::with_capacity(t);
+        let mut caches = Vec::with_capacity(t);
+        for p in &precond {
+            let (out, cache) = crate::common::ode_split_band::split_band_forward_with_cache(p, &weights.kerr);
+            outs.push(out);
+            caches.push(cache);
+        }
+        (outs, None, Some(caches), "CPU-split-band")
+    } else if !freeze_ode && ping_pong.is_some() {
         // GPU forward for learnable ODE — backward will recompute via gpu_kerr_ode_backward_batch
         let gpu_be = ping_pong.unwrap().1;
         let out = gpu_be.gpu_kerr_ode_batch_fused(&weights.kerr, &precond);
-        (out, None, "GPU-learnable")
+        (out, None, None, "GPU-learnable")
     } else if !freeze_ode || ode_pathway {
         // CPU caching forward — stores intermediates for backward (also when ode_pathway forces caching)
         let mut outs = Vec::with_capacity(t);
@@ -108,7 +129,7 @@ pub fn ffn_forward_via_backend(
             outs.push(out);
             caches.push(cache);
         }
-        (outs, Some(caches), "CPU-cached")
+        (outs, Some(caches), None, "CPU-cached")
     } else if let Some((_bufs, gpu_be)) = ping_pong {
         // GPU: perturbative (single dispatch) or fused RK4 based on rk4_n_steps
         let out = if weights.kerr.rk4_n_steps <= 1 {
@@ -116,23 +137,23 @@ pub fn ffn_forward_via_backend(
         } else {
             gpu_be.gpu_kerr_ode_batch_fused(&weights.kerr, &precond)
         };
-        (out, None, if weights.kerr.rk4_n_steps <= 1 { "GPU-perturbative" } else { "GPU-fused" })
+        (out, None, None, if weights.kerr.rk4_n_steps <= 1 { "GPU-perturbative" } else { "GPU-fused" })
     } else if let Some(st) = stencil {
         let out = precond.iter().map(|p| {
             crate::fft_ode::kerr_ode_fft(p, &weights.kerr.gamma_raw, &weights.kerr.omega,
                 weights.kerr.alpha, weights.kerr.beta, weights.kerr.rk4_n_steps, st, &weights.kerr.rk4_weights)
         }).collect();
-        (out, None, "CPU-FFT")
+        (out, None, None, "CPU-FFT")
     } else {
-        (cpu.kerr_ode_batch(&weights.kerr, &precond), None, "CPU-seq")
+        (cpu.kerr_ode_batch(&weights.kerr, &precond), None, None, "CPU-seq")
     };
     let _ode_dur = _t_ode.elapsed();
 
     // Debug: ODE_BYPASS=1 forces identity forward for gradient diagnostics
-    let (kerr_out, ode_caches) = if std::env::var("ODE_BYPASS").is_ok() {
-        (precond.clone(), None)
+    let (kerr_out, ode_caches, split_band_caches) = if std::env::var("ODE_BYPASS").is_ok() {
+        (precond.clone(), None, None)
     } else {
-        (kerr_out, ode_caches)
+        (kerr_out, ode_caches, split_band_caches)
     };
 
     // No energy conservation — AGC handles magnitude regulation.
@@ -188,6 +209,7 @@ pub fn ffn_forward_via_backend(
         kerr_out, mae_out_sq, mae_out_act,
         regulated,
         ode_caches,
+        split_band_caches,
         corrector_active: use_corrector,
         gpu_ode_backward: gpu_ode,
         corr_sincos,
@@ -292,6 +314,16 @@ pub fn ffn_backward_via_backend(
             });
         }
         (d_inputs, Some(param_grads))
+    } else if let Some(ref sb_caches) = cache.split_band_caches {
+        // Split-band CPU backward — per-band 2×2 Jacobian chains + ns_frozen backward
+        let mut d_preconds = Vec::with_capacity(t);
+        let mut param_grads = Vec::with_capacity(t);
+        for (pos, d_ko) in d_kerr_out.iter().enumerate() {
+            let (d_p, pg) = crate::common::ode_split_band::split_band_backward(d_ko, &sb_caches[pos], &weights.kerr);
+            d_preconds.push(d_p);
+            param_grads.push(pg);
+        }
+        (d_preconds, Some(param_grads))
     } else if let Some(ref ode_caches) = cache.ode_caches {
         // CPU ODE backward — full backward through cached RK4
         let mut d_preconds = Vec::with_capacity(t);
@@ -359,8 +391,10 @@ pub struct FfnCache {
     pub mae_out_sq: Vec<Vec<f32>>,
     pub mae_out_act: Vec<Vec<f32>>,
     pub regulated: Vec<Vec<f32>>,
-    /// ODE forward caches for backward pass — None when GPU or --freeze-ode
+    /// ODE forward caches for backward pass — None when GPU or --freeze-ode or split-band in use
     pub ode_caches: Option<Vec<crate::common::ode_backward::OdeForwardCache>>,
+    /// Split-band ODE caches — populated when dims.split_band is true
+    pub split_band_caches: Option<Vec<crate::common::ode_split_band::SplitBandForwardCache>>,
     /// Whether corrector plate was applied in forward (gates backward)
     pub corrector_active: bool,
     /// GPU ODE backward path: precond stored, backward recomputes via GPU
@@ -444,7 +478,7 @@ mod tests {
 
         // Forward
         let (output, cache) = ffn_forward_via_backend(
-            &ffn, &x, &cpu, None, None, None, true, false, None, None, false,
+            &ffn, &x, &cpu, None, None, None, true, false, None, None, false, false,
         );
 
         // d_output = 1.0 everywhere (loss = sum)
@@ -463,12 +497,12 @@ mod tests {
             for j in 0..n_embd {
                 let mut ffn_p = ffn.clone();
                 ffn_p.maestro_in.squeeze.w[i][j] += eps;
-                let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false);
+                let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false, false);
                 let loss_p: f32 = out_p.iter().flat_map(|v| v.iter()).sum();
 
                 let mut ffn_m = ffn.clone();
                 ffn_m.maestro_in.squeeze.w[i][j] -= eps;
-                let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false);
+                let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false, false);
                 let loss_m: f32 = out_m.iter().flat_map(|v| v.iter()).sum();
 
                 let fd = (loss_p - loss_m) / (2.0 * eps);
@@ -489,11 +523,11 @@ mod tests {
         for i in 0..maestro_dim {
             let mut ffn_p = ffn.clone();
             ffn_p.maestro_in.squeeze.b[i] += eps;
-            let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false);
+            let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false, false);
             let loss_p: f32 = out_p.iter().flat_map(|v| v.iter()).sum();
             let mut ffn_m = ffn.clone();
             ffn_m.maestro_in.squeeze.b[i] -= eps;
-            let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false);
+            let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false, false);
             let loss_m: f32 = out_m.iter().flat_map(|v| v.iter()).sum();
             let fd = (loss_p - loss_m) / (2.0 * eps);
             let an = grads.d_mae_in_sq_b[i];
@@ -512,11 +546,11 @@ mod tests {
             for j in 0..n_embd {
                 let mut ffn_p = ffn.clone();
                 ffn_p.maestro_out.squeeze.w[i][j] += eps;
-                let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false);
+                let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false, false);
                 let loss_p: f32 = out_p.iter().flat_map(|v| v.iter()).sum();
                 let mut ffn_m = ffn.clone();
                 ffn_m.maestro_out.squeeze.w[i][j] -= eps;
-                let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false);
+                let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false, false);
                 let loss_m: f32 = out_m.iter().flat_map(|v| v.iter()).sum();
                 let fd = (loss_p - loss_m) / (2.0 * eps);
                 let an = grads.d_mae_out_sq_w[i][j];

@@ -41,5 +41,6 @@ pub mod catalog_axes;
 pub use math::backward;
 pub use math::ode_deriv;
 pub use math::ode_backward;
+pub use math::ode_split_band;
 pub use math::attn_backward;
 pub use math::phase_loss;

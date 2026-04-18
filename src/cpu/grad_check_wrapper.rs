@@ -99,6 +99,7 @@ pub fn phase_native_check(
     attention_pathway: bool,
     learnable_ode: bool,
     ode_pathway: bool,
+    split_band: bool,
 ) -> (
     impl Fn(&[f32]) -> f64,
     impl Fn(&[f32]) -> (f32, Vec<f32>),
@@ -109,7 +110,8 @@ pub fn phase_native_check(
         .with_learnable_ode(learnable_ode)
         .with_corrector(learnable_ode || ode_pathway) // corrector on when ODE backward is active
         .with_attention_pathway(attention_pathway)
-        .with_ode_pathway(ode_pathway);
+        .with_ode_pathway(ode_pathway)
+        .with_split_band(split_band);
     let mut model = init_model(vocab_size, 42, n_layers, 1, dims, alpha, beta);
     model.phase_native = true;
     model.output_corrector = vec![0.0; n_bands];

@@ -159,7 +159,8 @@ fn cmd_verify(args: cli::VerifyArgs) {
                             .with_learnable_ode(ga.learnable_ode)
                             .with_corrector(ga.learnable_ode || ode_path)
                             .with_attention_pathway(attn_path)
-                            .with_ode_pathway(ode_path);
+                            .with_ode_pathway(ode_path)
+                            .with_split_band(ga.split_band);
                         let mut model = init_model(m.vocab, 42, m.layers, 1, dims, m.alpha, m.beta);
                         model.phase_native = true;
                         model.output_corrector = vec![0.0; m.n_bands];
@@ -188,7 +189,7 @@ fn cmd_verify(args: cli::VerifyArgs) {
 
                     let (fwd, bwd, params, labels) = cpu::grad_check_wrapper::phase_native_check(
                         tokens, targets, m.layers, m.n_bands, m.n_head, m.vocab, m.alpha, m.beta,
-                        attn_path, ga.learnable_ode, ode_path,
+                        attn_path, ga.learnable_ode, ode_path, ga.split_band,
                     );
                     let result = monitors::junctions::grad_check::check_gradients(
                         "phase-native", fwd, bwd, &params, &labels, config,
