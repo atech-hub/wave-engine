@@ -164,6 +164,10 @@ pub struct TrainArgs {
     /// Enable curriculum training
     #[arg(long)]
     pub curriculum: bool,
+
+    /// Split-band ODE integration (freeze-and-decouple). Phase A requires chi=0.
+    #[arg(long)]
+    pub split_band: bool,
 }
 
 #[derive(clap::Args)]

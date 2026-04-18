@@ -397,6 +397,7 @@ fn cmd_train(args: cli::TrainArgs) {
         harmonics: if args.harmonics_dyn { train::DynParam::Dynamic } else { train::DynParam::Off },
         agc_headroom: train::DynParam::Off,
         corrector: train::DynParam::Dynamic,
+        split_band: args.split_band,
     });
 }
 

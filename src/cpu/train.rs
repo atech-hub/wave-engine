@@ -104,6 +104,7 @@ pub struct TrainConfig {
     pub harmonics: DynParam,   // --harmonics dyn | --harmonics 0.5,1.0,1.5,2.0
     pub agc_headroom: DynParam, // --agc-headroom dyn | --agc-headroom 2.0,3.0,3.0,4.0
     pub corrector: DynParam,    // --corrector dyn | --corrector off (replaces --no-corrector)
+    pub split_band: bool,       // --split-band: freeze-and-decouple ODE integration
 }
 
 /// A parameter that can be fixed (manual value) or dynamic (model learns it).

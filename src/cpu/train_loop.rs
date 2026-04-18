@@ -36,7 +36,7 @@ pub fn run_training(config: TrainConfig) {
         let (params, ck_vocab, ck_iter, _ck_lr, ck_rng, adam_t, adam_m, adam_v, _ck_groups, _ck_flags, ck_chi) = wave_checkpoint::load_checkpoint(ckpt);
         checkpoint_chi = ck_chi;
         assert_eq!(ck_vocab, vocab_size, "Vocab size mismatch: checkpoint={ck_vocab}, data={vocab_size}");
-        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()), config.alpha, config.beta);
+        let mut m = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()).with_split_band(config.split_band), config.alpha, config.beta);
         m.phase_native = config.phase_native; // Must set before count_trainable for correct param count
         let ext_count = count_trainable_ex(&m, config.tied);
         if params.len() == ext_count {
@@ -69,7 +69,7 @@ pub fn run_training(config: TrainConfig) {
         }
     } else {
         println!("Initializing model (seed=42)...");
-        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()), config.alpha, config.beta);
+        model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, crate::Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_pythagorean(config.pythagorean).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()).with_split_band(config.split_band), config.alpha, config.beta);
         model.phase_native = config.phase_native; // Must set before count_trainable
         start_iter = 0;
         let n_t = count_trainable_ex(&model, config.tied);
@@ -86,7 +86,7 @@ pub fn run_training(config: TrainConfig) {
     println!("  Architecture: {} parallel blocks, {} harmonic heads, {} bands ({}-dim)", config.n_layers, config.n_head, config.n_bands, config.n_bands * 2);
 
     // Runtime dimensions (needed by pre-flight, forward, backward)
-    let mut dims = crate::Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active());
+    let mut dims = crate::Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, crate::BLOCK_SIZE, crate::RK4_STEPS).with_moduli(config.m1, config.m2).with_tied(config.tied).with_lm_rank(config.lm_rank).with_wave_decode(config.wave_decode).with_unfreeze_phases(config.unfreeze_phases).with_learnable_ode(!config.freeze_ode).with_corrector(config.corrector.is_active() && !config.freeze_ode).with_layer_scale(config.layer_scale.is_active()).with_lr_scale(config.lr_scale.is_active()).with_rk4_weights(config.rk4_weights.is_active()).with_dyn_harmonics(config.harmonics.is_active()).with_split_band(config.split_band);
     dims.phase_temp = config.phase_temp;
     dims.pythagorean = config.pythagorean;
     dims.fwm_strength = config.fwm_strength;
@@ -246,14 +246,20 @@ pub fn run_training(config: TrainConfig) {
     let (fw_related, fw_random, fw_labels) =
         crate::monitors::framework_monitor::build_canonical_pairs(&fw_test_strings);
 
-    // JSONL telemetry — derive from checkpoint name or use explicit --log-name
+    // JSONL telemetry — derive from checkpoint name or use explicit --log-name.
+    // Use Path handling so absolute --checkpoint-name paths work on Windows (fix #31).
     let log_name = config.log_name.clone().unwrap_or_else(|| {
         let tier = if config.use_gpu { "wgpu" } else { "cpu" };
-        // If checkpoint has a custom name, derive log name from it
-        let base = &config.checkpoint_name;
-        if base != "checkpoint.bin" {
-            let stem = base.strip_suffix(".bin").unwrap_or(base);
-            format!("training_log_{}.jsonl", stem)
+        let ck = std::path::Path::new(&config.checkpoint_name);
+        if ck.file_name().map(|n| n.to_string_lossy()) != Some(std::borrow::Cow::Borrowed("checkpoint.bin")) {
+            let stem = ck.file_stem().map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| tier.to_string());
+            let parent = ck.parent().filter(|p| !p.as_os_str().is_empty());
+            let name = format!("training_log_{}.jsonl", stem);
+            match parent {
+                Some(p) => p.join(name).to_string_lossy().into_owned(),
+                None => name,
+            }
         } else {
             format!("training_log_{}.jsonl", tier)
         }
