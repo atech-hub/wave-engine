@@ -770,7 +770,21 @@ pub fn run_training(config: TrainConfig) {
                 train_health::write_checkpoint_drift(&mut log_writer, iter, &drift);
             }
 
-            let path = format!("checkpoint_iter{}.bin", iter + 1);
+            // Derive periodic checkpoint path from the base --checkpoint-name so runs
+            // with different names (postfix_arithmetic, postfix_grammar_10k, ...) keep
+            // their iter snapshots separate instead of overwriting a shared
+            // "checkpoint_iter{N}.bin". Handles absolute and relative base paths.
+            let path = {
+                let ck = std::path::Path::new(&config.checkpoint_name);
+                let stem = ck.file_stem().map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "checkpoint".to_string());
+                let parent = ck.parent().filter(|p| !p.as_os_str().is_empty());
+                let name = format!("{}_iter{}.bin", stem, iter + 1);
+                match parent {
+                    Some(p) => p.join(name).to_string_lossy().into_owned(),
+                    None => name,
+                }
+            };
             let groups = model.blocks[0].ffn.out_proj.n_groups();
             if config.tied {
                 let dummy_opt = Adam::new(config.lr, save_p.len());
