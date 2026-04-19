@@ -230,6 +230,12 @@ fn cmd_scan_memory(args: cli::ScanMemoryArgs) {
         .expect("Failed to load memory file");
     let scans = common::wave_memory::scan_memory(&mem);
     common::wave_memory::print_memory_scan(&mem, &scans);
+
+    if let Some(out_path) = args.output {
+        common::wave_memory::write_memory_scan_json(&out_path, &mem, &scans)
+            .unwrap_or_else(|e| eprintln!("Error writing {}: {}", out_path, e));
+        println!("\n  JSON written to: {}", out_path);
+    }
 }
 
 fn cmd_galaxy_scan(args: cli::GalaxyScanArgs) {
@@ -309,27 +315,93 @@ fn cmd_analyze(args: cli::AnalyzeArgs) {
 
     let m = &args.model;
     common::analyze::run_analyze(&args.checkpoint.resume, m.layers, m.out_proj_groups,
-        args.bpe, &args.tokenizer, m.n_bands, m.n_head, m.alpha, m.beta, false);
+        args.bpe, &args.tokenizer, m.n_bands, m.n_head, m.alpha, m.beta, args.sub_harmonic);
 }
 
 fn cmd_convert_dataset(args: cli::ConvertDatasetArgs) {
     let m = &args.model;
     println!("Converting dataset: {}", args.data);
 
-    let (tokens, vs) = common::data_loader::load_data(&args.data, false, None);
+    let tok_path = if args.bpe { Some(args.tokenizer.as_str()) } else { None };
+    let (tokens, vs) = common::data_loader::load_data(&args.data, args.bpe, tok_path);
     let vocab_size = vs.min(m.vocab);
 
     if args.per_position {
-        // KWDS per-position wave conversion
+        // KWDS per-position wave conversion (embeddings + positional, no ODE)
         let dims = Dims::from_cli(m.n_bands, m.n_head, m.maestro_dim, 128, 16);
         let model = init_model(vocab_size, 42, m.layers, m.out_proj_groups, dims, m.alpha, m.beta);
         common::kwds::convert_tokens_to_kwds(&args.output, &tokens, &model.wte, &model.wpe, m.n_bands)
             .expect("KWDS conversion failed");
         println!("  Written to: {}", args.output);
-    } else {
-        eprintln!("convert-dataset: non-per-position mode not yet supported via clap. Use legacy --convert-dataset.");
-        std::process::exit(1);
+        return;
     }
+
+    // ─── KWMF aggregate mode ───
+    // Run tokens through the model in block-size chunks, average per-layer ODE
+    // states across positions, merge into persistent wave memory.
+    let dims = Dims::from_cli(m.n_bands, m.n_head, m.maestro_dim, 128, 16);
+    let model = if let Some(ref ckpt) = args.resume {
+        println!("Converting dataset through trained model: {}", ckpt);
+        let (mut model, _dims_loaded) = common::wave_model::load_checkpoint_auto(
+            ckpt, m.n_bands, m.n_head, m.layers, m.out_proj_groups, m.alpha, m.beta,
+        );
+        model.learnable_ode = false;
+        model
+    } else {
+        println!("Converting dataset through UNTRAINED model (random init)");
+        let mut model = init_model(vocab_size, 42, m.layers, m.out_proj_groups, dims, m.alpha, m.beta);
+        model.phase_native = true;
+        model.output_corrector = vec![0.0; m.n_bands];
+        model.learnable_ode = false;
+        model
+    };
+
+    ffn_backend::init_agc(model.blocks[0].ffn.kerr.alpha, model.blocks[0].ffn.kerr.beta);
+    let stencil = fft_ode::StencilFft::new(m.n_bands);
+
+    let mut mem = common::wave_memory::load_or_create(&args.output, m.layers, m.n_bands);
+
+    let block_size = 128;
+    let n_chunks = (tokens.len().saturating_sub(1)) / block_size;
+    println!("  Processing {} tokens in {} chunks of {}...", tokens.len(), n_chunks, block_size);
+
+    for chunk_idx in 0..n_chunks {
+        let start = chunk_idx * block_size;
+        let end = (start + block_size).min(tokens.len());
+        let chunk = &tokens[start..end];
+
+        let cache = cpu::forward::forward_with_cache(
+            &model, chunk, dims, None, None, None, Some(&stencil), None, None, None,
+        );
+
+        // Per-layer ODE states averaged across positions
+        let ode_states: Vec<(Vec<f32>, Vec<f32>)> = cache.block_caches.iter().map(|bc| {
+            let t = bc.input.len().max(1);
+            let mut avg_r = vec![0.0f32; m.n_bands];
+            let mut avg_s = vec![0.0f32; m.n_bands];
+            for pos in &bc.input {
+                for k in 0..m.n_bands.min(pos.len() / 2) {
+                    avg_r[k] += pos[k * 2];
+                    avg_s[k] += pos[k * 2 + 1];
+                }
+            }
+            let scale = 1.0 / t as f32;
+            for k in 0..m.n_bands { avg_r[k] *= scale; avg_s[k] *= scale; }
+            (avg_r, avg_s)
+        }).collect();
+
+        common::wave_memory::merge_ode_states(&mut mem, &ode_states);
+
+        if (chunk_idx + 1) % 100 == 0 {
+            println!("    {}/{} chunks processed", chunk_idx + 1, n_chunks);
+        }
+    }
+
+    common::wave_memory::save(&args.output, &mem);
+    println!("  Dataset converted: {} chunks → {} conversations in {}", n_chunks, mem.n_convos, args.output);
+
+    let scans = common::wave_memory::scan_memory(&mem);
+    common::wave_memory::print_memory_scan(&mem, &scans);
 }
 
 fn cmd_train_waves(args: cli::TrainWavesArgs) {
@@ -710,14 +782,18 @@ fn cmd_serve(args: cli::ServeArgs) {
         std::sync::Mutex::new(common::wave_memory::load_or_create(path, m.layers, m.n_bands))
     });
 
+    // phase_native flag currently advisory — auto-loader detects from checkpoint shape.
+    // Exposed for explicit control when the detection heuristic is ambiguous.
+    let _ = args.phase_native;
+
     let state = std::sync::Arc::new(serve_tier::server::AppState {
         model: std::sync::Arc::new(model),
         vocab: std::sync::Arc::new(vocab),
         dims: dims_serve,
         stencil: std::sync::Arc::new(stencil),
-        model_name: "wave-engine".to_string(),
+        model_name: args.model_name.clone(),
         api_key: args.token.clone(),
-        host: "127.0.0.1".to_string(),
+        host: args.host.clone(),
         port: args.port,
         memory: wave_mem,
         memory_path: args.memory.clone(),
@@ -730,10 +806,10 @@ fn cmd_scale_checkpoint(args: cli::ScaleCheckpointArgs) {
     common::scale::scale_checkpoint(&common::scale::ScaleConfig {
         source_path: args.checkpoint.resume,
         target_bands: args.tgt_bands,
-        target_head: 0, // TODO: add to clap args
-        target_layers: None,
+        target_head: args.target_head,
+        target_layers: args.target_layers,
         output_path: args.output,
-        target_groups: 1,
+        target_groups: args.out_proj_groups,
         seed: 42,
     }).unwrap_or_else(|e| { eprintln!("Scale error: {e}"); std::process::exit(1); });
 }

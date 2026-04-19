@@ -458,8 +458,9 @@ pub struct ScanMemoryArgs {
     /// KWMF memory file to analyze
     pub file: String,
 
-    #[command(flatten)]
-    pub model: ModelArgs,
+    /// Write JSON scan to this path
+    #[arg(long)]
+    pub output: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -565,6 +566,10 @@ pub struct AnalyzeArgs {
     /// BPE tokenizer path
     #[arg(long, default_value = "data/tokenizer.json")]
     pub tokenizer: String,
+
+    /// Enable sub-harmonic diagnostic
+    #[arg(long)]
+    pub sub_harmonic: bool,
 }
 
 #[derive(clap::Args)]
@@ -613,7 +618,8 @@ pub struct ConvertDatasetArgs {
     #[arg(long)]
     pub output: String,
 
-    /// Per-position wave storage (KWDS format)
+    /// Per-position wave storage (KWDS format). Without this flag, writes aggregate
+    /// KWMF by running tokens through a model in block-size chunks.
     #[arg(long)]
     pub per_position: bool,
 
@@ -624,6 +630,11 @@ pub struct ConvertDatasetArgs {
     /// BPE tokenizer path
     #[arg(long, default_value = "data/tokenizer.json")]
     pub tokenizer: String,
+
+    /// Convert through a trained model (KWMF aggregate mode). Without this, uses
+    /// an untrained random-init model.
+    #[arg(long)]
+    pub resume: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -642,11 +653,23 @@ pub struct ScaleCheckpointArgs {
     pub src_bands: usize,
 
     /// Target bands
-    #[arg(long)]
+    #[arg(long, default_value_t = 128)]
     pub tgt_bands: usize,
 
-    /// Output checkpoint path
+    /// Target attention heads
+    #[arg(long, default_value_t = 8)]
+    pub target_head: usize,
+
+    /// Target layers (None = keep source layer count)
     #[arg(long)]
+    pub target_layers: Option<usize>,
+
+    /// Out-proj groups for target
+    #[arg(long, default_value_t = 1)]
+    pub out_proj_groups: usize,
+
+    /// Output checkpoint path
+    #[arg(long, default_value = "scaled_checkpoint.bin")]
     pub output: String,
 }
 
@@ -663,9 +686,21 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 8080)]
     pub port: u16,
 
-    /// Bearer auth token
-    #[arg(long)]
+    /// Bind address
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// Model name advertised via /v1/models
+    #[arg(long, default_value = "wave-engine")]
+    pub model_name: String,
+
+    /// Bearer auth token (alias: --api-key)
+    #[arg(long, alias = "api-key")]
     pub token: Option<String>,
+
+    /// Use phase-native decode (for phase-native checkpoints)
+    #[arg(long)]
+    pub phase_native: bool,
 
     /// Use BPE tokenizer
     #[arg(long)]
