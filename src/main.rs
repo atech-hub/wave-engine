@@ -95,6 +95,12 @@ pub use candle_tier::block_diag as block_diagonal;
 fn main() {
     use clap::Parser;
     let cli = cli::Cli::parse();
+
+    // Global --threads: init rayon pool before any subcommand runs.
+    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let n_threads = cli.threads.unwrap_or(available / 2).max(1);
+    rayon::ThreadPoolBuilder::new().num_threads(n_threads).build_global().ok();
+
     match cli.command {
         cli::Command::Train(args) => cmd_train(args),
         cli::Command::TrainWaves(args) => cmd_train_waves(args),
@@ -118,8 +124,8 @@ fn main() {
 // ─── Runtime init ──────────────────────────────────────────────
 
 fn init_runtime() {
-    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    rayon::ThreadPoolBuilder::new().num_threads(available / 2).build_global().ok();
+    // Thread pool already set by main() via --threads. This stays as a no-op
+    // banner so existing callers keep the startup log line.
     println!("wave-engine v0.1.0\n");
 }
 
@@ -419,14 +425,31 @@ fn cmd_train_waves(args: cli::TrainWavesArgs) {
 }
 
 fn cmd_train(args: cli::TrainArgs) {
-    // Init thread pool
+    // Init thread pool (banner only; pool set in main)
     init_runtime();
 
     let m = &args.model;
-    // Legacy --no-corrector is replaced by --corrector off. Preserve the
-    // no_corrector TrainConfig field for downstream code paths that still
-    // consult it directly.
-    let no_corrector = matches!(args.corrector, train::DynParam::Off);
+    // --no-corrector (legacy) OR --corrector off both disable the corrector.
+    let no_corrector = args.no_corrector || matches!(args.corrector, train::DynParam::Off);
+    let corrector = if args.no_corrector { train::DynParam::Off } else { args.corrector };
+
+    // Curriculum semantics: default ON (matches legacy). --no-curriculum disables.
+    // --curriculum kept as explicit opt-in for scripts that set it.
+    let use_curriculum = !args.no_curriculum;
+
+    // Candle path: --candle or --cuda-kernel routes to the candle training
+    // engine instead of the CPU path. Parity with legacy --candle dispatch.
+    if args.candle || args.cuda_kernel {
+        match candle_engine::engine::train_candle(
+            &args.data, args.iters,
+            m.n_bands, m.n_head, m.layers,
+            m.maestro_dim, crate::RK4_STEPS, m.out_proj_groups,
+            args.debug_nan, m.alpha, m.beta, args.chi, args.phase_native,
+        ) {
+            Ok(()) => return,
+            Err(e) => { eprintln!("Candle error: {e:?}"); std::process::exit(1); }
+        }
+    }
 
     train::run_training(train::TrainConfig {
         data_path: args.data,
@@ -438,7 +461,7 @@ fn cmd_train(args: cli::TrainArgs) {
         use_bpe: args.bpe,
         tokenizer_path: args.tokenizer,
         resume_path: args.resume,
-        use_curriculum: args.curriculum,
+        use_curriculum,
         use_gpu: args.gpu,
         use_monitor: args.monitor,
         out_proj_groups: m.out_proj_groups,
@@ -472,7 +495,7 @@ fn cmd_train(args: cli::TrainArgs) {
         wd: args.wd,
         harmonics: args.harmonics,
         agc_headroom: args.agc_headroom,
-        corrector: args.corrector,
+        corrector,
         split_band: args.split_band,
     });
 }

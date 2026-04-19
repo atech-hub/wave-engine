@@ -10,6 +10,10 @@ use clap::{Parser, Subcommand};
 #[command(about = "Research platform for wave-coherent neural architectures")]
 #[command(version)]
 pub struct Cli {
+    /// Rayon thread pool size (default: half available cores)
+    #[arg(long, global = true)]
+    pub threads: Option<usize>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -157,15 +161,23 @@ pub struct TrainArgs {
     #[arg(long)]
     pub cuda_kernel: bool,
 
-    /// Enable FWM (four-wave mixing)
-    #[arg(long, default_value_t = 0.0)]
+    /// Enable FWM (four-wave mixing). Alias: --fwm-strength.
+    #[arg(long, alias = "fwm-strength", default_value_t = 0.0)]
     pub chi: f32,
+
+    /// Candle per-layer NaN detection (~6x slower — diagnostic only)
+    #[arg(long)]
+    pub debug_nan: bool,
 
     /// Checkpoint output name
     #[arg(long)]
     pub checkpoint_name: Option<String>,
 
-    /// Enable curriculum training
+    /// Disable curriculum training (default: on)
+    #[arg(long)]
+    pub no_curriculum: bool,
+
+    /// Enable curriculum training (kept for explicit opt-in; default behaviour is ON)
     #[arg(long)]
     pub curriculum: bool,
 
@@ -274,6 +286,10 @@ pub struct TrainArgs {
     /// Corrector plate: dyn | off (default: dyn)
     #[arg(long, default_value = "dyn")]
     pub corrector: crate::cpu::train::DynParam,
+
+    /// Legacy alias: equivalent to --corrector off
+    #[arg(long)]
+    pub no_corrector: bool,
 }
 
 #[derive(clap::Args)]
@@ -652,8 +668,8 @@ pub struct ScaleCheckpointArgs {
     #[arg(long)]
     pub src_bands: usize,
 
-    /// Target bands
-    #[arg(long, default_value_t = 128)]
+    /// Target bands. Alias: --target-bands.
+    #[arg(long, alias = "target-bands", default_value_t = 128)]
     pub tgt_bands: usize,
 
     /// Target attention heads
