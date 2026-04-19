@@ -351,20 +351,24 @@ fn cmd_train(args: cli::TrainArgs) {
     init_runtime();
 
     let m = &args.model;
-    // Map clap args to TrainConfig
+    // Legacy --no-corrector is replaced by --corrector off. Preserve the
+    // no_corrector TrainConfig field for downstream code paths that still
+    // consult it directly.
+    let no_corrector = matches!(args.corrector, train::DynParam::Off);
+
     train::run_training(train::TrainConfig {
         data_path: args.data,
         n_iters: args.iters,
-        batch_size: 4, // TODO: add to clap
+        batch_size: args.batch,
         seq_len: args.seq,
         n_layers: m.layers,
         lr: args.lr,
         use_bpe: args.bpe,
         tokenizer_path: args.tokenizer,
-        resume_path: None, // TODO: add to clap
+        resume_path: args.resume,
         use_curriculum: args.curriculum,
-        use_gpu: false, // TODO: add to clap
-        use_monitor: false, // TODO: add to clap
+        use_gpu: args.gpu,
+        use_monitor: args.monitor,
         out_proj_groups: m.out_proj_groups,
         checkpoint_name: args.checkpoint_name.unwrap_or("checkpoint.bin".to_string()),
         n_bands: m.n_bands,
@@ -372,31 +376,31 @@ fn cmd_train(args: cli::TrainArgs) {
         maestro_dim: m.maestro_dim,
         alpha: m.alpha,
         beta: m.beta,
-        agc_ceiling: None,
-        log_name: None,
-        m1: None,
-        m2: None,
-        tied: false,
-        lm_rank: 0,
-        wave_decode: false,
-        unfreeze_phases: false,
-        health_interval: 0,
-        freeze_ode: false,
-        head_lr_floor: 0.0,
-        no_corrector: false,
-        layer_scale: train::DynParam::Off,
-        lr_scale: train::DynParam::Off,
+        agc_ceiling: args.agc_ceiling,
+        log_name: args.log_name,
+        m1: args.m1,
+        m2: args.m2,
+        tied: args.tied_embeddings,
+        lm_rank: args.lm_rank,
+        wave_decode: args.wave_decode,
+        unfreeze_phases: args.unfreeze_phases,
+        health_interval: args.health_interval,
+        freeze_ode: args.freeze_ode,
+        head_lr_floor: args.head_lr_floor,
+        no_corrector,
+        layer_scale: args.layer_scale,
+        lr_scale: args.lr_scale,
         phase_native: args.phase_native,
         fwm_strength: args.chi,
-        phase_temp: 1.0,
-        pythagorean: false,
-        spring_k: 0.1,
-        active_layers: None,
-        rk4_weights: train::DynParam::Off,
-        wd: train::DynParam::Off,
-        harmonics: if args.harmonics_dyn { train::DynParam::Dynamic } else { train::DynParam::Off },
-        agc_headroom: train::DynParam::Off,
-        corrector: train::DynParam::Dynamic,
+        phase_temp: args.phase_temp,
+        pythagorean: args.pythagorean,
+        spring_k: args.spring,
+        active_layers: args.active_layers,
+        rk4_weights: args.rk4_weights,
+        wd: args.wd,
+        harmonics: args.harmonics,
+        agc_headroom: args.agc_headroom,
+        corrector: args.corrector,
         split_band: args.split_band,
     });
 }

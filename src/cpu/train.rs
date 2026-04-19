@@ -119,3 +119,37 @@ impl DynParam {
     pub fn is_active(&self) -> bool { !matches!(self, DynParam::Off) }
     pub fn is_dynamic(&self) -> bool { matches!(self, DynParam::Dynamic) }
 }
+
+/// Parse `"off"`, `"dyn"`/`"dynamic"`, or CSV floats (e.g. `"1.0,0.8,1.0"`).
+/// Used by clap `value_parser` for --layer-scale, --lr-scale, etc.
+impl std::str::FromStr for DynParam {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let t = s.trim();
+        match t.to_ascii_lowercase().as_str() {
+            "off" | "none" | "" => Ok(DynParam::Off),
+            "dyn" | "dynamic" => Ok(DynParam::Dynamic),
+            _ => {
+                let parts: Result<Vec<f32>, _> =
+                    t.split(',').map(|v| v.trim().parse::<f32>()).collect();
+                match parts {
+                    Ok(v) if !v.is_empty() => Ok(DynParam::Fixed(v)),
+                    _ => Err(format!("expected 'off', 'dyn', or CSV floats, got '{}'", s)),
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DynParam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DynParam::Off => write!(f, "off"),
+            DynParam::Dynamic => write!(f, "dyn"),
+            DynParam::Fixed(v) => {
+                let s: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+                write!(f, "{}", s.join(","))
+            }
+        }
+    }
+}

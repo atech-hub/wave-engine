@@ -129,6 +129,14 @@ pub struct TrainArgs {
     #[arg(long, default_value_t = 128)]
     pub seq: usize,
 
+    /// Batch size
+    #[arg(long, default_value_t = 4)]
+    pub batch: usize,
+
+    /// Resume from checkpoint
+    #[arg(long)]
+    pub resume: Option<String>,
+
     /// Use phase-native loss
     #[arg(long)]
     pub phase_native: bool,
@@ -153,10 +161,6 @@ pub struct TrainArgs {
     #[arg(long, default_value_t = 0.0)]
     pub chi: f32,
 
-    /// Enable dynamic harmonics
-    #[arg(long)]
-    pub harmonics_dyn: bool,
-
     /// Checkpoint output name
     #[arg(long)]
     pub checkpoint_name: Option<String>,
@@ -168,6 +172,108 @@ pub struct TrainArgs {
     /// Split-band ODE integration (freeze-and-decouple). Phase A requires chi=0.
     #[arg(long)]
     pub split_band: bool,
+
+    /// Use wgpu GPU backend
+    #[arg(long)]
+    pub gpu: bool,
+
+    /// Enable pipeline monitor
+    #[arg(long)]
+    pub monitor: bool,
+
+    /// Custom training log filename
+    #[arg(long)]
+    pub log_name: Option<String>,
+
+    // ─── Architecture / encoding ───
+
+    /// Tied embeddings (wte reused as lm_head)
+    #[arg(long)]
+    pub tied_embeddings: bool,
+
+    /// Low-rank lm_head factorization (0 = full rank)
+    #[arg(long, default_value_t = 0)]
+    pub lm_rank: usize,
+
+    /// Wave-decode mode
+    #[arg(long)]
+    pub wave_decode: bool,
+
+    /// Train phase offsets as learnable parameters
+    #[arg(long)]
+    pub unfreeze_phases: bool,
+
+    /// Freeze ODE (identity shortcut — degrades gradients, for A/B only)
+    #[arg(long)]
+    pub freeze_ode: bool,
+
+    /// Pythagorean sphere encoding
+    #[arg(long)]
+    pub pythagorean: bool,
+
+    /// Custom modulus m1 for dual-modulus encoding
+    #[arg(long)]
+    pub m1: Option<usize>,
+
+    /// Custom modulus m2 for dual-modulus encoding
+    #[arg(long)]
+    pub m2: Option<usize>,
+
+    // ─── Training schedule / regularisation ───
+
+    /// Health-sample interval in iters (0 = disabled)
+    #[arg(long, default_value_t = 0)]
+    pub health_interval: usize,
+
+    /// Head LR floor for hypergradient (0 = disabled)
+    #[arg(long, default_value_t = 0.0)]
+    pub head_lr_floor: f32,
+
+    /// Phase-native loss temperature
+    #[arg(long, default_value_t = 1.0)]
+    pub phase_temp: f32,
+
+    /// AGC ceiling override (None = derive from alpha)
+    #[arg(long)]
+    pub agc_ceiling: Option<f32>,
+
+    /// Spring constant for dynamic params (0 = no spring)
+    #[arg(long, default_value_t = 0.1)]
+    pub spring: f32,
+
+    /// First N layers active at eq=1.0, rest dormant at eq=0.0
+    #[arg(long)]
+    pub active_layers: Option<usize>,
+
+    // ─── DynParam flags (off | dyn | CSV values) ───
+
+    /// Per-layer residual scaling: off | dyn | v1,v2,…
+    #[arg(long, default_value = "off")]
+    pub layer_scale: crate::cpu::train::DynParam,
+
+    /// Per-group LR scaling: off | dyn | v1,v2,…
+    #[arg(long, default_value = "off")]
+    pub lr_scale: crate::cpu::train::DynParam,
+
+    /// Per-layer RK4 combination weights: off | dyn
+    #[arg(long, default_value = "off")]
+    pub rk4_weights: crate::cpu::train::DynParam,
+
+    /// Weight decay: off | dyn | v1,v2,…
+    #[arg(long, default_value = "off")]
+    pub wd: crate::cpu::train::DynParam,
+
+    /// Learnable harmonic numbers: off | dyn | v1,v2,…
+    #[arg(long, default_value = "off")]
+    pub harmonics: crate::cpu::train::DynParam,
+
+    /// AGC headroom: off | dyn | v1,v2,…
+    #[arg(long, default_value = "off")]
+    pub agc_headroom: crate::cpu::train::DynParam,
+
+    /// Corrector plate: dyn | off (default: dyn)
+    #[arg(long, default_value = "dyn")]
+    pub corrector: crate::cpu::train::DynParam,
 }
 
 #[derive(clap::Args)]
