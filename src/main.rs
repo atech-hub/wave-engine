@@ -215,7 +215,7 @@ fn cmd_verify(args: cli::VerifyArgs) {
 
                     let (fwd, bwd, params, labels) = cpu::grad_check_wrapper::phase_native_check(
                         tokens, targets, m.layers, m.n_bands, m.n_head, m.vocab, m.alpha, m.beta,
-                        attn_path, ga.learnable_ode, ode_path, ga.split_band,
+                        attn_path, ga.learnable_ode, ode_path, ga.split_band, ga.learnable_attn,
                     );
                     let result = monitors::junctions::grad_check::check_gradients(
                         "phase-native", fwd, bwd, &params, &labels, config,
@@ -627,6 +627,7 @@ fn cmd_train(args: cli::TrainArgs) {
         split_band: args.split_band,
         ode_pathway,
         attention_pathway,
+        learnable_attn: args.learnable_attn,
         candle: args.candle,
         cuda_kernel: args.cuda_kernel,
         custom_op: args.custom_op || args.cuda_kernel, // --cuda-kernel implies --custom-op

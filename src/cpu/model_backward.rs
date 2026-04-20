@@ -55,6 +55,9 @@ pub struct Gradients {
     pub d_output_corrector: Vec<f32>,
     // Wave transduction gradients (self-contained)
     pub wd_grads: Option<crate::common::wave_decode::WaveDecodeGrads>,
+    /// Per-block attention weight gradients. `Some(_)` when dims.learnable_attn,
+    /// `None` otherwise (frozen attention). Populated by `wave_attention_backward_full`.
+    pub block_attn_grads: Vec<Option<crate::common::attn::WaveAttnGrads>>,
 }
 
 pub fn backward(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize], d: Dims, gpu: Option<&(dyn backend::ComputeBackend + Send + Sync)>, ping_pong: Option<(&ffn_gpu::FfnGpuBuffers, &gpu_pipelines::GpuBackend)>, full_gpu: Option<(&ffn_full_gpu::FfnFullBuffers, &gpu_pipelines::GpuBackend)>) -> (f32, Gradients) {
@@ -104,6 +107,7 @@ fn backward_impl(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize
         d_output_corrector: vec![],
         tied_temperature: 0.0,
         wd_grads: None, // populated by wave_decode::backward when active
+        block_attn_grads: vec![None; n_blocks],
     };
 
     let n_embd = d.n_embd;
@@ -371,12 +375,23 @@ fn backward_impl(model: &WavePacketModel, cache: &ForwardCache, targets: &[usize
         // ─── LN backward (shared LN) ───
         // When attention_pathway is on, combine FFN and attention contributions to d_normed.
         // When off, attention contribution is dropped (known bug #6, preserved for baseline).
+        // When learnable_attn is on, use the full backward so attention weight
+        // gradients are collected into `grads.block_attn_grads[block_idx]`.
         let d_normed_combined: Vec<Vec<f32>> = if d.attention_pathway {
-            let d_normed_from_attn = crate::common::attn::wave_attention_backward_pathway(
-                &block.attn,
-                bc.attn_pathway.as_ref().expect("attention_pathway requires populated cache"),
-                &d_ffn_out,
-            );
+            let attn_cache = bc.attn_pathway.as_ref()
+                .expect("attention_pathway requires populated cache");
+            let d_normed_from_attn: Vec<Vec<f32>> = if d.learnable_attn {
+                let full = crate::common::attn::wave_attention_backward_full(
+                    &block.attn, attn_cache, &d_ffn_out,
+                );
+                let d_normed_copy = full.d_normed.clone();
+                grads.block_attn_grads[block_idx] = Some(full);
+                d_normed_copy
+            } else {
+                crate::common::attn::wave_attention_backward_pathway(
+                    &block.attn, attn_cache, &d_ffn_out,
+                )
+            };
             (0..t).map(|pos| {
                 (0..d.n_embd).map(|j| d_normed_from_ffn[pos][j] + d_normed_from_attn[pos][j]).collect()
             }).collect()
@@ -624,6 +639,22 @@ pub fn flatten_grads_ex(grads: &Gradients, tied: bool) -> Vec<f32> {
         // Harmonic number gradients (when dynamic)
         if !grads.d_harmonic_raw[b].is_empty() {
             g.extend_from_slice(&grads.d_harmonic_raw[b]);
+        }
+        // Attention weight gradients (when learnable_attn). Order mirrors
+        // flatten_params_ex: per head (phase, v, content), then block-level
+        // out_proj. Harmonic_raw here lives under use_dyn_harmonics — no
+        // double-count (the flatten_params_ex layout follows the same gate).
+        if let Some(ref ag) = grads.block_attn_grads[b] {
+            for hg in &ag.heads {
+                for row in &hg.phase_proj_w { g.extend_from_slice(row); }
+                g.extend_from_slice(&hg.phase_proj_b);
+                for row in &hg.v_proj_w { g.extend_from_slice(row); }
+                g.extend_from_slice(&hg.v_proj_b);
+                for row in &hg.content_proj_w { g.extend_from_slice(row); }
+                g.extend_from_slice(&hg.content_proj_b);
+            }
+            for row in &ag.out_proj_w { g.extend_from_slice(row); }
+            g.extend_from_slice(&ag.out_proj_b);
         }
     }
     if !grads.layer_scale.is_empty() {

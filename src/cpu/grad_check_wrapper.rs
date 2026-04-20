@@ -62,6 +62,31 @@ pub fn build_section_labels(model: &WavePacketModel) -> SectionLabels {
             ranges.push((idx, format!("block_{}_harmonic_raw", b)));
             idx += block.attn.heads.len();
         }
+        if model.learnable_attn {
+            let n_embd = model.ln_f.weight.len();
+            let head_dim = n_embd / block.attn.heads.len();
+            for (h, head) in block.attn.heads.iter().enumerate() {
+                ranges.push((idx, format!("block_{}_h{}_phase_proj_w", b, h)));
+                idx += 2 * n_embd;
+                ranges.push((idx, format!("block_{}_h{}_phase_proj_b", b, h)));
+                idx += 2;
+                ranges.push((idx, format!("block_{}_h{}_v_proj_w", b, h)));
+                idx += head_dim * head_dim;
+                ranges.push((idx, format!("block_{}_h{}_v_proj_b", b, h)));
+                idx += head_dim;
+                if !head.content_proj_w.is_empty() {
+                    let content_dim = head.content_proj_w.len();
+                    ranges.push((idx, format!("block_{}_h{}_content_proj_w", b, h)));
+                    idx += content_dim * n_embd;
+                    ranges.push((idx, format!("block_{}_h{}_content_proj_b", b, h)));
+                    idx += content_dim;
+                }
+            }
+            ranges.push((idx, format!("block_{}_attn_out_proj_w", b)));
+            idx += block.attn.out_proj_w.len() * n_embd;
+            ranges.push((idx, format!("block_{}_attn_out_proj_b", b)));
+            idx += block.attn.out_proj_b.len();
+        }
     }
     if model.use_layer_scale {
         ranges.push((idx, "layer_scale".to_string()));
@@ -100,6 +125,7 @@ pub fn phase_native_check(
     learnable_ode: bool,
     ode_pathway: bool,
     split_band: bool,
+    learnable_attn: bool,
 ) -> (
     impl Fn(&[f32]) -> f64,
     impl Fn(&[f32]) -> (f32, Vec<f32>),
@@ -111,7 +137,8 @@ pub fn phase_native_check(
         .with_corrector(learnable_ode || ode_pathway) // corrector on when ODE backward is active
         .with_attention_pathway(attention_pathway)
         .with_ode_pathway(ode_pathway)
-        .with_split_band(split_band);
+        .with_split_band(split_band)
+        .with_learnable_attn(learnable_attn);
     let mut model = init_model(vocab_size, 42, n_layers, 1, dims, alpha, beta);
     model.phase_native = true;
     model.output_corrector = vec![0.0; n_bands];

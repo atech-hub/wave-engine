@@ -311,6 +311,124 @@ pub fn wave_attention_forward(
 /// (flag --attention-pathway). Calls shared primitives from attn_backward.rs.
 ///
 /// Returns d_normed_from_attention shaped [t][n_embd].
+/// Per-head attention weight gradients. Matches the layout flatten_params_ex
+/// uses when `learnable_attn` is true, so the training loop can drop these
+/// straight into the flat gradient vector.
+#[derive(Clone)]
+pub struct WaveAttnHeadGrads {
+    pub phase_proj_w: Vec<Vec<f32>>,
+    pub phase_proj_b: Vec<f32>,
+    pub v_proj_w: Vec<Vec<f32>>,
+    pub v_proj_b: Vec<f32>,
+    pub content_proj_w: Vec<Vec<f32>>, // empty when content projection absent
+    pub content_proj_b: Vec<f32>,
+    pub d_harmonic_raw: f32,
+}
+
+/// Full attention gradient bundle — per-head weight grads plus block-level
+/// out_proj grads plus `d_normed` (the pathway contribution to the input).
+#[derive(Clone)]
+pub struct WaveAttnGrads {
+    pub heads: Vec<WaveAttnHeadGrads>,
+    pub out_proj_w: Vec<Vec<f32>>,
+    pub out_proj_b: Vec<f32>,
+    pub d_normed: Vec<Vec<f32>>,
+}
+
+/// Full attention backward: computes `d_normed` AND all attention weight
+/// gradients. Use this path when `dims.learnable_attn` is true so Adam has
+/// gradients to update attention with. For the frozen-attention default,
+/// `wave_attention_backward_pathway` stays the cheaper option (weight grads
+/// are discarded anyway). The math is identical — every step the pathway
+/// version runs, this one runs too; the only extra work is keeping the
+/// weight-grad tensors the pathway version was already computing and
+/// ignoring via `_`.
+pub fn wave_attention_backward_full(
+    weights: &WaveAttnWeights,
+    cache: &WaveAttnCache,
+    d_attn_out: &[Vec<f32>],
+) -> WaveAttnGrads {
+    let n_bands = cache.n_bands;
+    let n_embd = n_bands * 2;
+    let n_head = weights.heads.len();
+    let head_dim = n_embd / n_head;
+    let t = d_attn_out.len();
+
+    use super::attn_backward as ab;
+
+    let (d_out, d_op_w, d_op_b) = ab::out_proj_backward(
+        d_attn_out, &cache.out_merged, &weights.out_proj_w, n_embd,
+    );
+    let d_heads = ab::split_heads(&d_out, n_head, head_dim);
+
+    let mut d_x_from_phase_all = Vec::with_capacity(n_head);
+    let mut d_x_from_v_all = Vec::with_capacity(n_head);
+    let mut d_x_from_content_all = Vec::with_capacity(n_head);
+    let mut head_grads = Vec::with_capacity(n_head);
+
+    for h in 0..n_head {
+        let raw = weights.heads[h].harmonic_raw;
+        let harmonic_n = super::math::softplus(raw);
+        let sigmoid_raw = 1.0 / (1.0 + (-raw).exp()); // d softplus(raw) / d raw
+        let offset = h * head_dim;
+
+        let (d_att_w, d_v_all) = ab::value_aggregation_backward(
+            &d_heads[h], &cache.att_w[h], &cache.v_all[h],
+        );
+        let d_scores = ab::softmax_backward(&d_att_w, &cache.att_w[h]);
+
+        let cv_opt = if !cache.content_vecs[h].is_empty() {
+            Some(cache.content_vecs[h].as_slice())
+        } else {
+            None
+        };
+        let (d_delta, d_content_opt, d_harmonic_n) = ab::score_backward(
+            &d_scores, &cache.phases[h], harmonic_n, &cache.att_w[h], cv_opt, cache.content_scale[h],
+        );
+
+        let d_phases = ab::phase_subtraction_backward(&d_delta, &cache.att_w[h]);
+
+        let (d_x_phase, d_pp_w, d_pp_b) = ab::phase_projection_backward(
+            &d_phases, &cache.normed,
+            &weights.heads[h].phase_proj_w, &weights.heads[h].phase_proj_b, n_embd,
+        );
+        let (d_x_v, d_vp_w, d_vp_b) = ab::value_projection_backward(
+            &d_v_all, &cache.normed, offset, head_dim, n_embd, &weights.heads[h].v_proj_w,
+        );
+        let (d_x_content, d_cp_w, d_cp_b) = if let Some(ref dcv) = d_content_opt {
+            let (d_x_c, d_cw, d_cb) = ab::content_projection_backward(
+                dcv, &cache.normed, &weights.heads[h].content_proj_w, n_embd,
+            );
+            (d_x_c, d_cw, d_cb)
+        } else {
+            (vec![vec![0.0f32; n_embd]; t], vec![], vec![])
+        };
+
+        d_x_from_phase_all.push(d_x_phase);
+        d_x_from_v_all.push(d_x_v);
+        d_x_from_content_all.push(d_x_content);
+
+        head_grads.push(WaveAttnHeadGrads {
+            phase_proj_w: d_pp_w,
+            phase_proj_b: d_pp_b,
+            v_proj_w: d_vp_w,
+            v_proj_b: d_vp_b,
+            content_proj_w: d_cp_w,
+            content_proj_b: d_cp_b,
+            d_harmonic_raw: d_harmonic_n * sigmoid_raw,
+        });
+    }
+
+    let d_normed = ab::combine_d_normed(&d_x_from_phase_all, &d_x_from_v_all, &d_x_from_content_all, t, n_embd);
+
+    WaveAttnGrads {
+        heads: head_grads,
+        out_proj_w: d_op_w,
+        out_proj_b: d_op_b,
+        d_normed,
+    }
+}
+
 pub fn wave_attention_backward_pathway(
     weights: &WaveAttnWeights,
     cache: &WaveAttnCache,

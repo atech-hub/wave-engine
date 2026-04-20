@@ -193,6 +193,11 @@ pub struct TrainArgs {
     #[arg(long)]
     pub split_band: bool,
 
+    /// Train attention weights (phase_proj, v_proj, out_proj, harmonic_raw).
+    /// Content projection stays frozen by design. Default: frozen attention.
+    #[arg(long)]
+    pub learnable_attn: bool,
+
     /// Use wgpu GPU backend
     #[arg(long)]
     pub gpu: bool,
@@ -624,6 +629,10 @@ pub struct VerifyGradArgs {
     /// Split-band ODE integration (freeze-and-decouple). Phase A requires chi=0.
     #[arg(long)]
     pub split_band: bool,
+
+    /// Include attention weights in the grad check (requires learnable attention build)
+    #[arg(long)]
+    pub learnable_attn: bool,
 }
 
 #[derive(clap::Args)]

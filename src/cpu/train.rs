@@ -107,6 +107,7 @@ pub struct TrainConfig {
     pub split_band: bool,       // --split-band: freeze-and-decouple ODE integration
     pub ode_pathway: bool,      // --no-ode-pathway disables real Jacobian (identity shortcut)
     pub attention_pathway: bool,// --no-attention-pathway disables d_normed from attention
+    pub learnable_attn: bool,   // --learnable-attn: attention weights trainable + serialized
     // ─── Candle tier flags (ignored on CPU/wgpu tiers) ───
     pub candle: bool,           // --candle: route training through Candle tensor ops
     pub cuda_kernel: bool,      // --cuda-kernel: fused CUDA kernel (implies candle)
