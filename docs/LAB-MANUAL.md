@@ -1,6 +1,6 @@
 # Wave-Engine Lab Manual
 
-**Version:** 1.0 — April 19, 2026
+**Version:** 1.1 — April 20, 2026
 **Engine:** wave-engine (Rust, Apache 2.0, [github.com/atech-hub/wave-engine](https://github.com/atech-hub/wave-engine))
 **Hardware requirement:** Any machine with a Rust toolchain. GPU optional (wgpu for AMD/Intel/NVIDIA; Candle for NVIDIA CUDA).
 
@@ -32,21 +32,24 @@ Each transformer block contains: layer norm → parallel attention and FFN branc
 ## 1.2 Subcommands
 
 ```
-wave-engine train           Standard token-prediction training
-wave-engine train-waves     Wave-space training (L2 loss on ODE states)
-wave-engine generate        Token-based text generation
-wave-engine wave-generate   Generation from wave-trained checkpoints
-wave-engine encode          Phase encoding, relate pairs, vocabulary scan
-wave-engine galaxy-scan     Geometric inventory of a checkpoint
-wave-engine verify grad     Junction monitor: gradient correctness (J1)
-wave-engine analyze         Checkpoint analysis and diagnostics
-wave-engine ode-monitor     Per-band magnitude/phase inspection
-wave-engine phase-decode    Compare phase-native vs lm_head decoding
-wave-engine convert-dataset Create KWDS/KWMF format datasets
-wave-engine recommend       Architecture sizing recommendations
-wave-engine scale-checkpoint Scale checkpoint to different dimensions
-wave-engine serve           Inference server (OpenAI-compatible API)
+wave-engine train             Standard token-prediction training
+wave-engine train-waves       Wave-space training from KWDS dataset (L2 loss on ODE states)
+wave-engine generate          Token-based text generation
+wave-engine wave-generate     Generation from wave-trained checkpoints
+wave-engine encode            Phase encoding, relate pairs, vocabulary scan
+wave-engine scan-memory       Analyze KWMF wave memory files (JSON output)
+wave-engine galaxy-scan       Geometric inventory of a trained checkpoint
+wave-engine verify grad       Junction monitor: gradient correctness (J1)
+wave-engine analyze           Checkpoint analysis and diagnostics (incl. sub-harmonic)
+wave-engine ode-monitor       Per-band magnitude/phase inspection, prompt comparison
+wave-engine phase-decode      Compare phase-native vs lm_head decoding
+wave-engine convert-dataset   Create KWDS (per-position) or KWMF (aggregate) format datasets
+wave-engine recommend         Architecture sizing recommendations from dataset
+wave-engine scale-checkpoint  Scale checkpoint to different band/head/layer dimensions
+wave-engine serve             Inference server (OpenAI-compatible API, requires --features serve)
 ```
+
+**Global flag:** `--threads N` sets the Rayon thread pool size (default: half available cores). Applies to all subcommands.
 
 ## 1.3 Training Controls
 
@@ -78,13 +81,63 @@ These are the experimental variables. Changing one while holding others constant
 | `--lr` | 3e-4 | Learning rate |
 | `--iters` | 10000 | Training iterations |
 | `--seq` | 128 | Sequence length |
+| `--batch` | 4 | Batch size |
+| `--resume` | — | Resume training from checkpoint file |
 | `--phase-native` | off | Use phase-native loss instead of cross-entropy through lm_head |
 | `--bpe` | off | Use BPE tokenizer instead of character-level |
-| `--curriculum` | off | Enable curriculum training schedule |
-| `--split-band` | off | Freeze-and-decouple ODE integration (cleaner gradients) |
-| `--chi 0.03` | — | Enable four-wave mixing (requires chi=0 for split-band Phase A) |
+| `--tokenizer` | data/tokenizer.json | BPE tokenizer path (used with --bpe) |
+| `--curriculum` | on | Curriculum training schedule (default behaviour) |
+| `--no-curriculum` | — | Disable curriculum training |
+| `--split-band` | off | Freeze-and-decouple ODE integration (cleaner gradients, requires chi=0) |
+| `--chi` | 0.0 | Four-wave mixing strength (alias: `--fwm-strength`) |
 | `--candle` | off | Use Candle/CUDA backend |
 | `--cuda-kernel` | off | Use fused CUDA kernel (implies --candle) |
+| `--gpu` | off | Use wgpu GPU backend |
+| `--monitor` | off | Enable pipeline monitor (per-section timing) |
+| `--log-name` | — | Custom training log filename |
+| `--checkpoint-name` | — | Custom checkpoint output name |
+| `--debug-nan` | off | Candle per-layer NaN detection (~6× slower, diagnostic only) |
+
+### Architecture & encoding flags
+
+| Flag | Default | What it controls |
+|------|---------|-----------------|
+| `--tied-embeddings` | off | Reuse input embeddings (wte) as lm_head |
+| `--lm-rank` | 0 | Low-rank lm_head factorisation (0 = full rank) |
+| `--wave-decode` | off | Wave-decode mode |
+| `--unfreeze-phases` | off | Train phase offsets as learnable parameters |
+| `--freeze-ode` | off | Identity shortcut (degrades gradients — for A/B comparison only) |
+| `--pythagorean` | off | Pythagorean sphere encoding |
+| `--m1` | — | Custom modulus m1 for dual-modulus encoding |
+| `--m2` | — | Custom modulus m2 for dual-modulus encoding |
+
+### Training schedule & regularisation
+
+| Flag | Default | What it controls |
+|------|---------|-----------------|
+| `--spring` | 0.1 | Spring constant pulling dynamic params toward home value (0 = no spring) |
+| `--active-layers` | — | Only first N layers active at eq=1.0, rest dormant |
+| `--head-lr-floor` | 0.0 | Minimum LR for hypergradient (0 = disabled) |
+| `--phase-temp` | 1.0 | Temperature for phase-native loss |
+| `--agc-ceiling` | — | AGC ceiling override (default: derived from α as √(π/2 / (α + 4β))) |
+| `--health-interval` | 0 | Health-sample interval in iterations (0 = disabled) |
+
+### DynParam flags
+
+These accept three forms: `off` (disabled), `dyn` (learnable with spring regulation), or a comma-separated list of per-layer values (e.g., `1.0,1.5,1.5,0.5`).
+
+| Flag | Default | What it controls |
+|------|---------|-----------------|
+| `--layer-scale` | off | Per-layer residual scaling |
+| `--lr-scale` | off | Per-group learning rate scaling |
+| `--rk4-weights` | off | Per-layer RK4 combination weights |
+| `--wd` | off | Weight decay |
+| `--harmonics` | off | Learnable harmonic numbers |
+| `--agc-headroom` | off | AGC headroom |
+| `--corrector` | dyn | Corrector plate (per-band phase correction after ODE) |
+| `--no-corrector` | — | Disable corrector plate (alias for --corrector off) |
+
+**Note on DynParam with learnable attention:** per-layer LR scaling (`--lr-scale`) becomes particularly relevant when learnable ODE parameters and attention parameters coexist in each layer — different parameter groups may need different learning rates. The spring constant (`--spring`) prevents runaway values. These were previously tested on the pre-fix engine; results on the corrected gradient engine may differ significantly.
 
 ### Pathway flags
 
@@ -115,6 +168,16 @@ wave-engine train data/grammar_lesson_1.txt \
     --alpha 0.1 --beta 0.2 --chi 0.03 \
     --lr 0.001 --iters 80000 --seq 128 \
     --phase-native --vocab 77
+```
+
+### Example: DynParam training with per-layer control
+
+```bash
+wave-engine train data/arithmetic.txt \
+    --n-bands 84 --n-head 4 --layers 4 \
+    --lr 0.001 --iters 40000 --phase-native \
+    --layer-scale dyn --lr-scale 1.0,1.5,1.5,0.5 \
+    --spring 0.2 --active-layers 2
 ```
 
 ## 1.4 Component Monitors (17)
@@ -202,6 +265,73 @@ Reads the dataset, computes vocabulary size, checks two independent bottlenecks,
 2. **Attention bottleneck:** positions_per_head < 40, head_dim ≥ 16
 
 Both must be satisfied simultaneously. Fixing one without the other gives zero accuracy gain.
+
+## 1.9 Other Subcommands
+
+### Wave-space training
+
+```bash
+wave-engine train-waves data/dataset.kwds \
+    --n-bands 84 --layers 4 --lr 3e-4 --iters 10000 --seq 64
+```
+
+Trains on wave-space representations (KWDS format) using L2 loss on ODE output states instead of token-prediction cross-entropy. The model learns to reproduce the phase and magnitude structure directly. Use `convert-dataset` to create KWDS files from text data.
+
+### Wave-space generation
+
+```bash
+wave-engine wave-generate --resume wave_trained.bin \
+    --data data/input.txt --prompt "3+4="
+```
+
+Generation from wave-trained checkpoints. Supports `--wave-diagnose` for per-band phase/magnitude diagnostic output and `--teacher-force <kwds_file>` for teacher-forced accuracy measurement.
+
+### Dataset conversion
+
+```bash
+# Create KWDS (per-position wave states) for wave-space training
+wave-engine convert-dataset data/input.txt --output data/dataset.kwds --per-position
+
+# Create KWMF (aggregate wave state) through a trained model
+wave-engine convert-dataset data/input.txt --output data/aggregate.kwmf --resume checkpoint.bin
+```
+
+Two modes: `--per-position` creates KWDS files storing per-position ODE states for wave-space training. Without `--per-position`, creates aggregate KWMF files by running tokens through a model in block-size chunks. Use `--resume` to convert through a trained model instead of random-init.
+
+### Scale checkpoint
+
+```bash
+wave-engine scale-checkpoint --resume checkpoint_168dim.bin \
+    --src-bands 84 --tgt-bands 128 --target-head 8 --output scaled.bin
+```
+
+Scales a trained checkpoint to different dimensions (bands, heads, layers). Useful for progressive dimensional scaling — train at small dimension, scale up, continue training. Supports `--target-layers` to change depth and `--out-proj-groups` for the target output projection.
+
+### Analyze
+
+```bash
+wave-engine analyze --resume checkpoint.bin --data data/input.txt
+wave-engine analyze --resume checkpoint.bin --data data/input.txt --sub-harmonic
+```
+
+Checkpoint analysis and diagnostics. The `--sub-harmonic` flag enables sub-harmonic diagnostic mode for additional frequency analysis.
+
+### Inference server
+
+```bash
+# Basic server
+wave-engine serve --resume checkpoint.bin --data data/input.txt --port 8080
+
+# With wave memory and API auth
+wave-engine serve --resume checkpoint.bin --data data/input.txt \
+    --memory memory.kwmf --token sk-your-key --host 0.0.0.0
+
+# BPE model with phase-native decode
+wave-engine serve --resume bpe_model.bin --bpe --tokenizer data/tokenizer.json \
+    --phase-native --model-name "wave-bpe"
+```
+
+OpenAI-compatible API server (requires `cargo build --features serve`). Supports streaming and non-streaming completions, wave memory accumulation, bearer auth, custom model name, and bind address. Compatible with LM Studio, Open WebUI, and any OpenAI-compatible client.
 
 ---
 
@@ -319,9 +449,10 @@ The hidden coherence probe extends the search by computing MRL with shifted offs
 
 ```bash
 wave-engine scan-memory path/to/memory.kwmf
+wave-engine scan-memory path/to/memory.kwmf --output scan_results.json
 ```
 
-The wave memory file (1.5KB persistent harmonic band state) stores accumulated experience as r_k/s_k per band per layer. The scan-memory command takes the KWMF file as a positional argument and runs the same harmonic census tools used for model analysis during training, applied to the memory state. This reveals what the model has accumulated — which bands have shifted, which remain at baseline, whether the distribution looks healthy or distorted. Optional flags (`--n-bands`, `--layers`, etc.) are used if the memory's implied model shape differs from the defaults.
+The wave memory file (1.5KB persistent harmonic band state) stores accumulated experience as r_k/s_k per band per layer. The scan-memory command takes the KWMF file as a positional argument and runs the same harmonic census tools used for model analysis during training, applied to the memory state. This reveals what the model has accumulated — which bands have shifted, which remain at baseline, whether the distribution looks healthy or distorted. Use `--output` for JSON export.
 
 ---
 
