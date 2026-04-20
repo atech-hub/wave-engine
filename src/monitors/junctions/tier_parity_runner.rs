@@ -228,6 +228,15 @@ pub fn run_cpu_vs_candle_parity(
         crate::candle_tier::custom_attn::custom_attn::create_attn_grad_storage(n_layers),
     );
 
+    // Route Candle's ODE through the CustomOp that calls into the canonical
+    // CPU `ode_forward_with_cache`, so the ODE step matches CPU bit-exactly.
+    // Without this, Candle uses its autograd tensor-ops RK4 (ode.rs) which is
+    // a separate implementation of the same math and will diverge in f32.
+    candle_model.use_custom_op = true;
+    candle_model.ode_param_grads = Some(
+        crate::candle_tier::custom_ode::custom_ode::create_param_grad_storage(n_layers),
+    );
+
     let logits_tensor = candle_model.forward(tokens)
         .map_err(|e| format!("CandleWaveModel::forward failed: {e:?}"))?;
     let candle_logits: Vec<Vec<f32>> = logits_tensor.to_vec2::<f32>()

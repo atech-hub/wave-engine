@@ -90,44 +90,45 @@ pub mod forward {
                 let mae_in = block.mae_in_pr.forward(&mae_in)?;
                 let precond = (&ffn_input + &mae_in)?;
 
-                // AGC knee compression — differentiable (preserves autograd chain)
-                // Extract magnitude for EMA update (detached from graph)
-                // but apply clamping through tensor ops (on the graph)
+                // AGC: route through the canonical CPU implementation
+                // (common::agc::OdeAgc::process — knee-compress on the excess
+                // above threshold). The former Candle-side tensor-ops AGC used
+                // `min(1, threshold/mag)` which differs from knee-compress
+                // whenever compression is active; J10 caught that divergence.
+                //
+                // Backward: we use the straight-through estimator
+                //     precond_new = precond + (precond_scaled - precond).detach()
+                // so forward takes the knee-compressed value while backward
+                // treats AGC as identity — matching CPU's `ffn_forward_via_backend`
+                // (which also has no AGC term in its backward).
                 let precond = {
                     let n_b = self.n_bands;
-                    let n_e = self.n_embd;
 
-                    // Update AGC EMA state from detached magnitudes (no grad needed for EMA)
-                    let pv_detach: Vec<Vec<f32>> = precond.detach().to_vec2()?;
-                    let mags: Vec<f32> = pv_detach.iter().flat_map(|pos| {
-                        (0..n_b).map(move |k| (pos[k*2]*pos[k*2] + pos[k*2+1]*pos[k*2+1]).sqrt())
-                    }).collect();
-                    let threshold = if let Some(ref mut agcs) = self.layer_agcs {
-                        agcs[block_idx].observe(&mags);
-                        agcs[block_idx].stats().threshold
+                    // Detach → CPU → [n_pos][n_embd] for the mutating AGC call.
+                    let pv_flat = precond.detach().flatten_all()?.to_vec1::<f32>()?;
+                    let mut pv: Vec<Vec<f32>> = (0..n_pos)
+                        .map(|p| pv_flat[p * self.n_embd..(p + 1) * self.n_embd].to_vec())
+                        .collect();
+
+                    // Canonical AGC: observe + knee-compress, in-place. Per-layer
+                    // AGC when available, global fallback otherwise — same branch
+                    // logic the CPU path uses.
+                    if let Some(ref mut agcs) = self.layer_agcs {
+                        let _ = agcs[block_idx].process(&mut pv, n_b);
                     } else {
-                        let mut agc = crate::ffn_backend::AGC.get().unwrap().lock().unwrap();
-                        agc.observe(&mags);
-                        agc.stats().threshold
-                    };
+                        let mut agc = crate::ffn_backend::AGC.get()
+                            .expect("ffn_backend::AGC must be initialised before forward")
+                            .lock().unwrap();
+                        let _ = agc.process(&mut pv, n_b);
+                    }
 
-                    // Apply clamping through differentiable tensor ops (on the autograd graph)
-                    let reshaped = precond.reshape((n_pos, n_b, 2))?;
-                    let r = reshaped.narrow(2, 0, 1)?.squeeze(2)?;
-                    let s = reshaped.narrow(2, 1, 1)?.squeeze(2)?;
-                    let mag_sq = (&r * &r)?.add(&(&s * &s)?)?;
-                    let mag = (mag_sq + 1e-12 as f64)?.sqrt()?;
-                    // scale = min(1.0, threshold / mag) — knee compression as differentiable min
-                    let thresh_tensor = (mag.zeros_like()? + threshold as f64)?;
-                    let raw_scale = (thresh_tensor / &mag)?;
-                    let ones = raw_scale.ones_like()?;
-                    let scale = raw_scale.minimum(&ones)?;
-                    // Apply scale to r, s (gradient flows through scale computation)
-                    let r_scaled = (r * &scale)?;
-                    let s_scaled = (s * &scale)?;
-                    let r_exp = r_scaled.unsqueeze(2)?;
-                    let s_exp = s_scaled.unsqueeze(2)?;
-                    Tensor::cat(&[&r_exp, &s_exp], 2)?.reshape((n_pos, n_e))?
+                    // Rebuild as a Candle tensor (new leaf; detached from graph).
+                    let flat: Vec<f32> = pv.into_iter().flatten().collect();
+                    let scaled = Tensor::from_vec(flat, (n_pos, self.n_embd), precond.device())?;
+
+                    // Straight-through: value = scaled, grad w.r.t. precond = 1.
+                    let diff = (&scaled - &precond)?.detach();
+                    (&precond + diff)?
                 };
 
                 if self.debug_nan {
@@ -396,37 +397,27 @@ pub mod forward {
                 let mae_in = block.mae_in_pr.forward(&mae_in)?;
                 let precond = (&ffn_input + &mae_in)?;
 
-                // AGC
-                // AGC — differentiable (same as main forward)
+                // AGC — canonical CPU implementation + straight-through estimator
+                // (see main forward for the rationale). Keeps forward matching
+                // common::agc and backward matching CPU's identity treatment.
                 let precond = {
                     let n_b = self.n_bands;
-                    let n_e = self.n_embd;
-                    let pv_detach: Vec<Vec<f32>> = precond.detach().to_vec2()?;
-                    let mags: Vec<f32> = pv_detach.iter().flat_map(|pos| {
-                        (0..n_b).map(move |k| (pos[k*2]*pos[k*2] + pos[k*2+1]*pos[k*2+1]).sqrt())
-                    }).collect();
-                    let threshold = if let Some(ref mut agcs) = self.layer_agcs {
-                        agcs[block_idx].observe(&mags);
-                        agcs[block_idx].stats().threshold
+                    let pv_flat = precond.detach().flatten_all()?.to_vec1::<f32>()?;
+                    let mut pv: Vec<Vec<f32>> = (0..n_pos)
+                        .map(|p| pv_flat[p * self.n_embd..(p + 1) * self.n_embd].to_vec())
+                        .collect();
+                    if let Some(ref mut agcs) = self.layer_agcs {
+                        let _ = agcs[block_idx].process(&mut pv, n_b);
                     } else {
-                        let mut agc = crate::ffn_backend::AGC.get().unwrap().lock().unwrap();
-                        agc.observe(&mags);
-                        agc.stats().threshold
-                    };
-                    let reshaped = precond.reshape((n_pos, n_b, 2))?;
-                    let r = reshaped.narrow(2, 0, 1)?.squeeze(2)?;
-                    let s = reshaped.narrow(2, 1, 1)?.squeeze(2)?;
-                    let mag_sq = (&r * &r)?.add(&(&s * &s)?)?;
-                    let mag = (mag_sq + 1e-12 as f64)?.sqrt()?;
-                    let thresh_tensor = (mag.zeros_like()? + threshold as f64)?;
-                    let raw_scale = (thresh_tensor / &mag)?;
-                    let ones = raw_scale.ones_like()?;
-                    let scale = raw_scale.minimum(&ones)?;
-                    let r_scaled = (r * &scale)?;
-                    let s_scaled = (s * &scale)?;
-                    let r_exp = r_scaled.unsqueeze(2)?;
-                    let s_exp = s_scaled.unsqueeze(2)?;
-                    Tensor::cat(&[&r_exp, &s_exp], 2)?.reshape((n_pos, n_e))?
+                        let mut agc = crate::ffn_backend::AGC.get()
+                            .expect("ffn_backend::AGC must be initialised before forward")
+                            .lock().unwrap();
+                        let _ = agc.process(&mut pv, n_b);
+                    }
+                    let flat: Vec<f32> = pv.into_iter().flatten().collect();
+                    let scaled = Tensor::from_vec(flat, (n_pos, self.n_embd), precond.device())?;
+                    let diff = (&scaled - &precond)?.detach();
+                    (&precond + diff)?
                 };
 
                 // ── ODE with monitoring ──
