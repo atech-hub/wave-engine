@@ -7,7 +7,8 @@ pub mod train {
     use std::time::Instant;
 
     use crate::candle_tier::candle_model::model::CandleWaveModel;
-    use crate::candle_tier::candle_attention::attention::harmonic_backward;
+    // harmonic_backward retired — harmonic grads now come from the
+    // WaveAttentionCustomOp shared storage (custom_attn::take_attn_param_grads).
     use crate::candle_tier::candle_checkpoint::checkpoint::{load_wchk_params_into_varmap, extract_wchk_params};
     use crate::candle_tier::candle_monitors::monitors::{
         CandleMonitorData, CandleOutputDist, CandleGradientFlow,
@@ -73,6 +74,10 @@ pub mod train {
         model.debug_nan = debug_nan;
         model.use_custom_op = use_custom_op;
         model.use_cuda_kernel = use_cuda_kernel;
+        // Attention CustomOp runs every forward; its gradient sink is always needed.
+        model.attn_param_grads = Some(
+            crate::candle_tier::custom_attn::custom_attn::create_attn_grad_storage(n_layers),
+        );
         if use_custom_op {
             model.ode_param_grads = Some(crate::candle_tier::custom_ode::custom_ode::create_param_grad_storage(n_layers));
             if use_cuda_kernel {
@@ -337,44 +342,30 @@ pub mod train {
                         grad_flow = Some(compute_gradient_flow(&grads, &varmap, n_layers));
                     }
 
-                    // ── Harmonic backward (manual, outside autograd) ──
-                    // Extract d_contribution from grad graph, compute d_harmonic_raw per head,
-                    // apply gradient + spring to harmonic_raws, sync harmonic_ns.
+                    // ── Harmonic grads from WaveAttentionCustomOp::bwd ──
+                    // Each block's CustomOp wrote d_harmonic_raws into the shared
+                    // Arc<Mutex> storage during autograd backward. Pull them out
+                    // and apply the update + spring. d_normed from attention has
+                    // already flowed through autograd into upstream params.
                     if use_harmonics_dyn {
                         let eq_fn = |h: usize| -> f32 { ((h + 1) as f32 * 0.5f32).ln() };
                         let spring_k_harm = 2.0f32; // very stiff — integer harmonics theoretically motivated
 
-                        for block in model.blocks.iter_mut() {
-                            if !block.harmonic_dyn { continue; }
-
-                            // Extract gradient of contribution tensor from GradStore
-                            let d_out_cpu = if let Some(ref layer_out) = block.cached_layer_output {
-                                grads.get(layer_out).map(|g| g.to_vec2::<f32>().ok()).flatten()
-                            } else {
-                                None
-                            };
-
-                            if let Some(d_out) = d_out_cpu {
-                                let d_hr = harmonic_backward(block, &d_out, n_embd);
-
-                                for h in 0..block.harmonic_ns.len() {
-                                    // Gradient step
-                                    block.harmonic_ns[h] -= (current_lr as f32) * d_hr[h];
-                                    // Spring pull toward equilibrium
-                                    let eq = eq_fn(h);
-                                    block.harmonic_ns[h] -= (current_lr as f32) * spring_k_harm * (block.harmonic_ns[h] - eq);
+                        if let Some(ref attn_grads) = model.attn_param_grads {
+                            for (block_idx, block) in model.blocks.iter_mut().enumerate() {
+                                if !block.harmonic_dyn { continue; }
+                                let pg = crate::candle_tier::custom_attn::custom_attn::take_attn_param_grads(
+                                    attn_grads, block_idx,
+                                );
+                                if let Some(pg) = pg {
+                                    for h in 0..block.harmonic_ns.len() {
+                                        block.harmonic_ns[h] -= (current_lr as f32) * pg.d_harmonic_raws[h];
+                                        let eq = eq_fn(h);
+                                        block.harmonic_ns[h] -= (current_lr as f32) * spring_k_harm
+                                            * (block.harmonic_ns[h] - eq);
+                                    }
                                 }
-
-                                // Sync: harmonic_ns = softplus(harmonic_raws)
-                                // Since harmonic_ns stores the raw values (confusing name, but matches CPU tier),
-                                // and softplus is applied at use-time in wave_attention, no sync needed here.
-                                // The update above directly modifies the raw values.
                             }
-
-                            // Clear caches to free memory
-                            block.cached_att_weights = None;
-                            block.cached_normed_cpu = None;
-                            block.cached_layer_output = None;
                         }
                     }
 

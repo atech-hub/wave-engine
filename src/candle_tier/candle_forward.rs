@@ -49,6 +49,11 @@ pub mod forward {
             }
             let mut hidden = Tensor::from_vec(hidden_vecs, (n_pos, n_embd), &self.device)?;
 
+            // Attention-param gradient sink (shared Arc<Mutex>) cloned once so the
+            // borrow of `self.blocks` below doesn't conflict with reading self.
+            let attn_grads = self.attn_param_grads.clone()
+                .expect("attn_param_grads must be initialised before forward (train_candle sets it)");
+
             for (block_idx, block) in self.blocks.iter_mut().enumerate() {
                 let normed = layer_norm(&hidden, &block.ln_w, &block.ln_b)?;
                 if self.debug_nan {
@@ -57,21 +62,19 @@ pub mod forward {
                     }
                 }
 
-                // Cache normed input on CPU when harmonics dyn (for manual backward)
-                if block.harmonic_dyn {
-                    block.cached_normed_cpu = Some(normed.to_vec2::<f32>()?);
-                }
-
-                // Attention (frozen, CPU scoring, GPU out_proj)
-                let (attn_out, att_weights) = wave_attention(
+                // Attention: CustomOp connects normed → out_tensor in autograd, then
+                // out_proj matmul outside the op. Harmonic gradients (when dyn) are
+                // written to `attn_grads[block_idx]` during bwd.
+                let (attn_out, _att_weights) = wave_attention(
                     &normed,
                     &block.phase_proj_ws_cpu, &block.phase_proj_bs_cpu,
                     &block.v_proj_ws_cpu, &block.v_proj_bs_cpu,
                     &block.harmonic_ns,
                     &block.attn_out_proj_w, &block.attn_out_proj_b,
+                    attn_grads.clone(),
+                    block_idx,
                     block.harmonic_dyn,
                 )?;
-                block.cached_att_weights = att_weights;
 
                 // FFN (trained) — soft-mask inactive bands (curriculum)
                 // Attention sees full normed (frozen, routes only).
@@ -228,10 +231,8 @@ pub mod forward {
 
                 // Parallel residual: hidden + scale * (attn_out + ffn_out)
                 let contribution = (&attn_out + &ffn_out)?;
-                // Cache contribution tensor for harmonic backward (gradient extraction)
-                if block.harmonic_dyn {
-                    block.cached_layer_output = Some(contribution.clone());
-                }
+                // Harmonic grads now flow via WaveAttentionCustomOp::bwd — no need
+                // to cache the contribution tensor for a post-backward walk.
                 hidden = if let Some(ref scale) = block.layer_scale {
                     (&hidden + contribution.broadcast_mul(scale)?)?
                 } else {

@@ -42,6 +42,9 @@ pub mod model {
         pub use_custom_op: bool,  // true = CustomOp ODE (no autograd graph, CPU backward)
         pub use_cuda_kernel: bool, // true = CUDA native kernel (GPU forward, CPU backward)
         pub ode_param_grads: Option<crate::candle_tier::custom_ode::custom_ode::SharedParamGrads>,
+        /// Shared attention-param grads populated by WaveAttentionCustomOp::bwd.
+        /// One slot per block; optimizer reads it after loss.backward().
+        pub attn_param_grads: Option<crate::candle_tier::custom_attn::custom_attn::SharedAttnGrads>,
 
         pub device: Device,
 
@@ -74,11 +77,10 @@ pub mod model {
         pub v_proj_ws_cpu: Vec<Vec<Vec<f32>>>,       // [n_head][head_dim][head_dim]
         pub v_proj_bs_cpu: Vec<Vec<f32>>,            // [n_head][head_dim]
 
-        // Harmonics dyn — attention cache for manual backward
-        pub harmonic_dyn: bool,                                    // --harmonics dyn active
-        pub cached_att_weights: Option<Vec<Vec<Vec<f32>>>>,        // [n_head][t][t] post-softmax
-        pub cached_normed_cpu: Option<Vec<Vec<f32>>>,              // [t][n_embd] block input (normed)
-        pub cached_layer_output: Option<Tensor>,                   // layer output tensor (on grad graph)
+        // Harmonics dyn — gate on whether the custom_attn harmonic grad is applied
+        // in the optimizer step. The forward path no longer branches on this; the
+        // CustomOp always computes d_harmonic_raws, we just choose whether to use them.
+        pub harmonic_dyn: bool,
 
         // FFN (trained via VarMap)
         pub mae_in_sq: Linear,
@@ -201,9 +203,6 @@ pub mod model {
                     harmonic_init: harmonic_ns.clone(),
                     harmonic_ns, attn_out_proj_w, attn_out_proj_b,
                     harmonic_dyn: false,  // set by train_candle when --harmonics dyn
-                    cached_att_weights: None,
-                    cached_normed_cpu: None,
-                    cached_layer_output: None,
                     mae_in_sq, mae_in_pr, ode_params, gpu_ode_params, phase_correction,
                     mae_out_sq, mae_out_pr, out_proj,
                     layer_scale: None, // set by --layer-scale dyn
@@ -228,7 +227,7 @@ pub mod model {
             };
 
             Ok(Self { wte, wpe, blocks, ln_f_w, ln_f_b, lm_head, output_corrector, phase_native,
-                layer_agcs: None, use_custom_op: false, use_cuda_kernel: false, ode_param_grads: None, device: device.clone(),
+                layer_agcs: None, use_custom_op: false, use_cuda_kernel: false, ode_param_grads: None, attn_param_grads: None, device: device.clone(),
                 n_bands: n_bands_cfg, n_embd: n_embd_cfg, n_head: n_head_cfg, block_size: block_size_cfg, debug_nan: false })
         }
     }
