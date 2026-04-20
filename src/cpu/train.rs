@@ -77,6 +77,7 @@ pub struct TrainConfig {
     pub n_bands: usize,
     pub n_head: usize,
     pub maestro_dim: usize,
+    pub vocab_size: usize,      // authoritative vocab for wte/decode (CLI --vocab)
     pub alpha: f32,
     pub beta: f32,
     pub agc_ceiling: Option<f32>, // None = auto-derive from alpha

@@ -84,17 +84,24 @@ pub fn run(config: &TrainConfig) {
         .with_learnable_attn(config.learnable_attn);
 
     // ── Model init / resume ──────────────────────────────────────
-    let vocab_size = config.n_bands.max(1); // wave training doesn't use vocab for decoding; any >0 is fine
+    // Authoritative vocab from TrainConfig. Wave training doesn't use lm_head
+    // (phase-native by construction) but `model.wte` has this many rows and
+    // wave-generate decodes against that table — so vocab must match the
+    // char-map size used when the KWDS was built, otherwise argmax lands on
+    // token IDs outside the char map and decode returns blanks.
+    let vocab_size = config.vocab_size;
     let mut model;
     let mut start_iter = 0usize;
     let mut optimizer;
     let mut rng = crate::rng::Rng::new(1337);
 
     model = init_model(vocab_size, 42, config.n_layers, config.out_proj_groups, dims, config.alpha, config.beta);
-    model.phase_native = config.phase_native;
-    if config.phase_native {
-        model.output_corrector = vec![0.0; n_bands];
-    }
+    // Wave training is phase-native by construction — the loss is L2 on ODE
+    // output states, there's no decoder to attach. Force phase_native=true
+    // regardless of config.phase_native to avoid the lm_head ghost path that
+    // bloats the param vector by vocab×n_embd (never referenced by backward_wave).
+    model.phase_native = true;
+    model.output_corrector = vec![0.0; n_bands];
 
     if let Some(ref ckpt) = config.resume_path {
         println!("Resuming from checkpoint: {ckpt}");
