@@ -1,6 +1,6 @@
 # Wave-Engine Lab Manual
 
-**Version:** 1.1 — April 20, 2026
+**Version:** 1.2 — April 20, 2026
 **Engine:** wave-engine (Rust, Apache 2.0, [github.com/atech-hub/wave-engine](https://github.com/atech-hub/wave-engine))
 **Hardware requirement:** Any machine with a Rust toolchain. GPU optional (wgpu for AMD/Intel/NVIDIA; Candle for NVIDIA CUDA).
 
@@ -97,6 +97,8 @@ These are the experimental variables. Changing one while holding others constant
 | `--log-name` | — | Custom training log filename |
 | `--checkpoint-name` | — | Custom checkpoint output name |
 | `--debug-nan` | off | Candle per-layer NaN detection (~6× slower, diagnostic only) |
+| `--learnable-attn` | off | Train attention weights (phase_proj, v_proj, out_proj, harmonic_raw). Content projection stays frozen. CPU tier today; Candle-side wiring pending (#152). |
+| `--wave-loss` | off | Train on a KWDS wave dataset with L2 loss on ODE output states. Positional DATA arg becomes the KWDS file path. Shares the main training loop — all other flags (split-band, pathway, monitors) still apply. CPU tier only today (#153). |
 
 ### Architecture & encoding flags
 
@@ -226,17 +228,49 @@ These verify correctness at component boundaries. They do not run during normal 
 **Running J1 (gradient check):**
 
 ```bash
-# Standard check (sampled parameters, section-aware)
-wave-engine verify grad --scope sampled --split-band
+# Standard check (sampled parameters, section-aware) on CPU
+wave-engine verify grad phase-native --scope sampled --split-band
 
 # Exhaustive check at tiny scale
-wave-engine verify grad --scope tiny --eps 1e-3 --verbose
+wave-engine verify grad phase-native --scope tiny --eps 1e-3 --verbose
 
 # Check with specific pathways disabled
-wave-engine verify grad --no-ode-pathway
+wave-engine verify grad phase-native --no-ode-pathway
+
+# Include attention weights in the check (learnable-attention mode)
+wave-engine verify grad phase-native --learnable-attn --split-band
+
+# Run J1 through Candle's autograd (requires candle-backend feature build)
+cargo build --release --features candle-backend
+wave-engine verify grad phase-native --tier candle --scope tiny \
+    --n-bands 4 --n-head 2 --layers 1 --vocab 15
 ```
 
+**J1 tiers:** CPU is the default and primary. `--tier candle` runs the same framework through Candle's autograd; the monitor framework is tier-agnostic. Use CPU for routine verification; Candle J1 is for checking that the Candle backward chain agrees with FD on its own terms.
+
 **J1 section-aware interpretation:** output-adjacent sections (output_corrector, ln_f, ln_w) must pass at the specified tolerance. ODE-adjacent sections (mae_in, mae_out weights) will show higher max_err due to the stiff-ODE Jacobian product — this is mathematically expected (see Pattern 149) and documented, not gated.
+
+**Running J10 (tier parity):**
+
+```bash
+# CPU vs wgpu forward parity (43 sections per 4-layer model)
+wave-engine verify tier-parity --tier wgpu \
+    --n-bands 84 --n-head 4 --layers 4 --vocab 15 --seq 16
+
+# CPU vs Candle forward parity (final logits — Candle emits one section)
+wave-engine verify tier-parity --tier candle --n-bands 84 --n-head 4 --layers 4 --vocab 15
+
+# With split-band ODE integration
+wave-engine verify tier-parity --tier wgpu --split-band --n-bands 84 --n-head 4 --layers 4 --vocab 15
+```
+
+**Verified tier parity** (84 bands, 4L, seed 42, seq 16, as of 2026-04-20):
+- CPU vs wgpu, monolithic ODE: 43 sections, 74,224 elements, 0 violations, max abs 3.05e-5
+- CPU vs wgpu, split-band: 43 sections, 74,224 elements, 0 violations
+- CPU vs Candle, monolithic ODE: 1 section, 240 elements, 0 violations, max abs 2.29e-5
+- CPU vs Candle, split-band: 1 section, 240 elements, 0 violations
+
+All divergence is floating-point rounding noise. Both GPU tiers match CPU within f32 precision.
 
 ## 1.6 Baselines
 
@@ -270,12 +304,36 @@ Both must be satisfied simultaneously. Fixing one without the other gives zero a
 
 ### Wave-space training
 
+Two equivalent invocations:
+
 ```bash
+# Canonical: --wave-loss on the train subcommand. Full shared-infrastructure
+# path — split-band, pathway flags, NaN guard, stall detector, JSONL
+# telemetry, periodic checkpoints, proper Adam state on resume.
+wave-engine train data/dataset.kwds --wave-loss \
+    --n-bands 84 --n-head 4 --layers 4 --vocab 15 \
+    --alpha 0.1 --beta 0.2 --lr 1e-4 --iters 40000 --seq 32 \
+    --split-band \
+    --checkpoint-name wave_trained.bin
+
+# Backward-compat alias: train-waves subcommand builds the same TrainConfig
+# and dispatches to the same wave_training::run function.
 wave-engine train-waves data/dataset.kwds \
-    --n-bands 84 --layers 4 --lr 3e-4 --iters 10000 --seq 64
+    --n-bands 84 --layers 4 --lr 1e-4 --iters 40000 --seq 32
 ```
 
-Trains on wave-space representations (KWDS format) using L2 loss on ODE output states instead of token-prediction cross-entropy. The model learns to reproduce the phase and magnitude structure directly. Use `convert-dataset` to create KWDS files from text data.
+Trains on wave-space representations (KWDS format) using L2 loss on ODE output states instead of token-prediction cross-entropy. The model learns to reproduce the phase and magnitude structure directly. Use `convert-dataset --per-position` to create KWDS files from text data.
+
+**What wave training honours** (same flag surface as token training):
+`--split-band`, `--no-ode-pathway`, `--no-attention-pathway`, `--learnable-attn`, `--freeze-ode`, `--corrector`, all DynParam flags (`--layer-scale`, `--lr-scale`, `--wd`, etc.), `--active-layers`, `--spring`, `--agc-ceiling`, `--agc-headroom`, `--health-interval`, `--resume` (with Adam state restored), `--log-name`, `--checkpoint-name`.
+
+**What wave training doesn't have yet** (follow-ups tracked):
+- GPU backends (`--gpu`, `--candle`) — CPU only today (#153)
+- Full 17-monitor suite — several monitors read token targets (#150 close note)
+- Curriculum band masking — semantics need a separate decision for continuous loss
+- `batch_size > 1` — currently single-batch (serial KWDS read per iter)
+
+**Phase-native is forced.** Wave training is phase-native by construction (L2 loss on ODE output states; there's no decoder to attach an lm_head to). The flag is hardcoded inside `wave_training::run` regardless of `--phase-native` on the CLI.
 
 ### Wave-space generation
 
