@@ -1,77 +1,57 @@
-//! Harmonic coherence attention — CPU scoring wrapped in a Candle CustomOp1
-//! so the autograd graph stays intact through the CPU boundary. Bug-#6
-//! equivalent on Candle (attention's `d_normed` contribution used to be lost
-//! because `x.to_vec2` severed the graph) is closed by this wrapper.
+//! Harmonic coherence attention — CustomOp wrapper that routes through the
+//! canonical `common::attn::wave_attention_forward` + `wave_attention_backward_pathway`.
+//! Parity with CPU is by construction: same code path, same weights (via the
+//! block's CPU caches), same phase-hashed sparse scoring + content projection.
 
 #[cfg(feature = "candle-backend")]
 pub mod attention {
     use candle_core::{Device, Result, Tensor};
 
+    use crate::candle_tier::candle_model::model::CandleBlock;
     use crate::candle_tier::custom_attn::custom_attn::{
         SharedAttnGrads, WaveAttentionCustomOp,
     };
+    use crate::common::attn::{WaveAttnHeadWeights, WaveAttnWeights};
 
-    // ─── Harmonic Coherence Attention ───
-    // Forward is `normed → out_tensor` via CustomOp (CPU, autograd-connected),
-    // then `out_proj` as a regular Candle matmul (autograd-tracked).
-
+    /// Run wave attention for one block on the Candle autograd graph.
+    ///
+    /// The CustomOp consumes a full `WaveAttnWeights` (same struct as CPU) and
+    /// runs the shared `wave_attention_forward` internally. No out_proj matmul
+    /// outside the op: the shared forward already applies it, and the shared
+    /// backward handles its gradient within the op's `bwd`.
     pub fn wave_attention(
         x: &Tensor,
-        pp_ws_cpu: &[Vec<Vec<f32>>],
-        pp_bs_cpu: &[Vec<f32>],
-        vw_cpu: &[Vec<Vec<f32>>],
-        vb_cpu: &[Vec<f32>],
-        harmonic_ns: &[f32],
-        out_proj_w: &Tensor,
-        out_proj_b: &Tensor,
+        block: &CandleBlock,
+        n_bands: usize,
         attn_param_grads: SharedAttnGrads,
         layer_idx: usize,
-        store_attn_weights: bool, // kept for signature compat; attn weights taken off the op when needed
-    ) -> Result<(Tensor, Option<Vec<Vec<Vec<f32>>>>)> {
-        let (_n_pos, n_embd) = x.dims2()?;
+    ) -> Result<Tensor> {
+        let n_head = block.harmonic_ns.len();
+        let heads: Vec<WaveAttnHeadWeights> = (0..n_head).map(|h| WaveAttnHeadWeights {
+            harmonic_raw: block.harmonic_ns[h],
+            phase_proj_w: block.phase_proj_ws_cpu[h].clone(),
+            phase_proj_b: block.phase_proj_bs_cpu[h].clone(),
+            v_proj_w: block.v_proj_ws_cpu[h].clone(),
+            v_proj_b: block.v_proj_bs_cpu[h].clone(),
+            content_proj_w: block.content_proj_ws_cpu.get(h).cloned().unwrap_or_default(),
+            content_proj_b: block.content_proj_bs_cpu.get(h).cloned().unwrap_or_default(),
+        }).collect();
+        let weights = WaveAttnWeights {
+            heads,
+            out_proj_w: block.attn_out_proj_w_cpu.clone(),
+            out_proj_b: block.attn_out_proj_b_cpu.clone(),
+        };
 
-        let op = WaveAttentionCustomOp::new(
-            pp_ws_cpu.to_vec(),
-            pp_bs_cpu.to_vec(),
-            vw_cpu.to_vec(),
-            vb_cpu.to_vec(),
-            harmonic_ns.to_vec(),
-            n_embd,
-            layer_idx,
-            attn_param_grads,
-        );
+        let op = WaveAttentionCustomOp::new(weights, n_bands, layer_idx, attn_param_grads);
 
-        // CustomOp runs on CPU — round-trip the input if it lives on a GPU.
+        // CustomOp runs on CPU; round-trip the tensor if it lives elsewhere.
+        // apply_op1 preserves the autograd graph — the op's bwd is the
+        // registered backward for the x_cpu → out_cpu edge, so `d_normed`
+        // enters the grad store before LN backward consumes it.
         let device = x.device().clone();
-        let x_cpu = if matches!(device, Device::Cpu) {
-            x.clone()
-        } else {
-            x.to_device(&Device::Cpu)?
-        };
-
-        // The autograd graph lives here: apply_op1 connects x_cpu → out_cpu with
-        // WaveAttentionCustomOp::bwd as the registered backward. Moving back to
-        // the original device preserves the graph (to_device is autograd-tracked).
+        let x_cpu = if matches!(device, Device::Cpu) { x.clone() } else { x.to_device(&Device::Cpu)? };
         let out_cpu = x_cpu.apply_op1(op)?;
-        // Taking att weights off the op requires holding a reference to it, which
-        // we cannot do because apply_op1 consumes the op. If a caller needs the
-        // softmax weights for monitoring, we would need a separate scoring pass
-        // or to expose them via a second shared Arc. None of the current monitors
-        // read them post-fix, so we return None for now.
-        let _ = store_attn_weights;
-        let att_weights: Option<Vec<Vec<Vec<f32>>>> = None;
-
-        let out_tensor = if matches!(device, Device::Cpu) {
-            out_cpu
-        } else {
-            out_cpu.to_device(&device)?
-        };
-
-        // out_proj: regular Candle matmul. Autograd handles the backward to
-        // out_proj_w / out_proj_b and to out_tensor (which flows back through
-        // the CustomOp's bwd into d_normed).
-        let projected = out_tensor.matmul(&out_proj_w.t()?)?.broadcast_add(out_proj_b)?;
-        Ok((projected, att_weights))
+        let attn_out = if matches!(device, Device::Cpu) { out_cpu } else { out_cpu.to_device(&device)? };
+        Ok(attn_out)
     }
-
 }

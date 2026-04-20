@@ -76,6 +76,16 @@ pub mod model {
         pub phase_proj_bs_cpu: Vec<Vec<f32>>,        // [n_head][2]
         pub v_proj_ws_cpu: Vec<Vec<Vec<f32>>>,       // [n_head][head_dim][head_dim]
         pub v_proj_bs_cpu: Vec<Vec<f32>>,            // [n_head][head_dim]
+        // Frozen content projection (symmetry-breaker) — matches CPU's
+        // `WaveAttnHeadWeights.content_proj_w/b`. Empty `Vec`s mean "no content
+        // bias" (pure harmonic coherence); non-empty adds a content-dependent
+        // attention bias. Populated in parity-runner via copy from CPU model;
+        // initialised empty in CandleWaveModel::new until Candle training
+        // owns the init stream alignment.
+        pub content_proj_ws_cpu: Vec<Vec<Vec<f32>>>, // [n_head][CONTENT_DIM][n_embd]
+        pub content_proj_bs_cpu: Vec<Vec<f32>>,      // [n_head][CONTENT_DIM]
+        pub attn_out_proj_w_cpu: Vec<Vec<f32>>,      // [n_embd][n_embd] — cached for shared backward
+        pub attn_out_proj_b_cpu: Vec<f32>,           // [n_embd]
 
         // Harmonics dyn — gate on whether the custom_attn harmonic grad is applied
         // in the optimizer step. The forward path no longer branches on this; the
@@ -196,10 +206,23 @@ pub mod model {
                     candle_nn::Init::Const(0.0),
                 )?;
 
+                // Pre-flatten attn_out_proj to CPU Vec for the shared backward
+                // path (common::attn::wave_attention_backward_pathway reads
+                // out_proj_w as Vec<Vec<f32>>).
+                let attn_op_w_flat = attn_out_proj_w.flatten_all()?.to_vec1::<f32>()?;
+                let attn_out_proj_w_cpu: Vec<Vec<f32>> = (0..n_embd)
+                    .map(|i| attn_op_w_flat[i * n_embd..(i + 1) * n_embd].to_vec())
+                    .collect();
+                let attn_out_proj_b_cpu: Vec<f32> = attn_out_proj_b.flatten_all()?.to_vec1::<f32>()?;
+
                 blocks.push(CandleBlock {
                     ln_w, ln_b,
                     phase_proj_ws, phase_proj_bs, v_proj_ws, v_proj_bs,
                     phase_proj_ws_cpu, phase_proj_bs_cpu, v_proj_ws_cpu, v_proj_bs_cpu,
+                    content_proj_ws_cpu: vec![vec![]; n_head],
+                    content_proj_bs_cpu: vec![vec![]; n_head],
+                    attn_out_proj_w_cpu,
+                    attn_out_proj_b_cpu,
                     harmonic_init: harmonic_ns.clone(),
                     harmonic_ns, attn_out_proj_w, attn_out_proj_b,
                     harmonic_dyn: false,  // set by train_candle when --harmonics dyn

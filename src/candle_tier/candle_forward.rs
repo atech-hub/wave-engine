@@ -65,15 +65,12 @@ pub mod forward {
                 // Attention: CustomOp connects normed → out_tensor in autograd, then
                 // out_proj matmul outside the op. Harmonic gradients (when dyn) are
                 // written to `attn_grads[block_idx]` during bwd.
-                let (attn_out, _att_weights) = wave_attention(
+                let attn_out = wave_attention(
                     &normed,
-                    &block.phase_proj_ws_cpu, &block.phase_proj_bs_cpu,
-                    &block.v_proj_ws_cpu, &block.v_proj_bs_cpu,
-                    &block.harmonic_ns,
-                    &block.attn_out_proj_w, &block.attn_out_proj_b,
+                    block,
+                    self.n_bands,
                     attn_grads.clone(),
                     block_idx,
-                    block.harmonic_dyn,
                 )?;
 
                 // FFN (trained) — soft-mask inactive bands (curriculum)
