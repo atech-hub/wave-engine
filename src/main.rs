@@ -155,11 +155,31 @@ fn cmd_verify(args: cli::VerifyArgs) {
 
             match ga.mode.as_str() {
                 "phase-native" => {
-                    println!("Gradient check: phase-native, {}L, {}bands, {}head", m.layers, m.n_bands, m.n_head);
+                    println!("Gradient check: phase-native, {}L, {}bands, {}head  [tier={}]",
+                        m.layers, m.n_bands, m.n_head, ga.tier);
                     let tokens: Vec<usize> = (0..8).map(|i| i % m.vocab).collect();
                     let targets: Vec<usize> = (1..9).map(|i| i % m.vocab).collect();
 
-                    // ─── Component monitors: gradient flow analysis ───
+                    if ga.tier.as_str() == "candle" {
+                        // Candle J1: autograd analytical grads vs FD. Cross-
+                        // entropy loss (matches Candle training). ODE runs on
+                        // autograd tensor ops so every param gets a real grad
+                        // (use_custom_op defaults to false in CandleWaveModel::new).
+                        let label = format!("phase-native-candle");
+                        let (fwd, bwd, params, labels) =
+                            run_candle_phase_native_check(
+                                tokens.clone(), targets.clone(),
+                                m.layers, m.n_bands, m.n_head, m.vocab, m.alpha, m.beta,
+                            );
+                        let result = monitors::junctions::grad_check::check_gradients(
+                            &label, fwd, bwd, &params, &labels, config,
+                        );
+                        monitors::junctions::grad_check::print_result(&result);
+                        if !result.passed() { std::process::exit(1); }
+                        return;
+                    }
+
+                    // ─── CPU tier: component monitors + CPU grad check ───
                     {
                         let dims = Dims::from_cli(m.n_bands, m.n_head, 16, 128, 16)
                             .with_learnable_ode(ga.learnable_ode)
@@ -225,6 +245,47 @@ fn cmd_verify(args: cli::VerifyArgs) {
         }
         cli::VerifyCommand::TierParity(tp) => cmd_verify_tier_parity(tp),
     }
+}
+
+// Thin feature gate for the Candle phase-native grad check. Default build
+// errors out with a build hint; candle-backend build routes to the real one.
+#[cfg(feature = "candle-backend")]
+fn run_candle_phase_native_check(
+    tokens: Vec<usize>, targets: Vec<usize>,
+    n_layers: usize, n_bands: usize, n_head: usize, vocab_size: usize,
+    alpha: f32, beta: f32,
+) -> (
+    impl Fn(&[f32]) -> f64,
+    impl Fn(&[f32]) -> (f32, Vec<f32>),
+    Vec<f32>,
+    monitors::junctions::grad_check::SectionLabels,
+) {
+    candle_tier::candle_grad_check::grad_check::phase_native_check_candle(
+        tokens, targets, n_layers, n_bands, n_head, vocab_size, alpha, beta,
+    )
+}
+
+#[cfg(not(feature = "candle-backend"))]
+fn run_candle_phase_native_check(
+    _tokens: Vec<usize>, _targets: Vec<usize>,
+    _n_layers: usize, _n_bands: usize, _n_head: usize, _vocab_size: usize,
+    _alpha: f32, _beta: f32,
+) -> (
+    impl Fn(&[f32]) -> f64,
+    impl Fn(&[f32]) -> (f32, Vec<f32>),
+    Vec<f32>,
+    monitors::junctions::grad_check::SectionLabels,
+) {
+    eprintln!("verify grad --tier candle requires: cargo build --features candle-backend");
+    std::process::exit(2);
+    // Unreachable — keep the type signature happy with never-returning fns.
+    #[allow(unreachable_code)]
+    (
+        |_: &[f32]| -> f64 { unreachable!() },
+        |_: &[f32]| -> (f32, Vec<f32>) { unreachable!() },
+        Vec::new(),
+        monitors::junctions::grad_check::SectionLabels::new(Vec::new()),
+    )
 }
 
 fn cmd_verify_tier_parity(args: cli::VerifyTierParityArgs) {

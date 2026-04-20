@@ -10,3 +10,4 @@ pub mod block_diag;
 pub mod custom_ode;
 pub mod custom_attn;
 pub mod cuda_ode;
+pub mod candle_grad_check;

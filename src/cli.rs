@@ -574,6 +574,10 @@ pub struct VerifyGradArgs {
     #[arg(default_value = "phase-native")]
     pub mode: String,
 
+    /// Tier to check: cpu | candle. Candle requires --features candle-backend.
+    #[arg(long, default_value = "cpu")]
+    pub tier: String,
+
     #[command(flatten)]
     pub model: ModelArgs,
 
