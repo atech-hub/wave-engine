@@ -637,11 +637,19 @@ fn cmd_train(args: cli::TrainArgs) {
 
     // Candle path routes through candle_tier. Everything else runs the CPU/wgpu loop.
     if config.candle || config.cuda_kernel {
-        let ffn = common::ffn_config::FfnConfig::from_flags(
+        if config.learnable_attn {
+            eprintln!("--learnable-attn is currently CPU-only. Candle-side weight-grad \
+                       wiring is planned but not yet implemented. Use CPU for the A/B \
+                       validation experiment; scale to Candle after CPU confirms the \
+                       approach.");
+            std::process::exit(2);
+        }
+        let ffn = common::ffn_config::FfnConfig::from_flags_with_attn(
             config.ode_pathway,
             config.split_band,
             config.freeze_ode,
             !config.no_corrector,
+            config.learnable_attn,
         );
         match candle_engine::engine::train_candle(&config, &ffn) {
             Ok(()) => return,

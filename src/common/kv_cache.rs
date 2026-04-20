@@ -202,6 +202,7 @@ pub fn prefill(
             split_band: false,
             freeze_ode: true,
             use_corrector: dims.use_corrector,
+            learnable_attn: false,
         };
         let (ffn_out, _) = crate::ffn_backend::ffn_forward_via_backend(
             &block.ffn, &normed_ffn, &crate::backend::CpuBackend,
@@ -341,6 +342,7 @@ pub fn forward_one(
             split_band: false,
             freeze_ode: true,
             use_corrector: dims.use_corrector,
+            learnable_attn: false,
         };
         let (ffn_out, _) = crate::ffn_backend::ffn_forward_via_backend(
             &block.ffn, &[normed_ffn], &crate::backend::CpuBackend,

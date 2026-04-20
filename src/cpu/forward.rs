@@ -102,6 +102,7 @@ pub fn forward_with_cache(
             split_band: d.split_band,
             freeze_ode: !d.learnable_ode,
             use_corrector: d.use_corrector,
+            learnable_attn: d.learnable_attn,
         };
         let layer_mem = memory_offsets.and_then(|offsets| offsets.get(block_idx).copied());
         let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, &cfg, agc_for_layer, layer_mem);
@@ -230,6 +231,7 @@ pub fn forward_with_cache_from_waves(
             split_band: d.split_band,
             freeze_ode: !d.learnable_ode,
             use_corrector: d.use_corrector,
+            learnable_attn: d.learnable_attn,
         };
         let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(
             &block.ffn, &normed, be, stencil, None, None, &cfg, None, None,

@@ -481,6 +481,7 @@ mod tests {
             split_band: false,
             freeze_ode: true,
             use_corrector: false,
+            learnable_attn: false,
         };
 
         // Forward

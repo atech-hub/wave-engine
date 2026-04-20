@@ -45,6 +45,11 @@ pub struct FfnConfig {
     /// Enable the per-band corrector plate after the ODE (default: true).
     /// Off when the corrector DynParam is `off` or `--no-corrector` is set.
     pub use_corrector: bool,
+
+    /// Train attention weights (default: false). When true, attention
+    /// weights (phase/v/content/out_proj) participate in flatten/unflatten
+    /// and receive gradients from the full backward.
+    pub learnable_attn: bool,
 }
 
 impl Default for FfnConfig {
@@ -65,7 +70,17 @@ impl FfnConfig {
         freeze_ode: bool,
         use_corrector: bool,
     ) -> Self {
-        Self { ode_pathway, split_band, freeze_ode, use_corrector }
+        Self { ode_pathway, split_band, freeze_ode, use_corrector, learnable_attn: false }
+    }
+
+    pub fn from_flags_with_attn(
+        ode_pathway: bool,
+        split_band: bool,
+        freeze_ode: bool,
+        use_corrector: bool,
+        learnable_attn: bool,
+    ) -> Self {
+        Self { ode_pathway, split_band, freeze_ode, use_corrector, learnable_attn }
     }
 
     /// Defaults for inference / analysis / generation paths that don't parse
@@ -77,6 +92,7 @@ impl FfnConfig {
             split_band: false,
             freeze_ode: true,
             use_corrector: true,
+            learnable_attn: false,
         }
     }
 }
