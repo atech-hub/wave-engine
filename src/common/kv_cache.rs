@@ -197,9 +197,15 @@ pub fn prefill(
             .map(|h| layer_norm(h, &block.ln_ffn.weight, &block.ln_ffn.bias))
             .collect();
         let layer_mem = memory.and_then(|m| m.get(layer_idx).copied());
+        let cfg = crate::common::ffn_config::FfnConfig {
+            ode_pathway: false,
+            split_band: false,
+            freeze_ode: true,
+            use_corrector: dims.use_corrector,
+        };
         let (ffn_out, _) = crate::ffn_backend::ffn_forward_via_backend(
             &block.ffn, &normed_ffn, &crate::backend::CpuBackend,
-            Some(stencil), None, None, true, dims.use_corrector, None, layer_mem, false, false,
+            Some(stencil), None, None, &cfg, None, layer_mem,
         );
 
         // Residual
@@ -330,9 +336,15 @@ pub fn forward_one(
         // FFN (single position)
         let normed_ffn = layer_norm(&hidden, &block.ln_ffn.weight, &block.ln_ffn.bias);
         let layer_mem = memory.and_then(|m| m.get(layer_idx).copied());
+        let cfg = crate::common::ffn_config::FfnConfig {
+            ode_pathway: false,
+            split_band: false,
+            freeze_ode: true,
+            use_corrector: dims.use_corrector,
+        };
         let (ffn_out, _) = crate::ffn_backend::ffn_forward_via_backend(
             &block.ffn, &[normed_ffn], &crate::backend::CpuBackend,
-            Some(stencil), None, None, true, dims.use_corrector, None, layer_mem, false, false,
+            Some(stencil), None, None, &cfg, None, layer_mem,
         );
 
         // Residual

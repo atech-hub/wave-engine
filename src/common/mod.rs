@@ -7,6 +7,7 @@ pub mod embed;
 pub mod attn;
 pub mod block;
 pub mod ffn;
+pub mod ffn_config;
 pub mod checkpoint;
 pub mod rng;
 pub mod bpe;

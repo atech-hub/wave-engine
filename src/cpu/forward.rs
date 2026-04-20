@@ -97,10 +97,14 @@ pub fn forward_with_cache(
 
         // FFN forward via backend (kerr-engine pattern: all ops through same device)
         let _tf = std::time::Instant::now();
-        let freeze_ode = !d.learnable_ode;
-        let use_corrector = d.use_corrector;
+        let cfg = crate::common::ffn_config::FfnConfig {
+            ode_pathway: d.ode_pathway,
+            split_band: d.split_band,
+            freeze_ode: !d.learnable_ode,
+            use_corrector: d.use_corrector,
+        };
         let layer_mem = memory_offsets.and_then(|offsets| offsets.get(block_idx).copied());
-        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, freeze_ode, use_corrector, agc_for_layer, layer_mem, d.ode_pathway, d.split_band);
+        let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(&block.ffn, &normed, be, stencil, ping_pong, gpu_kernel, &cfg, agc_for_layer, layer_mem);
         let ffn_dur = _tf.elapsed();
 
         // Attention (CPU — frozen, harmonic coherence scoring)
@@ -221,10 +225,14 @@ pub fn forward_with_cache_from_waves(
             .collect();
 
         let be: &dyn backend::ComputeBackend = &backend::CpuBackend;
-        let freeze_ode = !d.learnable_ode;
-        let use_corrector = d.use_corrector;
+        let cfg = crate::common::ffn_config::FfnConfig {
+            ode_pathway: d.ode_pathway,
+            split_band: d.split_band,
+            freeze_ode: !d.learnable_ode,
+            use_corrector: d.use_corrector,
+        };
         let (ffn_out, ffn_be_cache) = ffn_backend::ffn_forward_via_backend(
-            &block.ffn, &normed, be, stencil, None, None, freeze_ode, use_corrector, None, None, d.ode_pathway, d.split_band,
+            &block.ffn, &normed, be, stencil, None, None, &cfg, None, None,
         );
 
         let (attn_out, att_weights, attn_cache) = wave_attention_forward(

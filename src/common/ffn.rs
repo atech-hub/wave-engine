@@ -43,13 +43,14 @@ pub fn ffn_forward_via_backend(
     stencil: Option<&crate::fft_ode::StencilFft>,
     ping_pong: Option<(&crate::ffn_gpu::FfnGpuBuffers, &crate::gpu_pipelines::GpuBackend)>,
     gpu_kernel: Option<(&crate::fft_ode::GpuKernelFft, &crate::gpu_pipelines::GpuBackend)>,
-    freeze_ode: bool,
-    use_corrector: bool,
+    config: &crate::common::ffn_config::FfnConfig,
     layer_agc: Option<&mut crate::common::agc::OdeAgc>,
     memory: Option<(&[f32], &[f32])>,
-    ode_pathway: bool,
-    split_band: bool,
 ) -> (Vec<Vec<f32>>, FfnCache) {
+    let freeze_ode = config.freeze_ode;
+    let use_corrector = config.use_corrector;
+    let ode_pathway = config.ode_pathway;
+    let split_band = config.split_band;
     let t = x.len();
     let n_embd = x[0].len();
     let cpu = &crate::backend::CpuBackend;
@@ -475,10 +476,16 @@ mod tests {
 
         init_agc(0.1, 0.2);
         let cpu = crate::backend::CpuBackend;
+        let cfg = crate::common::ffn_config::FfnConfig {
+            ode_pathway: false,
+            split_band: false,
+            freeze_ode: true,
+            use_corrector: false,
+        };
 
         // Forward
         let (output, cache) = ffn_forward_via_backend(
-            &ffn, &x, &cpu, None, None, None, true, false, None, None, false, false,
+            &ffn, &x, &cpu, None, None, None, &cfg, None, None,
         );
 
         // d_output = 1.0 everywhere (loss = sum)
@@ -497,12 +504,12 @@ mod tests {
             for j in 0..n_embd {
                 let mut ffn_p = ffn.clone();
                 ffn_p.maestro_in.squeeze.w[i][j] += eps;
-                let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false, false);
+                let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, &cfg, None, None);
                 let loss_p: f32 = out_p.iter().flat_map(|v| v.iter()).sum();
 
                 let mut ffn_m = ffn.clone();
                 ffn_m.maestro_in.squeeze.w[i][j] -= eps;
-                let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false, false);
+                let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, &cfg, None, None);
                 let loss_m: f32 = out_m.iter().flat_map(|v| v.iter()).sum();
 
                 let fd = (loss_p - loss_m) / (2.0 * eps);
@@ -523,11 +530,11 @@ mod tests {
         for i in 0..maestro_dim {
             let mut ffn_p = ffn.clone();
             ffn_p.maestro_in.squeeze.b[i] += eps;
-            let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false, false);
+            let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, &cfg, None, None);
             let loss_p: f32 = out_p.iter().flat_map(|v| v.iter()).sum();
             let mut ffn_m = ffn.clone();
             ffn_m.maestro_in.squeeze.b[i] -= eps;
-            let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false, false);
+            let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, &cfg, None, None);
             let loss_m: f32 = out_m.iter().flat_map(|v| v.iter()).sum();
             let fd = (loss_p - loss_m) / (2.0 * eps);
             let an = grads.d_mae_in_sq_b[i];
@@ -546,11 +553,11 @@ mod tests {
             for j in 0..n_embd {
                 let mut ffn_p = ffn.clone();
                 ffn_p.maestro_out.squeeze.w[i][j] += eps;
-                let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, true, false, None, None, false, false);
+                let (out_p, _) = ffn_forward_via_backend(&ffn_p, &x, &cpu, None, None, None, &cfg, None, None);
                 let loss_p: f32 = out_p.iter().flat_map(|v| v.iter()).sum();
                 let mut ffn_m = ffn.clone();
                 ffn_m.maestro_out.squeeze.w[i][j] -= eps;
-                let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, true, false, None, None, false, false);
+                let (out_m, _) = ffn_forward_via_backend(&ffn_m, &x, &cpu, None, None, None, &cfg, None, None);
                 let loss_m: f32 = out_m.iter().flat_map(|v| v.iter()).sum();
                 let fd = (loss_p - loss_m) / (2.0 * eps);
                 let an = grads.d_mae_out_sq_w[i][j];
