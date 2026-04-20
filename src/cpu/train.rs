@@ -108,12 +108,24 @@ pub struct TrainConfig {
     pub ode_pathway: bool,      // --no-ode-pathway disables real Jacobian (identity shortcut)
     pub attention_pathway: bool,// --no-attention-pathway disables d_normed from attention
     pub learnable_attn: bool,   // --learnable-attn: attention weights trainable + serialized
+    pub loss_mode: LossMode,    // token cross-entropy OR wave-space L2 (--wave-loss)
     // ─── Candle tier flags (ignored on CPU/wgpu tiers) ───
     pub candle: bool,           // --candle: route training through Candle tensor ops
     pub cuda_kernel: bool,      // --cuda-kernel: fused CUDA kernel (implies candle)
     pub custom_op: bool,        // --custom-op: Candle CustomOp fallback (implied by cuda-kernel)
     pub gpu_duty: usize,        // --gpu-duty: sleep between iters to throttle GPU (1-100%)
     pub debug_nan: bool,        // --debug-nan: per-layer NaN detection in Candle (~6× slower)
+}
+
+/// Which loss the training loop optimises. TokenCE is the historical default
+/// — cross-entropy on phase-native / lm_head logits against next-token targets.
+/// WaveL2 is L2 on the ODE output states against next-position targets read
+/// from a KWDS file. Both go through the same model forward + backward
+/// infrastructure; only the batch source and the loss computation differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LossMode {
+    TokenCE,
+    WaveL2,
 }
 
 /// A parameter that can be fixed (manual value) or dynamic (model learns it).

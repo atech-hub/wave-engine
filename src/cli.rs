@@ -198,6 +198,13 @@ pub struct TrainArgs {
     #[arg(long)]
     pub learnable_attn: bool,
 
+    /// Train on a KWDS wave dataset with L2 loss on ODE output states instead
+    /// of cross-entropy on token logits. The positional DATA arg becomes the
+    /// KWDS file path. All other flags (split-band, monitors, GPU, etc.) still
+    /// apply — wave training now shares the main training loop.
+    #[arg(long)]
+    pub wave_loss: bool,
+
     /// Use wgpu GPU backend
     #[arg(long)]
     pub gpu: bool,

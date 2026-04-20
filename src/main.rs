@@ -547,16 +547,60 @@ fn cmd_convert_dataset(args: cli::ConvertDatasetArgs) {
 
 fn cmd_train_waves(args: cli::TrainWavesArgs) {
     init_runtime();
+    // Build a full TrainConfig so wave training uses the shared Adam +
+    // shared Dims builder. --train-waves stays as a compat alias for scripts;
+    // --train --wave-loss is the canonical form.
     let m = &args.model;
-    cpu::wave_training::run(cpu::wave_training::WaveTrainConfig {
-        kwds_path: args.kwds,
-        n_layers: m.layers, n_head: m.n_head, n_bands: m.n_bands,
-        out_proj_groups: m.out_proj_groups, vocab: m.vocab,
-        alpha: m.alpha, beta: m.beta,
-        iters: args.iters, lr: args.lr, seq: args.seq,
+    let config = train::TrainConfig {
+        data_path: args.kwds,
+        n_iters: args.iters,
+        batch_size: 1,                           // wave path is single-batch today (follow-up)
+        seq_len: args.seq,
+        n_layers: m.layers,
+        lr: args.lr,
+        use_bpe: false,
+        tokenizer_path: "data/tokenizer.json".into(),
+        resume_path: args.resume,
+        use_curriculum: false,
+        use_gpu: false,
+        use_monitor: false,
+        out_proj_groups: m.out_proj_groups,
         checkpoint_name: args.checkpoint_name,
-        resume: args.resume,
-    });
+        n_bands: m.n_bands,
+        n_head: m.n_head,
+        maestro_dim: m.maestro_dim,
+        alpha: m.alpha,
+        beta: m.beta,
+        agc_ceiling: None,
+        log_name: None,
+        m1: None, m2: None,
+        tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false,
+        health_interval: 0,
+        freeze_ode: false,
+        head_lr_floor: 0.0,
+        no_corrector: false,
+        layer_scale: train::DynParam::Off,
+        lr_scale: train::DynParam::Off,
+        phase_native: true,                      // wave training is phase-native by nature
+        fwm_strength: 0.0,
+        phase_temp: 1.0,
+        pythagorean: false,
+        spring_k: 0.1,
+        active_layers: None,
+        rk4_weights: train::DynParam::Off,
+        wd: train::DynParam::Off,
+        harmonics: train::DynParam::Off,
+        agc_headroom: train::DynParam::Off,
+        corrector: train::DynParam::Dynamic,
+        split_band: false,
+        ode_pathway: true,
+        attention_pathway: true,
+        learnable_attn: false,
+        loss_mode: train::LossMode::WaveL2,
+        candle: false, cuda_kernel: false, custom_op: false,
+        gpu_duty: 100, debug_nan: false,
+    };
+    cpu::wave_training::run(&config);
 }
 
 fn cmd_train(args: cli::TrainArgs) {
@@ -628,12 +672,26 @@ fn cmd_train(args: cli::TrainArgs) {
         ode_pathway,
         attention_pathway,
         learnable_attn: args.learnable_attn,
+        loss_mode: if args.wave_loss { train::LossMode::WaveL2 } else { train::LossMode::TokenCE },
         candle: args.candle,
         cuda_kernel: args.cuda_kernel,
         custom_op: args.custom_op || args.cuda_kernel, // --cuda-kernel implies --custom-op
         gpu_duty: args.gpu_duty.clamp(1, 100),
         debug_nan: args.debug_nan,
     };
+
+    // Wave-loss path — KWDS batch source + L2 loss on ODE states. Shares
+    // the same Adam, Dims builder, NaN guard, JSONL logging, checkpointing.
+    // Only the forward/backward and batch source differ from the token path.
+    if matches!(config.loss_mode, train::LossMode::WaveL2) {
+        if config.candle || config.cuda_kernel {
+            eprintln!("--wave-loss on Candle is not yet supported (wave-side Candle \
+                       forward/backward wiring pending). Use CPU for now.");
+            std::process::exit(2);
+        }
+        cpu::wave_training::run(&config);
+        return;
+    }
 
     // Candle path routes through candle_tier. Everything else runs the CPU/wgpu loop.
     if config.candle || config.cuda_kernel {
