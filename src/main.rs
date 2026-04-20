@@ -223,7 +223,68 @@ fn cmd_verify(args: cli::VerifyArgs) {
                 }
             }
         }
+        cli::VerifyCommand::TierParity(tp) => cmd_verify_tier_parity(tp),
     }
+}
+
+fn cmd_verify_tier_parity(args: cli::VerifyTierParityArgs) {
+    use crate::monitors::junctions::tier_parity::print_report;
+    use crate::monitors::junctions::tier_parity_runner::run_cpu_vs_wgpu_parity;
+
+    let m = &args.model;
+    ffn_backend::init_agc(m.alpha, m.beta);
+
+    // Build model: resume if provided, otherwise random init with phase-native
+    // corrector (matches standard training config so the ODE runs the same path).
+    let dims = Dims::from_cli(m.n_bands, m.n_head, m.maestro_dim, 128, crate::RK4_STEPS)
+        .with_corrector(true)
+        .with_split_band(false); // section-by-section wants monolithic ODE to stress the GPU path
+
+    let model = if let Some(ref ckpt) = args.resume {
+        println!("[J10] Loading checkpoint: {}", ckpt);
+        let (model, _dims_loaded) = common::wave_model::load_checkpoint_auto(
+            ckpt, m.n_bands, m.n_head, m.layers, m.out_proj_groups, m.alpha, m.beta,
+        );
+        model
+    } else {
+        println!("[J10] Using random-init model (seed=42) — no checkpoint.");
+        let mut model = init_model(m.vocab, 42, m.layers, m.out_proj_groups, dims, m.alpha, m.beta);
+        model.phase_native = true;
+        model.output_corrector = vec![0.0; m.n_bands];
+        model
+    };
+
+    // Deterministic token sequence: 0..seq wrapped mod vocab.
+    let tokens: Vec<usize> = (0..args.seq).map(|i| i % m.vocab).collect();
+    println!("[J10] Running CPU vs wgpu parity: {} tokens, {}L, {} bands, {} vocab",
+        tokens.len(), m.layers, m.n_bands, m.vocab);
+
+    let mut worst_report: Option<crate::monitors::junctions::tier_parity::ParityReport> = None;
+    for i in 0..args.iters {
+        let report = run_cpu_vs_wgpu_parity(&model, &tokens, dims);
+        if args.verbose || !report.passed() {
+            println!("\n── Run {}/{} ──", i + 1, args.iters);
+            print_report(&report, false);
+            if args.verbose {
+                // Always-print mode: show every section with its worst element.
+                for sec in &report.sections {
+                    println!(
+                        "  [{}] {} elem  viol={}  max_abs={:.3e}  max_rel={:.3e}  mean_abs={:.3e}",
+                        sec.section, sec.n_elements, sec.n_violations,
+                        sec.max_abs_diff, sec.max_rel_diff, sec.mean_abs_diff,
+                    );
+                }
+            }
+        }
+        if worst_report.as_ref().map_or(true, |r| r.n_violations() < report.n_violations()) {
+            worst_report = Some(report);
+        }
+    }
+
+    let report = worst_report.expect("at least one iteration");
+    println!("\n=== J10 CPU vs wgpu parity summary ===");
+    print_report(&report, false);
+    if !report.passed() { std::process::exit(1); }
 }
 
 fn cmd_recommend(args: cli::RecommendArgs) {

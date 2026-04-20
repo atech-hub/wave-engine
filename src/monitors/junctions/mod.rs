@@ -16,3 +16,4 @@ pub mod tensor_shape;       // J9: tensor dimensions match at every boundary
 pub mod value_range;        // J7: named tensors must stay within declared bounds
 pub mod train_infer_alignment; // J8: train loss vs inference metric correlation tracker
 pub mod tier_parity;        // J10: CPU/GPU forward outputs must agree to tolerance
+pub mod tier_parity_runner; // J10 runner: drive CPU vs wgpu full forward + diff

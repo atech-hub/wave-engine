@@ -522,7 +522,32 @@ pub struct GalaxyScanArgs {
 pub enum VerifyCommand {
     /// J1: Gradient correctness (analytical vs finite-difference)
     Grad(VerifyGradArgs),
+
+    /// J10: Tier parity (CPU vs wgpu forward, section-by-section diff)
+    TierParity(VerifyTierParityArgs),
     // Future: Param, Roundtrip, VectorLength, LiveGradient, etc.
+}
+
+#[derive(clap::Args)]
+pub struct VerifyTierParityArgs {
+    #[command(flatten)]
+    pub model: ModelArgs,
+
+    /// Checkpoint to load (omit for random-init model)
+    #[arg(long)]
+    pub resume: Option<String>,
+
+    /// Sequence length for the forward pass
+    #[arg(long, default_value_t = 16)]
+    pub seq: usize,
+
+    /// Number of forward-pass iterations (deterministic; >1 to average timing noise)
+    #[arg(long, default_value_t = 1)]
+    pub iters: usize,
+
+    /// Print every section's diff even on pass (not just violations)
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 #[derive(clap::Args)]
