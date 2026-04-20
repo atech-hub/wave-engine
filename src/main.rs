@@ -503,30 +503,18 @@ fn cmd_train(args: cli::TrainArgs) {
     let ode_pathway = if args.no_ode_pathway { false } else { args.ode_pathway };
     let attention_pathway = if args.no_attention_pathway { false } else { args.attention_pathway };
 
-    // Candle path: --candle or --cuda-kernel routes to the candle training
-    // engine instead of the CPU path. Parity with legacy --candle dispatch.
-    if args.candle || args.cuda_kernel {
-        match candle_engine::engine::train_candle(
-            &args.data, args.iters,
-            m.n_bands, m.n_head, m.layers,
-            m.maestro_dim, crate::RK4_STEPS, m.out_proj_groups,
-            args.debug_nan, m.alpha, m.beta, args.chi, args.phase_native,
-        ) {
-            Ok(()) => return,
-            Err(e) => { eprintln!("Candle error: {e:?}"); std::process::exit(1); }
-        }
-    }
-
-    train::run_training(train::TrainConfig {
-        data_path: args.data,
+    // Build TrainConfig once. Both the Candle path and the CPU/wgpu path read
+    // from the same struct — no env-args scanning, no duplication.
+    let config = train::TrainConfig {
+        data_path: args.data.clone(),
         n_iters: args.iters,
         batch_size: args.batch,
         seq_len: args.seq,
         n_layers: m.layers,
         lr: args.lr,
         use_bpe: args.bpe,
-        tokenizer_path: args.tokenizer,
-        resume_path: args.resume,
+        tokenizer_path: args.tokenizer.clone(),
+        resume_path: args.resume.clone(),
         use_curriculum,
         use_gpu: args.gpu,
         use_monitor: args.monitor,
@@ -565,7 +553,28 @@ fn cmd_train(args: cli::TrainArgs) {
         split_band: args.split_band,
         ode_pathway,
         attention_pathway,
-    });
+        candle: args.candle,
+        cuda_kernel: args.cuda_kernel,
+        custom_op: args.custom_op || args.cuda_kernel, // --cuda-kernel implies --custom-op
+        gpu_duty: args.gpu_duty.clamp(1, 100),
+        debug_nan: args.debug_nan,
+    };
+
+    // Candle path routes through candle_tier. Everything else runs the CPU/wgpu loop.
+    if config.candle || config.cuda_kernel {
+        let ffn = common::ffn_config::FfnConfig::from_flags(
+            config.ode_pathway,
+            config.split_band,
+            config.freeze_ode,
+            !config.no_corrector,
+        );
+        match candle_engine::engine::train_candle(&config, &ffn) {
+            Ok(()) => return,
+            Err(e) => { eprintln!("Candle error: {e:?}"); std::process::exit(1); }
+        }
+    }
+
+    train::run_training(config);
 }
 
 fn cmd_encode(args: cli::EncodeArgs) {

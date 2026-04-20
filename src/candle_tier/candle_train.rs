@@ -18,11 +18,24 @@ pub mod train {
     // ─── Training loop ───
 
     pub fn train_candle(
-        data_path: &str, n_iters: usize,
-        n_bands: usize, n_head: usize, n_layers: usize,
-        maestro_dim: usize, _rk4_steps: usize, out_proj_groups: usize,
-        debug_nan: bool, alpha: f32, beta: f32, chi: f32, phase_native: bool,
+        config: &crate::cpu::train::TrainConfig,
+        ffn: &crate::common::ffn_config::FfnConfig,
     ) -> Result<()> {
+        // Extract the primitives that used to be function args — one-liner
+        // aliases keep the rest of the body readable without a big rename.
+        let data_path = config.data_path.as_str();
+        let n_iters = config.n_iters;
+        let n_bands = config.n_bands;
+        let n_head = config.n_head;
+        let n_layers = config.n_layers;
+        let maestro_dim = config.maestro_dim;
+        let out_proj_groups = config.out_proj_groups;
+        let debug_nan = config.debug_nan;
+        let alpha = config.alpha;
+        let beta = config.beta;
+        let chi = config.fwm_strength;
+        let phase_native = config.phase_native;
+
         // Runtime config — lowercase variables used throughout
         let n_embd = n_bands * 2;
         let block_size = 256usize; // positional table size
@@ -35,9 +48,8 @@ pub mod train {
         println!("  Device: {:?}", device);
 
         // Load data + tokenize (with token cache — 3min encode → instant reload)
-        let use_bpe = std::env::args().any(|a| a == "--bpe");
-        let tokenizer_path = std::env::args().skip_while(|a| a != "--tokenizer").nth(1)
-            .unwrap_or("data/tokenizer.json".to_string());
+        let use_bpe = config.use_bpe;
+        let tokenizer_path = config.tokenizer_path.clone();
 
         let tok_path_opt = if use_bpe { Some(tokenizer_path.as_str()) } else { None };
         let (tokens, vocab_size) = crate::common::data_loader::load_data(data_path, use_bpe, tok_path_opt);
@@ -45,22 +57,18 @@ pub mod train {
         let train_data = &tokens[..split];
         println!("  Train tokens: {}", train_data.len());
 
-        // Parse dynamic param flags early (needed for model construction + optimizer config)
-        let use_rk4_dyn = std::env::args().any(|a| a == "--rk4-weights") &&
-            std::env::args().skip_while(|a| a != "--rk4-weights").nth(1).map_or(false, |s| s == "dyn");
-        let use_layer_scale_dyn = std::env::args().any(|a| a == "--layer-scale") &&
-            std::env::args().skip_while(|a| a != "--layer-scale").nth(1).map_or(false, |s| s == "dyn");
-        let use_wd_dyn = std::env::args().any(|a| a == "--wd") &&
-            std::env::args().skip_while(|a| a != "--wd").nth(1).map_or(false, |s| s == "dyn");
-        let use_agc_headroom_dyn = std::env::args().any(|a| a == "--agc-headroom") &&
-            std::env::args().skip_while(|a| a != "--agc-headroom").nth(1).map_or(false, |s| s == "dyn");
-        let use_cuda_kernel = std::env::args().any(|a| a == "--cuda-kernel");
-        let use_custom_op = use_cuda_kernel || std::env::args().any(|a| a == "--custom-op");
+        // Dynamic param flags resolved from TrainConfig (single source of truth).
+        let use_rk4_dyn = config.rk4_weights.is_dynamic();
+        let use_layer_scale_dyn = config.layer_scale.is_dynamic();
+        let use_wd_dyn = config.wd.is_dynamic();
+        let use_agc_headroom_dyn = config.agc_headroom.is_dynamic();
+        let use_cuda_kernel = config.cuda_kernel;
+        let use_custom_op = config.custom_op;
 
         // Model
         let mut varmap = VarMap::new();
         let mut model = CandleWaveModel::new(&varmap, vocab_size, &device,
-            n_bands, n_head, n_layers, maestro_dim, _rk4_steps, out_proj_groups, alpha, beta,
+            n_bands, n_head, n_layers, maestro_dim, crate::RK4_STEPS, out_proj_groups, alpha, beta,
             chi, phase_native)?;
         model.debug_nan = debug_nan;
         model.use_custom_op = use_custom_op;
@@ -98,8 +106,8 @@ pub mod train {
         println!("  Trainable params: {n_params}");
         println!("  Architecture: {n_layers} layers, {n_head} heads, {n_bands} bands");
 
-        // Resume from checkpoint if --resume flag
-        let resume_path: Option<String> = std::env::args().skip_while(|a| a != "--resume").nth(1);
+        // Resume from checkpoint if provided in TrainConfig
+        let resume_path: Option<String> = config.resume_path.clone();
         let mut start_iter = 0usize;
         if let Some(ref ckpt) = resume_path {
             println!("  Resuming from: {ckpt}");
@@ -148,27 +156,17 @@ pub mod train {
             println!("  Resumed at iter {start_iter}");
         }
 
-        // CLI flag parsing for Candle path
-        fn parse_flag_c<T: std::str::FromStr>(name: &str, default: T) -> T {
-            std::env::args().skip_while(|a| a != name).nth(1)
-                .and_then(|s| s.parse().ok()).unwrap_or(default)
-        }
-        let batch_size: usize = parse_flag_c("--batch", 4);
-        let seq_len: usize = parse_flag_c("--seq", 256);
-        let lr: f64 = parse_flag_c("--lr", if n_bands > 256 { 1e-4 } else { 3e-4 });
-        let spring_k: f64 = parse_flag_c("--spring", 0.1);
-        let gpu_duty: usize = parse_flag_c("--gpu-duty", 100).clamp(1, 100);
+        // All scalars now come from TrainConfig — no env-args scanning.
+        let batch_size: usize = config.batch_size;
+        let seq_len: usize = config.seq_len;
+        let lr: f64 = config.lr as f64;
+        let spring_k: f64 = config.spring_k as f64;
+        let gpu_duty: usize = config.gpu_duty.clamp(1, 100);
         if gpu_duty < 100 {
             println!("  GPU duty cycle: {}% (sleep between iterations to reduce temperature)", gpu_duty);
         }
-        let use_rk4_dyn = std::env::args().any(|a| a == "--rk4-weights") &&
-            std::env::args().skip_while(|a| a != "--rk4-weights").nth(1).map_or(false, |s| s == "dyn");
-        let use_harmonics_dyn = std::env::args().any(|a| a == "--harmonics") &&
-            std::env::args().skip_while(|a| a != "--harmonics").nth(1).map_or(false, |s| s == "dyn");
-        let use_wd_dyn = std::env::args().any(|a| a == "--wd") &&
-            std::env::args().skip_while(|a| a != "--wd").nth(1).map_or(false, |s| s == "dyn");
-        let use_layer_scale_dyn = std::env::args().any(|a| a == "--layer-scale") &&
-            std::env::args().skip_while(|a| a != "--layer-scale").nth(1).map_or(false, |s| s == "dyn");
+        let use_harmonics_dyn = config.harmonics.is_dynamic();
+        // use_rk4_dyn / use_wd_dyn / use_layer_scale_dyn already resolved above from config.
         // Wire harmonic_dyn flag on blocks
         if use_harmonics_dyn {
             for block in &mut model.blocks {
@@ -206,7 +204,7 @@ pub mod train {
         let mut rng = crate::rng::Rng::new(1337);
 
         // Curriculum: soft-mask inactive bands (0.01 scale, not zero)
-        let use_curriculum = !std::env::args().any(|a| a == "--no-curriculum");
+        let use_curriculum = config.use_curriculum;
         let curriculum = if use_curriculum {
             crate::train::CurriculumSchedule::default_4stage(n_bands)
         } else {
@@ -260,11 +258,10 @@ pub mod train {
         println!("{:>6} {:>10} {:>10}", "Iter", "Loss", "Time");
         println!("{}", "-".repeat(35));
 
-        // JSONL telemetry — use --log-name if provided, else derive from checkpoint name
-        let log_name: String = std::env::args().skip_while(|a| a != "--log-name").nth(1)
+        // JSONL telemetry — use log_name if provided, else derive from checkpoint name.
+        let log_name: String = config.log_name.clone()
             .unwrap_or_else(|| {
-                let ckpt = std::env::args().skip_while(|a| a != "--checkpoint-name").nth(1)
-                    .unwrap_or_else(|| "checkpoint.bin".to_string());
+                let ckpt = config.checkpoint_name.clone();
                 let stem = ckpt.strip_suffix(".bin").unwrap_or(&ckpt);
                 format!("training_log_{}.jsonl", stem)
             });
@@ -287,7 +284,7 @@ pub mod train {
         };
 
         let train_start = Instant::now();
-        let health_interval: usize = parse_flag_c("--health-interval", 0);
+        let health_interval: usize = config.health_interval;
 
         for iter in start_iter..total_iters {
             let band_masks = curriculum.band_masks(iter, total_iters, n_bands);
@@ -772,7 +769,7 @@ pub mod train {
                     vocab_size, out_proj_groups, n_bands, phase_native,
                     use_rk4_dyn, use_layer_scale_dyn, use_harmonics_dyn);
                 let dummy_adam = crate::train::Adam::new(lr as f32, params.len());
-                let mut ck_dims = crate::Dims::from_cli(n_bands, n_head, maestro_dim, 256, _rk4_steps)
+                let mut ck_dims = crate::Dims::from_cli(n_bands, n_head, maestro_dim, 256, crate::RK4_STEPS)
                     .with_learnable_ode(true).with_corrector(true)
                     .with_rk4_weights(use_rk4_dyn).with_layer_scale(use_layer_scale_dyn);
                 ck_dims.use_dyn_harmonics = use_harmonics_dyn;

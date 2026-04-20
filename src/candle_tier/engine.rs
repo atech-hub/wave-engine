@@ -22,7 +22,10 @@ pub mod engine {
 // Stub when candle feature is not enabled
 #[cfg(not(feature = "candle-backend"))]
 pub mod engine {
-    pub fn train_candle(_data_path: &str, _n_iters: usize, _n_bands: usize, _n_head: usize, _n_layers: usize, _maestro_dim: usize, _rk4_steps: usize, _out_proj_groups: usize, _debug_nan: bool, _alpha: f32, _beta: f32, _chi: f32, _phase_native: bool) -> std::result::Result<(), String> {
+    pub fn train_candle(
+        _config: &crate::cpu::train::TrainConfig,
+        _ffn: &crate::common::ffn_config::FfnConfig,
+    ) -> std::result::Result<(), String> {
         Err("Candle backend not enabled. Build with: cargo run --release --features candle-backend".to_string())
     }
 }

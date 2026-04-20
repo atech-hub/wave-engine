@@ -161,6 +161,14 @@ pub struct TrainArgs {
     #[arg(long)]
     pub cuda_kernel: bool,
 
+    /// Use Candle CustomOp fallback (no CUDA toolkit required; implied by --cuda-kernel)
+    #[arg(long)]
+    pub custom_op: bool,
+
+    /// GPU duty cycle percentage (1-100, default 100 = no sleep between iters)
+    #[arg(long, default_value_t = 100)]
+    pub gpu_duty: usize,
+
     /// Enable FWM (four-wave mixing). Alias: --fwm-strength.
     #[arg(long, alias = "fwm-strength", default_value_t = 0.0)]
     pub chi: f32,
