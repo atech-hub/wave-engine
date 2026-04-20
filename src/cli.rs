@@ -290,6 +290,24 @@ pub struct TrainArgs {
     /// Legacy alias: equivalent to --corrector off
     #[arg(long)]
     pub no_corrector: bool,
+
+    // ─── Pathway flags (default on; --no-* disables for A/B) ───
+
+    /// ODE pathway: frozen ODE uses real Jacobian for gradient flow (default on)
+    #[arg(long, default_value_t = true)]
+    pub ode_pathway: bool,
+
+    /// Attention pathway: attention backward contributes to d_normed (default on)
+    #[arg(long, default_value_t = true)]
+    pub attention_pathway: bool,
+
+    /// Disable ODE pathway (identity shortcut, for A/B comparison only)
+    #[arg(long)]
+    pub no_ode_pathway: bool,
+
+    /// Disable attention pathway (for A/B comparison only)
+    #[arg(long)]
+    pub no_attention_pathway: bool,
 }
 
 #[derive(clap::Args)]

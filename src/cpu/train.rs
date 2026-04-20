@@ -105,6 +105,8 @@ pub struct TrainConfig {
     pub agc_headroom: DynParam, // --agc-headroom dyn | --agc-headroom 2.0,3.0,3.0,4.0
     pub corrector: DynParam,    // --corrector dyn | --corrector off (replaces --no-corrector)
     pub split_band: bool,       // --split-band: freeze-and-decouple ODE integration
+    pub ode_pathway: bool,      // --no-ode-pathway disables real Jacobian (identity shortcut)
+    pub attention_pathway: bool,// --no-attention-pathway disables d_normed from attention
 }
 
 /// A parameter that can be fixed (manual value) or dynamic (model learns it).

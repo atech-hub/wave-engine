@@ -437,6 +437,11 @@ fn cmd_train(args: cli::TrainArgs) {
     // --curriculum kept as explicit opt-in for scripts that set it.
     let use_curriculum = !args.no_curriculum;
 
+    // Pathway semantics (same convention as `verify grad`): default true,
+    // --no-* flips off for A/B training experiments.
+    let ode_pathway = if args.no_ode_pathway { false } else { args.ode_pathway };
+    let attention_pathway = if args.no_attention_pathway { false } else { args.attention_pathway };
+
     // Candle path: --candle or --cuda-kernel routes to the candle training
     // engine instead of the CPU path. Parity with legacy --candle dispatch.
     if args.candle || args.cuda_kernel {
@@ -497,6 +502,8 @@ fn cmd_train(args: cli::TrainArgs) {
         agc_headroom: args.agc_headroom,
         corrector,
         split_band: args.split_band,
+        ode_pathway,
+        attention_pathway,
     });
 }
 
