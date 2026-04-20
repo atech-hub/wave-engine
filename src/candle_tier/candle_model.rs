@@ -138,35 +138,58 @@ pub mod model {
                 let ln_w = vs_block.get_with_hints((n_embd,), "ln_w", candle_nn::Init::Const(1.0))?;
                 let ln_b = vs_block.get_with_hints((n_embd,), "ln_b", candle_nn::Init::Const(0.0))?;
 
-                // Attention heads (frozen)
+                // Attention heads (frozen). Uses the shared helper so Candle
+                // lands on bit-identical weights with CPU for the same seed.
+                // content_dim = CONTENT_DIM matches CPU's default
+                // (learnable_ode=true) — the frozen symmetry-breaker that CPU
+                // wave_attention_forward applies as a content bias in scoring.
+                // For builds that want learnable_ode=false, pass 0 here and
+                // adjust the RNG-advance logic accordingly.
+                let content_dim = crate::wave_attn::CONTENT_DIM;
+                let attn = crate::common::wave_model::init_block_attn(
+                    &mut rng, n_head, n_embd, content_dim,
+                );
+
+                // Populate per-head CPU caches from the shared struct.
+                let phase_proj_ws_cpu: Vec<Vec<Vec<f32>>> = attn.heads.iter().map(|h| h.phase_proj_w.clone()).collect();
+                let phase_proj_bs_cpu: Vec<Vec<f32>> = attn.heads.iter().map(|h| h.phase_proj_b.clone()).collect();
+                let v_proj_ws_cpu: Vec<Vec<Vec<f32>>> = attn.heads.iter().map(|h| h.v_proj_w.clone()).collect();
+                let v_proj_bs_cpu: Vec<Vec<f32>> = attn.heads.iter().map(|h| h.v_proj_b.clone()).collect();
+                let content_proj_ws_cpu: Vec<Vec<Vec<f32>>> = attn.heads.iter().map(|h| h.content_proj_w.clone()).collect();
+                let content_proj_bs_cpu: Vec<Vec<f32>> = attn.heads.iter().map(|h| h.content_proj_b.clone()).collect();
+                let harmonic_ns: Vec<f32> = attn.heads.iter().map(|h| h.harmonic_raw).collect();
+
+                // Build the GPU tensors from those CPU vecs (kept for legacy
+                // code paths that read them — e.g., the monitor attention path
+                // in forward_with_monitors). The CustomOp-wrapped attention
+                // uses the CPU caches directly.
                 let head_dim = n_embd / n_head;
                 let mut phase_proj_ws = Vec::new();
                 let mut phase_proj_bs = Vec::new();
                 let mut v_proj_ws = Vec::new();
                 let mut v_proj_bs = Vec::new();
-                let mut harmonic_ns = Vec::new();
-
                 for h in 0..n_head {
-                    let limit = 1.0 / (n_embd as f32).sqrt();
-                    let pw: Vec<f32> = (0..2*n_embd).map(|_| rng.uniform(limit)).collect();
-                    let pb = vec![0.0f32; 2];
-                    phase_proj_ws.push(Tensor::from_vec(pw, (2, n_embd), device)?);
+                    let pw_flat: Vec<f32> = phase_proj_ws_cpu[h].iter().flat_map(|r| r.iter().copied()).collect();
+                    let pb = phase_proj_bs_cpu[h].clone();
+                    phase_proj_ws.push(Tensor::from_vec(pw_flat, (2, n_embd), device)?);
                     phase_proj_bs.push(Tensor::from_vec(pb, (2,), device)?);
-
-                    let vlimit = 1.0 / (head_dim as f32).sqrt();
-                    let vw: Vec<f32> = (0..head_dim*head_dim).map(|_| rng.uniform(vlimit)).collect();
-                    let vb = vec![0.0f32; head_dim];
-                    v_proj_ws.push(Tensor::from_vec(vw, (head_dim, head_dim), device)?);
+                    let vw_flat: Vec<f32> = v_proj_ws_cpu[h].iter().flat_map(|r| r.iter().copied()).collect();
+                    let vb = v_proj_bs_cpu[h].clone();
+                    v_proj_ws.push(Tensor::from_vec(vw_flat, (head_dim, head_dim), device)?);
                     v_proj_bs.push(Tensor::from_vec(vb, (head_dim,), device)?);
-
-                    harmonic_ns.push(((h + 1) as f32 * 0.5f32).ln());
                 }
+                let ow_flat: Vec<f32> = attn.out_proj_w.iter().flat_map(|r| r.iter().copied()).collect();
+                let attn_out_proj_w = Tensor::from_vec(ow_flat, (n_embd, n_embd), device)?;
+                let attn_out_proj_b = Tensor::from_vec(attn.out_proj_b.clone(), (n_embd,), device)?;
 
-                let olimit = 1.0 / (n_embd as f32).sqrt();
-                let ow: Vec<f32> = (0..n_embd*n_embd).map(|_| rng.uniform(olimit)).collect();
-                let ob = vec![0.0f32; n_embd];
-                let attn_out_proj_w = Tensor::from_vec(ow, (n_embd, n_embd), device)?;
-                let attn_out_proj_b = Tensor::from_vec(ob, (n_embd,), device)?;
+                // Advance the RNG past CPU's per-block FFN draws so the NEXT
+                // block's attention reads from the same RNG position CPU does.
+                // Candle uses its own initialiser for FFN weights; these draws
+                // are discarded. load_wchk_params_into_varmap (checkpoint load)
+                // overwrites FFN weights with canonical values anyway.
+                crate::common::wave_model::advance_rng_for_block_ffn(
+                    &mut rng, n_embd, maestro_dim, out_proj_groups,
+                );
 
                 // FFN (trained)
                 let mae_in_sq = linear_uniform(n_embd, maestro_dim, vs_block.pp("mae_in_sq"))?;
@@ -190,15 +213,9 @@ pub mod model {
                     n_bands, alpha, beta, chi, rk4_steps, vs_block.pp("ode"),
                 )?;
 
-                // Cache frozen attention weights on CPU — eliminates 48 GPU→CPU transfers per layer per forward
-                let phase_proj_ws_cpu: Vec<Vec<Vec<f32>>> = phase_proj_ws.iter()
-                    .map(|t| t.to_vec2::<f32>().unwrap()).collect();
-                let phase_proj_bs_cpu: Vec<Vec<f32>> = phase_proj_bs.iter()
-                    .map(|t| t.to_vec1::<f32>().unwrap()).collect();
-                let v_proj_ws_cpu: Vec<Vec<Vec<f32>>> = v_proj_ws.iter()
-                    .map(|t| t.to_vec2::<f32>().unwrap()).collect();
-                let v_proj_bs_cpu: Vec<Vec<f32>> = v_proj_bs.iter()
-                    .map(|t| t.to_vec1::<f32>().unwrap()).collect();
+                // phase_proj_ws_cpu etc. were already populated above from the
+                // shared init_block_attn output — no need to re-extract from
+                // the GPU tensors.
 
                 // Corrector plate: per-band phase rotation (zero-init = transparent, learnable)
                 let phase_correction = vs_block.get_with_hints(
@@ -219,8 +236,8 @@ pub mod model {
                     ln_w, ln_b,
                     phase_proj_ws, phase_proj_bs, v_proj_ws, v_proj_bs,
                     phase_proj_ws_cpu, phase_proj_bs_cpu, v_proj_ws_cpu, v_proj_bs_cpu,
-                    content_proj_ws_cpu: vec![vec![]; n_head],
-                    content_proj_bs_cpu: vec![vec![]; n_head],
+                    content_proj_ws_cpu,
+                    content_proj_bs_cpu,
                     attn_out_proj_w_cpu,
                     attn_out_proj_b_cpu,
                     harmonic_init: harmonic_ns.clone(),
@@ -231,6 +248,13 @@ pub mod model {
                     layer_scale: None, // set by --layer-scale dyn
                 });
             }
+
+            // Advance RNG past CPU's non-tied, non-lowrank lm_head draws so
+            // any subsequent RNG use (none today, but kept aligned for future
+            // layers) matches CPU's stream position. CPU's init_model runs
+            // these uniforms even in phase_native mode (the lm_head values
+            // are unused, but the RNG advance happens).
+            crate::common::wave_model::advance_rng_for_lm_head(&mut rng, vocab_size, n_embd);
 
             // Final LN + LM head (trained) or output corrector (phase-native)
             let ln_f_w = vs.get_with_hints((n_embd,), "ln_f_w", candle_nn::Init::Const(1.0))?;

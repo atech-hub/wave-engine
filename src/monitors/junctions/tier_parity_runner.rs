@@ -237,25 +237,10 @@ pub fn run_cpu_vs_candle_parity(
         crate::candle_tier::custom_ode::custom_ode::create_param_grad_storage(n_layers),
     );
 
-    // Attention weights aren't in the WCHK flat-params layout (they're
-    // initialised from an RNG seed, not saved). CPU and Candle consume the
-    // RNG in different orders, so their attention weights drift. Inject
-    // CPU's attention weights into Candle's CPU caches to force parity here;
-    // production Candle training already had this divergence, which the
-    // convergence spec plans to retire once attention init is unified.
-    for (cpu_block, candle_block) in model.blocks.iter().zip(candle_model.blocks.iter_mut()) {
-        for (h, head) in cpu_block.attn.heads.iter().enumerate() {
-            candle_block.phase_proj_ws_cpu[h] = head.phase_proj_w.clone();
-            candle_block.phase_proj_bs_cpu[h] = head.phase_proj_b.clone();
-            candle_block.v_proj_ws_cpu[h] = head.v_proj_w.clone();
-            candle_block.v_proj_bs_cpu[h] = head.v_proj_b.clone();
-            candle_block.content_proj_ws_cpu[h] = head.content_proj_w.clone();
-            candle_block.content_proj_bs_cpu[h] = head.content_proj_b.clone();
-            candle_block.harmonic_ns[h] = head.harmonic_raw;
-        }
-        candle_block.attn_out_proj_w_cpu = cpu_block.attn.out_proj_w.clone();
-        candle_block.attn_out_proj_b_cpu = cpu_block.attn.out_proj_b.clone();
-    }
+    // Attention weights now match CPU by construction: both tiers call the
+    // shared `init_block_attn` from seed 42 at the same RNG position, and
+    // Candle advances its RNG past CPU's per-block FFN + post-block lm_head
+    // draws to stay aligned for the next block. No runner-side injection.
 
     let logits_tensor = candle_model.forward(tokens)
         .map_err(|e| format!("CandleWaveModel::forward failed: {e:?}"))?;

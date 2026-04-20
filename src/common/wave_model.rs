@@ -44,6 +44,74 @@ pub fn init_linear(rng: &mut Rng, out_dim: usize, in_dim: usize) -> (Vec<Vec<f32
     (w, b)
 }
 
+/// Shared attention-initialisation helper. Consumes `rng` in the exact order
+/// CPU's `init_model` did, so any tier that calls this lands on bit-identical
+/// attention weights for a given seed. The caller must invoke this at the
+/// same RNG position CPU's init_model reaches when it starts the per-block
+/// attention init — i.e., before any per-block FFN draws.
+///
+/// `content_dim` is the CPU tier's `wave_attn::CONTENT_DIM` when
+/// `learnable_ode` is true, else 0 (empty content projection → pure harmonic
+/// coherence, backward-compatible).
+pub fn init_block_attn(
+    rng: &mut Rng,
+    n_head: usize,
+    n_embd: usize,
+    content_dim: usize,
+) -> WaveAttnWeights {
+    let head_dim = n_embd / n_head;
+    let heads: Vec<WaveAttnHeadWeights> = (0..n_head).map(|h| {
+        let (phase_w, phase_b) = init_linear(rng, 2, n_embd);
+        let (v_w, v_b) = init_linear(rng, head_dim, head_dim);
+        let (content_w, content_b) = if content_dim > 0 {
+            init_linear(rng, content_dim, n_embd)
+        } else {
+            (vec![], vec![])
+        };
+        WaveAttnHeadWeights {
+            harmonic_raw: ((h + 1) as f32 * 0.5f32).ln(),
+            phase_proj_w: phase_w, phase_proj_b: phase_b,
+            v_proj_w: v_w, v_proj_b: v_b,
+            content_proj_w: content_w, content_proj_b: content_b,
+        }
+    }).collect();
+    let (out_w, out_b) = init_linear(rng, n_embd, n_embd);
+    WaveAttnWeights { heads, out_proj_w: out_w, out_proj_b: out_b }
+}
+
+/// Advance `rng` past the per-block FFN draws CPU's `init_model` makes. Used
+/// by tiers that don't use these draws (Candle constructs its FFN via its own
+/// initialiser) but must keep RNG stream aligned with CPU so subsequent
+/// attention blocks see the same weights. No return value — the draws are
+/// discarded.
+pub fn advance_rng_for_block_ffn(
+    rng: &mut Rng,
+    n_embd: usize,
+    maestro_dim: usize,
+    out_proj_groups: usize,
+) {
+    // mae_in.sq + mae_in.pr + mae_out.sq + mae_out.pr
+    for _ in 0..(maestro_dim * n_embd) { let _ = rng.uniform(1.0); }
+    for _ in 0..(n_embd * maestro_dim) { let _ = rng.uniform(1.0); }
+    for _ in 0..(maestro_dim * n_embd) { let _ = rng.uniform(1.0); }
+    for _ in 0..(n_embd * maestro_dim) { let _ = rng.uniform(1.0); }
+    if out_proj_groups <= 1 {
+        for _ in 0..(n_embd * n_embd) { let _ = rng.uniform(1.0); }
+    } else {
+        let group_size = n_embd / out_proj_groups;
+        for _ in 0..out_proj_groups {
+            for _ in 0..(group_size * group_size) { let _ = rng.uniform(1.0); }
+        }
+    }
+}
+
+/// Advance `rng` past the post-blocks lm_head draws CPU's `init_model` makes
+/// when the model is non-tied and non-low-rank. Call after all blocks'
+/// `advance_rng_for_block_ffn` calls.
+pub fn advance_rng_for_lm_head(rng: &mut Rng, vocab_size: usize, n_embd: usize) {
+    for _ in 0..(vocab_size * n_embd) { let _ = rng.uniform(1.0); }
+}
+
 pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups: usize, d: Dims, alpha: f32, beta: f32) -> WavePacketModel {
     let mut rng = Rng::new(seed);
 
@@ -58,30 +126,11 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
     for _ in 0..n_layers {
         let ln = LayerNormWeights { weight: vec![1.0f32; d.n_embd], bias: vec![0.0f32; d.n_embd] };
 
-        let head_dim = d.n_embd / d.n_head;
-        let heads: Vec<WaveAttnHeadWeights> = (0..d.n_head).map(|h| {
-            let (phase_w, phase_b) = init_linear(&mut rng, 2, d.n_embd);
-            let (v_w, v_b) = init_linear(&mut rng, head_dim, head_dim);
-            // Frozen content projection — deterministic-random symmetry-breaker for attention.
-            // Breaks the content-independence of harmonic coherence scoring so that
-            // different inputs attend differently. Never serialized, never trained.
-            let (content_w, content_b) = if d.learnable_ode {
-                init_linear(&mut rng, crate::wave_attn::CONTENT_DIM, d.n_embd)
-            } else {
-                (vec![], vec![]) // empty = pure harmonic coherence (backward-compatible)
-            };
-            WaveAttnHeadWeights {
-                harmonic_raw: ((h + 1) as f32 * 0.5f32).ln(),
-                phase_proj_w: phase_w,
-                phase_proj_b: phase_b,
-                v_proj_w: v_w,
-                v_proj_b: v_b,
-                content_proj_w: content_w,
-                content_proj_b: content_b,
-            }
-        }).collect();
-        let (out_w, out_b) = init_linear(&mut rng, d.n_embd, d.n_embd);
-        let attn = WaveAttnWeights { heads, out_proj_w: out_w, out_proj_b: out_b };
+        // Attention: shared helper so every tier (CPU, Candle) gets identical
+        // weights from the same RNG position. content_dim = CONTENT_DIM when
+        // learnable_ode (frozen symmetry-breaker), else 0.
+        let content_dim = if d.learnable_ode { crate::wave_attn::CONTENT_DIM } else { 0 };
+        let attn = init_block_attn(&mut rng, d.n_head, d.n_embd, content_dim);
 
         let gamma_raw_val = ((0.1f32).exp() - 1.0).ln();
         let kerr = KerrWeights {
