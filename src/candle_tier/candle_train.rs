@@ -699,6 +699,7 @@ pub mod train {
                         wpe: vec![], blocks: vec![], ln_f: crate::model::LayerNormWeights { weight: vec![], bias: vec![] },
                         lm_head: vec![], lm_down: vec![], lm_up: vec![], lm_rank: 0, vocab_size,
                         tied_temperature: 1.0, wd_state: None, learnable_ode: false,
+                        learnable_attn: false,
                         use_rk4_weights: false, use_dyn_harmonics: false, layer_scale: vec![], use_layer_scale: false,
                         lr_scale: vec![], use_lr_scale: false, wd_scale: vec![], agc_headroom: vec![],
                         phase_native: false, output_corrector: vec![],

@@ -23,6 +23,7 @@ pub struct WavePacketModel {
     // Wave transduction decoder (self-contained module)
     pub wd_state: Option<crate::common::wave_decode::WaveDecodeState>,
     pub learnable_ode: bool, // true = ODE params in flatten/unflatten, false = frozen
+    pub learnable_attn: bool, // true = attention weights serialize + train
     pub use_rk4_weights: bool, // true = RK4 combination weights are learnable
     pub use_dyn_harmonics: bool, // true = per-head harmonic numbers are learnable
     pub layer_scale: Vec<f32>, // per-layer residual scaling (1.0 = default, learnable when dynamic)
@@ -209,6 +210,7 @@ pub fn init_model(vocab_size: usize, seed: u64, n_layers: usize, out_proj_groups
     WavePacketModel {
         wte, wpe, blocks, ln_f, lm_head, lm_down, lm_up, lm_rank, vocab_size,
         tied_temperature: 1.0, wd_state, learnable_ode: d.learnable_ode,
+        learnable_attn: d.learnable_attn,
         use_rk4_weights: d.use_rk4_weights,
         use_dyn_harmonics: d.use_dyn_harmonics,
         layer_scale: vec![1.0; n_layers],
@@ -283,6 +285,20 @@ pub fn count_trainable_ex(model: &WavePacketModel, tied: bool) -> usize {
         if model.use_dyn_harmonics {
             n += block.attn.heads.len(); // harmonic_raw per head
         }
+        if model.learnable_attn {
+            // Per-head attention projections + per-block out_proj. Matches
+            // the flatten order below so J5 stays consistent.
+            for head in &block.attn.heads {
+                n += head.phase_proj_w.iter().map(|r| r.len()).sum::<usize>();
+                n += head.phase_proj_b.len();
+                n += head.v_proj_w.iter().map(|r| r.len()).sum::<usize>();
+                n += head.v_proj_b.len();
+                n += head.content_proj_w.iter().map(|r| r.len()).sum::<usize>();
+                n += head.content_proj_b.len();
+            }
+            n += block.attn.out_proj_w.iter().map(|r| r.len()).sum::<usize>();
+            n += block.attn.out_proj_b.len();
+        }
     }
     if model.use_layer_scale {
         n += model.layer_scale.len(); // 1 per layer
@@ -337,6 +353,20 @@ pub fn flatten_params_ex(model: &WavePacketModel, tied: bool) -> Vec<f32> {
             for head in &block.attn.heads {
                 p.push(head.harmonic_raw);
             }
+        }
+        if model.learnable_attn {
+            // Per-head attention projections.
+            for head in &block.attn.heads {
+                for row in &head.phase_proj_w { p.extend_from_slice(row); }
+                p.extend_from_slice(&head.phase_proj_b);
+                for row in &head.v_proj_w { p.extend_from_slice(row); }
+                p.extend_from_slice(&head.v_proj_b);
+                for row in &head.content_proj_w { p.extend_from_slice(row); }
+                p.extend_from_slice(&head.content_proj_b);
+            }
+            // Block-level attn out_proj.
+            for row in &block.attn.out_proj_w { p.extend_from_slice(row); }
+            p.extend_from_slice(&block.attn.out_proj_b);
         }
     }
     if model.use_layer_scale {
@@ -402,6 +432,34 @@ pub fn unflatten_params_ex(model: &mut WavePacketModel, params: &[f32], tied: bo
             for head in &mut block.attn.heads {
                 head.harmonic_raw = params[idx]; idx += 1;
             }
+        }
+        if model.learnable_attn {
+            for head in &mut block.attn.heads {
+                for row in &mut head.phase_proj_w {
+                    let n = row.len();
+                    row.copy_from_slice(&params[idx..idx+n]); idx += n;
+                }
+                let n = head.phase_proj_b.len();
+                head.phase_proj_b.copy_from_slice(&params[idx..idx+n]); idx += n;
+                for row in &mut head.v_proj_w {
+                    let n = row.len();
+                    row.copy_from_slice(&params[idx..idx+n]); idx += n;
+                }
+                let n = head.v_proj_b.len();
+                head.v_proj_b.copy_from_slice(&params[idx..idx+n]); idx += n;
+                for row in &mut head.content_proj_w {
+                    let n = row.len();
+                    row.copy_from_slice(&params[idx..idx+n]); idx += n;
+                }
+                let n = head.content_proj_b.len();
+                head.content_proj_b.copy_from_slice(&params[idx..idx+n]); idx += n;
+            }
+            for row in &mut block.attn.out_proj_w {
+                let n = row.len();
+                row.copy_from_slice(&params[idx..idx+n]); idx += n;
+            }
+            let n = block.attn.out_proj_b.len();
+            block.attn.out_proj_b.copy_from_slice(&params[idx..idx+n]); idx += n;
         }
     }
     if model.use_layer_scale {

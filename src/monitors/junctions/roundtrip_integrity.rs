@@ -160,4 +160,29 @@ mod tests {
         print_result(&result, false);
         assert!(result.passed(), "Realistic scale roundtrip failed: {} mismatches", result.n_mismatched);
     }
+
+    #[test]
+    fn test_roundtrip_learnable_attn() {
+        // With learnable_ode=true, content_proj is populated in CPU attn init,
+        // so the flatten path includes it. Verifies that the full set of
+        // attention params survives save → load intact.
+        let dims = Dims::from_cli(4, 2, 16, 128, 16)
+            .with_learnable_ode(true).with_corrector(true)
+            .with_learnable_attn(true);
+        let result = check_roundtrip(15, 1, 4, 2, dims, 0.1, 0.2);
+        print_result(&result, false);
+        assert!(result.passed(), "Learnable-attn roundtrip failed: {} mismatches", result.n_mismatched);
+    }
+
+    #[test]
+    fn test_roundtrip_learnable_attn_no_content_proj() {
+        // learnable_ode=false → content_proj vectors are empty, so the flatten
+        // path skips their bytes automatically. Must still round-trip.
+        let dims = Dims::from_cli(4, 2, 16, 128, 16)
+            .with_learnable_ode(false).with_corrector(false)
+            .with_learnable_attn(true);
+        let result = check_roundtrip(15, 1, 4, 2, dims, 0.1, 0.2);
+        print_result(&result, false);
+        assert!(result.passed(), "Learnable-attn-no-content roundtrip failed: {} mismatches", result.n_mismatched);
+    }
 }

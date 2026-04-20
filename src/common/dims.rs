@@ -41,14 +41,19 @@ pub struct Dims {
     pub attention_pathway: bool, // true = attention backward computes d_normed (fixes bugs #5, #6)
     pub ode_pathway: bool, // true = frozen ODE uses real Jacobian backward (fixes bug #9)
     pub split_band: bool, // true = freeze-and-decouple ODE integration (2×2 Jacobian chains, clean mae_in gradients). Phase A requires chi=0.
+    pub learnable_attn: bool, // true = attention weights (phase/v/content/out_proj) train + serialize. Default false = frozen symmetry-breaker.
 }
 
 impl Dims {
     pub fn from_cli(n_bands: usize, n_head: usize, maestro_dim: usize, block_size: usize, rk4_steps: usize) -> Self {
-        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false, phase_temp: 0.0, pythagorean: false, use_rk4_weights: false, use_dyn_harmonics: false, fwm_strength: 0.0, attention_pathway: true, ode_pathway: true, split_band: false }
+        Self { n_bands, n_embd: n_bands * 2, n_head, maestro_dim, block_size, rk4_steps, m1: None, m2: None, tied: false, lm_rank: 0, wave_decode: false, unfreeze_phases: false, learnable_ode: true, use_corrector: true, use_layer_scale: false, use_lr_scale: false, phase_temp: 0.0, pythagorean: false, use_rk4_weights: false, use_dyn_harmonics: false, fwm_strength: 0.0, attention_pathway: true, ode_pathway: true, split_band: false, learnable_attn: false }
     }
     pub fn with_split_band(mut self, sb: bool) -> Self {
         self.split_band = sb;
+        self
+    }
+    pub fn with_learnable_attn(mut self, la: bool) -> Self {
+        self.learnable_attn = la;
         self
     }
     pub fn with_tied(mut self, tied: bool) -> Self {
