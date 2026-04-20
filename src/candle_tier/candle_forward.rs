@@ -172,9 +172,10 @@ pub mod forward {
                     };
                     let param_grads = self.ode_param_grads.as_ref()
                         .expect("CustomOp requires ode_param_grads on model").clone();
-                    let op = crate::candle_tier::custom_ode::custom_ode::KerrOdeCustomOp::new(
+                    let op = crate::candle_tier::custom_ode::custom_ode::KerrOdeCustomOp::new_with_split_band(
                         gamma_raw, omega, alpha_v, beta_v, rk4_w,
                         block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
+                        self.split_band,
                         param_grads,
                     );
                     // CustomOp runs on CPU — move tensor CPU→op→GPU
@@ -454,9 +455,10 @@ pub mod forward {
                     };
                     let param_grads = self.ode_param_grads.as_ref()
                         .expect("CustomOp requires ode_param_grads on model").clone();
-                    let op = crate::candle_tier::custom_ode::custom_ode::KerrOdeCustomOp::new(
+                    let op = crate::candle_tier::custom_ode::custom_ode::KerrOdeCustomOp::new_with_split_band(
                         gamma_raw, omega, alpha_v, beta_v, rk4_w,
                         block.gpu_ode_params.rk4_steps, block.gpu_ode_params.n_bands, block_idx,
+                        self.split_band,
                         param_grads,
                     );
                     let precond_cpu = precond.to_device(&candle_core::Device::Cpu)?;

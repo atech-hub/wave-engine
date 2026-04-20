@@ -297,7 +297,7 @@ fn cmd_verify_tier_parity(args: cli::VerifyTierParityArgs) {
 
     let dims = Dims::from_cli(m.n_bands, m.n_head, m.maestro_dim, 128, crate::RK4_STEPS)
         .with_corrector(true)
-        .with_split_band(false); // section-by-section wants monolithic ODE to stress the GPU path
+        .with_split_band(args.split_band);
 
     let model = if let Some(ref ckpt) = args.resume {
         println!("[J10] Loading checkpoint: {}", ckpt);

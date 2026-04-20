@@ -36,12 +36,20 @@ pub mod custom_ode {
     }
 
     /// Cached forward intermediates — shared between forward and backward via Arc<Mutex>.
+    /// Variant matches whichever integration strategy produced the cache.
+    enum OdeCachePayload {
+        Monolithic(Vec<crate::common::ode_backward::OdeForwardCache>),
+        SplitBand(Vec<crate::common::ode_split_band::SplitBandForwardCache>),
+    }
     struct OdeCache {
-        caches: Vec<crate::common::ode_backward::OdeForwardCache>,
+        payload: OdeCachePayload,
         weights: crate::model::KerrWeights,
     }
 
     /// The CustomOp — holds ODE params, runs forward without autograd graph.
+    /// When `split_band` is true the forward/backward route to the freeze-and-
+    /// decouple split-band integration (same CPU functions CPU/wgpu tiers use),
+    /// which requires chi=0 (Phase A — FWM in the coupling step is Phase B).
     pub struct KerrOdeCustomOp {
         gamma_raw: Vec<f32>,
         omega: Vec<f32>,
@@ -51,6 +59,7 @@ pub mod custom_ode {
         rk4_steps: usize,
         n_bands: usize,
         layer_idx: usize,
+        split_band: bool,
         cache: Arc<Mutex<Option<OdeCache>>>,
         param_grads: SharedParamGrads,
     }
@@ -62,9 +71,22 @@ pub mod custom_ode {
             rk4_steps: usize, n_bands: usize, layer_idx: usize,
             param_grads: SharedParamGrads,
         ) -> Self {
+            Self::new_with_split_band(
+                gamma_raw, omega, alpha, beta, rk4_weights,
+                rk4_steps, n_bands, layer_idx, /*split_band=*/ false, param_grads,
+            )
+        }
+
+        pub fn new_with_split_band(
+            gamma_raw: Vec<f32>, omega: Vec<f32>,
+            alpha: f32, beta: f32, rk4_weights: [f32; 4],
+            rk4_steps: usize, n_bands: usize, layer_idx: usize,
+            split_band: bool,
+            param_grads: SharedParamGrads,
+        ) -> Self {
             Self {
                 gamma_raw, omega, alpha, beta, rk4_weights,
-                rk4_steps, n_bands, layer_idx,
+                rk4_steps, n_bands, layer_idx, split_band,
                 cache: Arc::new(Mutex::new(None)),
                 param_grads,
             }
@@ -98,21 +120,37 @@ pub mod custom_ode {
 
             let weights = self.make_weights();
 
-            // Run the EXACT same forward as CPU tier — with cache for backward
+            // Run the EXACT same forward as CPU tier — with cache for backward.
+            // Split-band uses the freeze-and-decouple integration; monolithic
+            // uses the full RK4. Both produce one cache per position.
             let mut outputs = vec![0.0f32; n_pos * n_embd];
-            let mut caches = Vec::with_capacity(n_pos);
-
-            for pos in 0..n_pos {
-                let start = layout.start_offset() + pos * n_embd;
-                let x = &input[start..start + n_embd];
-                let (out, cache) = crate::common::ode_backward::ode_forward_with_cache(x, &weights);
-                outputs[pos * n_embd..(pos + 1) * n_embd].copy_from_slice(&out);
-                caches.push(cache);
-            }
+            let payload: OdeCachePayload = if self.split_band {
+                let mut caches = Vec::with_capacity(n_pos);
+                for pos in 0..n_pos {
+                    let start = layout.start_offset() + pos * n_embd;
+                    let x = &input[start..start + n_embd];
+                    let (out, cache) =
+                        crate::common::ode_split_band::split_band_forward_with_cache(x, &weights);
+                    outputs[pos * n_embd..(pos + 1) * n_embd].copy_from_slice(&out);
+                    caches.push(cache);
+                }
+                OdeCachePayload::SplitBand(caches)
+            } else {
+                let mut caches = Vec::with_capacity(n_pos);
+                for pos in 0..n_pos {
+                    let start = layout.start_offset() + pos * n_embd;
+                    let x = &input[start..start + n_embd];
+                    let (out, cache) =
+                        crate::common::ode_backward::ode_forward_with_cache(x, &weights);
+                    outputs[pos * n_embd..(pos + 1) * n_embd].copy_from_slice(&out);
+                    caches.push(cache);
+                }
+                OdeCachePayload::Monolithic(caches)
+            };
 
             // Store cache for backward
             *self.cache.lock().unwrap() = Some(OdeCache {
-                caches,
+                payload,
                 weights: self.make_weights(),
             });
 
@@ -140,9 +178,18 @@ pub mod custom_ode {
 
             for pos in 0..n_pos {
                 let d_out = &d_output_flat[pos * n_embd..(pos + 1) * n_embd];
-                let (d_input, pg) = crate::common::ode_backward::ode_backward(
-                    d_out, &ode_cache.caches[pos], &ode_cache.weights,
-                );
+                let (d_input, pg) = match &ode_cache.payload {
+                    OdeCachePayload::Monolithic(caches) => {
+                        crate::common::ode_backward::ode_backward(
+                            d_out, &caches[pos], &ode_cache.weights,
+                        )
+                    }
+                    OdeCachePayload::SplitBand(caches) => {
+                        crate::common::ode_split_band::split_band_backward(
+                            d_out, &caches[pos], &ode_cache.weights,
+                        )
+                    }
+                };
                 d_inputs[pos * n_embd..(pos + 1) * n_embd].copy_from_slice(&d_input);
 
                 for k in 0..self.n_bands { total_d_gamma_raw[k] += pg.d_gamma_raw[k]; }

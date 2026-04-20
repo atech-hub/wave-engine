@@ -229,10 +229,12 @@ pub fn run_cpu_vs_candle_parity(
     );
 
     // Route Candle's ODE through the CustomOp that calls into the canonical
-    // CPU `ode_forward_with_cache`, so the ODE step matches CPU bit-exactly.
+    // CPU `ode_forward_with_cache` (or `split_band_forward_with_cache` when
+    // dims.split_band is true), so the ODE step matches CPU bit-exactly.
     // Without this, Candle uses its autograd tensor-ops RK4 (ode.rs) which is
     // a separate implementation of the same math and will diverge in f32.
     candle_model.use_custom_op = true;
+    candle_model.split_band = dims.split_band;
     candle_model.ode_param_grads = Some(
         crate::candle_tier::custom_ode::custom_ode::create_param_grad_storage(n_layers),
     );

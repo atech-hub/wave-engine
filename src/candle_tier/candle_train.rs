@@ -74,6 +74,21 @@ pub mod train {
         model.debug_nan = debug_nan;
         model.use_custom_op = use_custom_op;
         model.use_cuda_kernel = use_cuda_kernel;
+        // Split-band from FfnConfig. Phase A requires chi=0 (FWM in coupling
+        // step is Phase B); the CPU split-band function asserts this.
+        model.split_band = ffn.split_band;
+        // Split-band needs the ODE to run via the custom-op path (so the
+        // CPU split-band cache/backward is reachable). Force it on when
+        // split-band is requested — autograd tensor-ops ODE can't produce
+        // the split-band cache.
+        if ffn.split_band {
+            model.use_custom_op = true;
+            if model.ode_param_grads.is_none() {
+                model.ode_param_grads = Some(
+                    crate::candle_tier::custom_ode::custom_ode::create_param_grad_storage(n_layers),
+                );
+            }
+        }
         // Attention CustomOp runs every forward; its gradient sink is always needed.
         model.attn_param_grads = Some(
             crate::candle_tier::custom_attn::custom_attn::create_attn_grad_storage(n_layers),

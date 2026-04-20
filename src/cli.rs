@@ -560,6 +560,10 @@ pub struct VerifyTierParityArgs {
     /// Print every section's diff even on pass (not just violations)
     #[arg(long)]
     pub verbose: bool,
+
+    /// Run both tiers with split-band ODE integration (Phase A; chi=0 required)
+    #[arg(long)]
+    pub split_band: bool,
 }
 
 #[derive(clap::Args)]

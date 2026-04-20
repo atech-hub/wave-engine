@@ -41,6 +41,7 @@ pub mod model {
         pub layer_agcs: Option<Vec<crate::common::agc::OdeAgc>>,  // per-layer AGC (when --agc-headroom dyn)
         pub use_custom_op: bool,  // true = CustomOp ODE (no autograd graph, CPU backward)
         pub use_cuda_kernel: bool, // true = CUDA native kernel (GPU forward, CPU backward)
+        pub split_band: bool,     // true = freeze-and-decouple ODE integration (requires chi=0)
         pub ode_param_grads: Option<crate::candle_tier::custom_ode::custom_ode::SharedParamGrads>,
         /// Shared attention-param grads populated by WaveAttentionCustomOp::bwd.
         /// One slot per block; optimizer reads it after loss.backward().
@@ -274,7 +275,8 @@ pub mod model {
             };
 
             Ok(Self { wte, wpe, blocks, ln_f_w, ln_f_b, lm_head, output_corrector, phase_native,
-                layer_agcs: None, use_custom_op: false, use_cuda_kernel: false, ode_param_grads: None, attn_param_grads: None, device: device.clone(),
+                layer_agcs: None, use_custom_op: false, use_cuda_kernel: false, split_band: false,
+                ode_param_grads: None, attn_param_grads: None, device: device.clone(),
                 n_bands: n_bands_cfg, n_embd: n_embd_cfg, n_head: n_head_cfg, block_size: block_size_cfg, debug_nan: false })
         }
     }
