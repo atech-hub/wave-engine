@@ -541,6 +541,10 @@ pub struct VerifyTierParityArgs {
     #[command(flatten)]
     pub model: ModelArgs,
 
+    /// Tier to compare against CPU: wgpu | candle
+    #[arg(long, default_value = "wgpu")]
+    pub tier: String,
+
     /// Checkpoint to load (omit for random-init model)
     #[arg(long)]
     pub resume: Option<String>,

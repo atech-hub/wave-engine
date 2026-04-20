@@ -151,3 +151,134 @@ pub fn run_cpu_vs_wgpu_parity(
         sections,
     }
 }
+
+/// Run the same forward pass on CPU and Candle, diff the final logits.
+///
+/// This is the *minimum viable* Candle parity check. Unlike the wgpu runner
+/// (which diffs 13 sub-sections per block), Candle's block forward emits only
+/// a single output tensor — not the intermediate FfnCache that the shared
+/// `common/ffn.rs` pipeline produces. End-to-end logits parity is the honest
+/// measurement available today; per-section instrumentation of the Candle
+/// forward would be a separate task.
+///
+/// Weight bridge: we flatten the CPU model's params and load them into the
+/// Candle VarMap via `load_wchk_params_into_varmap`, so both models run with
+/// bit-identical weights. Forward is deterministic (no dropout), so any
+/// divergence is pure FP-order effect from the tensor-ops vs hand-written CPU
+/// math.
+#[cfg(feature = "candle-backend")]
+pub fn run_cpu_vs_candle_parity(
+    model: &WavePacketModel,
+    tokens: &[usize],
+    dims: Dims,
+    alpha: f32,
+    beta: f32,
+    phase_native: bool,
+    use_rk4_dyn: bool,
+    use_layer_scale: bool,
+    use_harmonics: bool,
+) -> Result<ParityReport, String> {
+    use candle_core::Device;
+    use candle_nn::VarMap;
+    use crate::candle_tier::candle_model::model::CandleWaveModel;
+    use crate::candle_tier::candle_checkpoint::checkpoint::load_wchk_params_into_varmap;
+
+    let n_layers = model.blocks.len();
+    let n_bands = dims.n_bands;
+    let n_embd = dims.n_embd;
+    let maestro_dim = dims.maestro_dim;
+    let vocab_size = model.vocab_size;
+    let out_proj_groups = if model.blocks[0].ffn.out_proj.n_groups() >= 1 {
+        model.blocks[0].ffn.out_proj.n_groups()
+    } else {
+        1
+    };
+
+    // CPU forward — same call the wgpu runner uses so the two are head-to-head.
+    let stencil = crate::fft_ode::StencilFft::new(n_bands);
+    let cpu_cache: ForwardCache = forward_with_cache(
+        model, tokens, dims,
+        None, None, None, Some(&stencil), None, None, None,
+    );
+
+    // Candle: build a fresh VarMap + model, then bridge weights in. `Device::Cpu`
+    // keeps the comparison honest — any CUDA/GPU non-determinism stays out of
+    // the numbers until we explicitly test against a GPU device in a follow-up.
+    let device = Device::Cpu;
+    let varmap = VarMap::new();
+    let mut candle_model = CandleWaveModel::new(
+        &varmap, vocab_size, &device,
+        n_bands, dims.n_head, n_layers, maestro_dim, crate::RK4_STEPS, out_proj_groups,
+        alpha, beta, dims.fwm_strength, phase_native,
+    ).map_err(|e| format!("CandleWaveModel::new failed: {e:?}"))?;
+
+    // Flatten CPU params and load into the Candle VarMap using the existing bridge.
+    let cpu_params = crate::common::wave_model::flatten_params_ex(model, dims.tied);
+    load_wchk_params_into_varmap(
+        &varmap, &cpu_params,
+        n_layers, n_embd, maestro_dim,
+        vocab_size, out_proj_groups, n_bands,
+        dims.learnable_ode, use_layer_scale, use_rk4_dyn, phase_native,
+        &device,
+    ).map_err(|e| format!("load_wchk_params_into_varmap failed: {e:?}"))?;
+
+    // Candle requires attn_param_grads initialised (WaveAttentionCustomOp bwd
+    // writes to it even when we don't read it back).
+    candle_model.attn_param_grads = Some(
+        crate::candle_tier::custom_attn::custom_attn::create_attn_grad_storage(n_layers),
+    );
+
+    let logits_tensor = candle_model.forward(tokens)
+        .map_err(|e| format!("CandleWaveModel::forward failed: {e:?}"))?;
+    let candle_logits: Vec<Vec<f32>> = logits_tensor.to_vec2::<f32>()
+        .map_err(|e| format!("logits.to_vec2 failed: {e:?}"))?;
+
+    let mut sections: Vec<ParityDiff> = Vec::new();
+    sections.push(check_outputs_2d(
+        "logits",
+        &cpu_cache.logits,
+        &candle_logits,
+        Tolerance::LINEAR,
+    ));
+
+    // Catch shape mismatch cheaply as its own section.
+    let cpu_shape = (cpu_cache.logits.len(),
+        cpu_cache.logits.first().map(|r| r.len()).unwrap_or(0));
+    let candle_shape = (candle_logits.len(),
+        candle_logits.first().map(|r| r.len()).unwrap_or(0));
+    if cpu_shape != candle_shape {
+        sections.push(check_outputs_1d(
+            "logits_shape",
+            &[cpu_shape.0 as f32, cpu_shape.1 as f32],
+            &[candle_shape.0 as f32, candle_shape.1 as f32],
+            Tolerance::TIGHT,
+        ));
+    }
+
+    // Silence unused-var warnings on `use_harmonics` — currently it's only
+    // consumed by load_wchk_params_into_varmap indirectly (flag compat), kept
+    // on the signature so the caller can make the intent explicit.
+    let _ = use_harmonics;
+
+    Ok(ParityReport {
+        tier_a: "cpu".to_string(),
+        tier_b: "candle".to_string(),
+        sections,
+    })
+}
+
+/// Stub when candle-backend feature is off.
+#[cfg(not(feature = "candle-backend"))]
+pub fn run_cpu_vs_candle_parity(
+    _model: &WavePacketModel,
+    _tokens: &[usize],
+    _dims: Dims,
+    _alpha: f32,
+    _beta: f32,
+    _phase_native: bool,
+    _use_rk4_dyn: bool,
+    _use_layer_scale: bool,
+    _use_harmonics: bool,
+) -> Result<ParityReport, String> {
+    Err("Candle parity requires: cargo build --features candle-backend".to_string())
+}
