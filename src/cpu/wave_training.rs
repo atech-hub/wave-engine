@@ -170,12 +170,17 @@ pub fn run(config: &TrainConfig) {
     // Monitor state — shared between iterations for dyn-param drift tracking
     let mut prev_dyn_snap: Option<crate::monitors::dyn_param_monitor::DynParamSnapshot> = None;
 
-    println!("\nTraining for {} iterations (seq={}, lr={})",
-        config.n_iters, seq_len, lr);
+    println!("\nTraining for {} iterations (batch={}, seq={}, lr={})",
+        config.n_iters, config.batch_size.max(1), seq_len, lr);
     println!("{:>6} {:>10} {:>10}  lr       gnorm    cos_sim  best_l2", "Iter", "L2_loss", "Time");
     println!("{}", "-".repeat(72));
 
     let train_start = std::time::Instant::now();
+
+    // Batch size: number of independent windows per iter whose gradients are
+    // averaged before the optimizer step. Each window samples an independent
+    // random start — matches the token loop's semantics.
+    let batch_size = config.batch_size.max(1);
 
     // ── Main loop ────────────────────────────────────────────────
     for iter in start_iter..total_iters {
@@ -191,44 +196,80 @@ pub fn run(config: &TrainConfig) {
         };
         optimizer.lr = current_lr;
 
-        // Random window into KWDS.
+        // Accumulate gradients and loss across the batch.
         let max_start = n_positions.saturating_sub(seq_len + 1).max(1);
-        let start = (rng.next_u64() as usize) % max_start;
-        let window_len = seq_len.min(n_positions - start - 1);
+        let mut accum_grads: Option<Vec<f32>> = None;
+        let mut accum_loss = 0.0f32;
+        let mut accum_cos_sim = 0.0f32;
+        let mut first_cache: Option<crate::cpu::forward::ForwardCache> = None;
+        let mut first_grads: Option<crate::cpu::model_backward::Gradients> = None;
+        let mut batch_nan = false;
 
-        let inputs = kwds::read_input_window(&mut kwds_file, &header, start as u64, window_len)
-            .expect("KWDS input read failed");
-        let targets = kwds::read_target_window(&mut kwds_file, &header, start as u64, window_len)
-            .expect("KWDS target read failed");
+        for batch_idx in 0..batch_size {
+            // Independent random window per batch element.
+            let start = (rng.next_u64() as usize) % max_start;
+            let window_len = seq_len.min(n_positions - start - 1);
 
-        let cache = crate::cpu::forward::forward_with_cache_from_waves(
-            &model, &inputs, dims, Some(&stencil),
-        );
-        let (loss, grads) = crate::cpu::model_backward::backward_wave(
-            &model, &cache, &targets, dims,
-        );
+            let inputs = kwds::read_input_window(&mut kwds_file, &header, start as u64, window_len)
+                .expect("KWDS input read failed");
+            let targets = kwds::read_target_window(&mut kwds_file, &header, start as u64, window_len)
+                .expect("KWDS target read failed");
 
-        // NaN guard — same policy as token loop: skip optimizer step on NaN.
-        if !loss.is_finite() {
-            nan_skip_count += 1;
-            eprintln!("  [NaN skip] iter {iter} (total skips: {nan_skip_count})");
-            continue;
-        }
+            let cache = crate::cpu::forward::forward_with_cache_from_waves(
+                &model, &inputs, dims, Some(&stencil),
+            );
+            let (loss, grads) = crate::cpu::model_backward::backward_wave(
+                &model, &cache, &targets, dims,
+            );
 
-        // Post-forward cosine similarity (wave-specific diagnostic).
-        let cos_sim = {
-            let mut sum = 0.0f32;
+            if !loss.is_finite() {
+                batch_nan = true;
+                break;
+            }
+
+            // Per-element cosine similarity contribution.
             let ct = cache.post_ln_f.len().min(targets.len());
+            let mut elem_cos = 0.0f32;
             for pos in 0..ct {
                 let pred = &cache.post_ln_f[pos];
                 let tgt = &targets[pos];
                 let dot: f32 = pred.iter().zip(tgt.iter()).map(|(&a, &b)| a * b).sum();
                 let np: f32 = pred.iter().map(|x| x * x).sum::<f32>().sqrt();
                 let nt: f32 = tgt.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if np > 1e-8 && nt > 1e-8 { sum += dot / (np * nt); }
+                if np > 1e-8 && nt > 1e-8 { elem_cos += dot / (np * nt); }
             }
-            sum / ct.max(1) as f32
-        };
+            accum_cos_sim += elem_cos / ct.max(1) as f32;
+            accum_loss += loss;
+
+            // Flatten grads once and accumulate elementwise.
+            let flat = crate::cpu::model_backward::flatten_grads_ex(&grads, config.tied);
+            match accum_grads.as_mut() {
+                None => accum_grads = Some(flat),
+                Some(a) => for (a_i, g_i) in a.iter_mut().zip(flat.iter()) { *a_i += *g_i; },
+            }
+
+            // Keep the first batch element's cache + grads for the health monitor.
+            if batch_idx == 0 {
+                first_cache = Some(cache);
+                first_grads = Some(grads);
+            }
+        }
+
+        // NaN guard — matches token loop policy: skip optimizer step on NaN.
+        if batch_nan {
+            nan_skip_count += 1;
+            eprintln!("  [NaN skip] iter {iter} (total skips: {nan_skip_count})");
+            continue;
+        }
+
+        let bsz = batch_size as f32;
+        let loss = accum_loss / bsz;
+        let cos_sim = accum_cos_sim / bsz;
+        let mut flat_grads = accum_grads.expect("batch produced no grads");
+        for g in flat_grads.iter_mut() { *g /= bsz; }
+        // Bind to immutable names for the monitor block below.
+        let cache = first_cache.expect("batch produced no cache");
+        let grads = first_grads.expect("batch produced no grads struct");
 
         if loss < best_loss {
             best_loss = loss;
@@ -236,7 +277,6 @@ pub fn run(config: &TrainConfig) {
         }
 
         // Optimizer step via shared Adam (same code path as token loop).
-        let mut flat_grads = crate::cpu::model_backward::flatten_grads_ex(&grads, config.tied);
         let grad_norm: f32 = flat_grads.iter().map(|g| g * g).sum::<f32>().sqrt();
         clip_grad_norm(&mut flat_grads, 1.0);
         let mut params = flatten_params_ex(&model, config.tied);
@@ -273,7 +313,7 @@ pub fn run(config: &TrainConfig) {
                 &health.distortion, &health.grad_flow, &health.attn_stats,
                 &health.flow_stats, &health.output_stats, &health.ode_dynamics,
                 &health.iq_analysis, &mut prev_dyn_snap,
-                1, seq_len, iter_elapsed_secs, iter_elapsed_secs, 0.0,
+                batch_size, seq_len, iter_elapsed_secs, iter_elapsed_secs, 0.0,
             );
         }
 
