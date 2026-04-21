@@ -29,7 +29,7 @@
 //! * Galaxy scan on best checkpoint at end — independent of training path.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::LineWriter;
 
 use crate::common::wave_model::*;
 use crate::common::dims::Dims;
@@ -158,7 +158,7 @@ pub fn run(config: &TrainConfig) {
     });
     let log_file = File::create(&log_name).expect("cannot create log");
     println!("  Telemetry: {log_name}");
-    let mut log_writer = BufWriter::new(log_file);
+    let mut log_writer = LineWriter::new(log_file);
 
     // ── Stall detector state ─────────────────────────────────────
     let mut best_loss = f32::MAX;
