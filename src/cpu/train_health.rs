@@ -373,6 +373,57 @@ pub struct BatchHealthData {
     pub iq_analysis: Option<crate::monitors::iq_monitor::IqAnalysis>,
 }
 
+/// Run all cache-based monitors against a forward cache and optional grads/targets.
+///
+/// Shared between the token training loop (`train_loop.rs`) and the wave training
+/// loop (`wave_training.rs`). Monitors that require token targets (output_stats,
+/// iq_analysis) return None when `targets` is None — wave training has no token
+/// targets, so those monitors skip themselves automatically.
+///
+/// Callers that don't have gradients yet (pre-backward) pass `grads: None`;
+/// `grad_flow` will be None in that case.
+pub fn collect_batch_health(
+    cache: &crate::cpu::forward::ForwardCache,
+    grads: Option<&crate::cpu::model_backward::Gradients>,
+    model: &WavePacketModel,
+    dims: Dims,
+    targets: Option<&[usize]>,
+    n_bands: usize,
+) -> BatchHealthData {
+    // Distortion: per-layer THD / gain from ODE precond + kerr_out
+    let mut layer_summaries = Vec::new();
+    for (li, bc) in cache.block_caches.iter().enumerate() {
+        if let Some(ref fc) = bc.ffn_backend_cache {
+            if let Some(summary) = crate::common::ode_distortion::measure_layer(
+                &fc.precond, &fc.kerr_out, dims.n_bands, li,
+            ) {
+                layer_summaries.push(summary);
+            }
+        }
+    }
+    let distortion = if layer_summaries.is_empty() { None } else { Some(layer_summaries) };
+
+    // Cache-only monitors — always run
+    let attn_stats = Some(crate::monitors::attn_monitor::analyze_attention(model, cache));
+    let flow_stats = Some(crate::monitors::layer_flow_monitor::analyze_flow(cache, dims));
+    let ode_dynamics = Some(crate::monitors::ode_dynamics_monitor::analyze_ode_dynamics(cache, dims));
+
+    // Gradient monitor — only if grads provided
+    let grad_flow = grads.map(|g| crate::monitors::gradient_monitor::analyze_gradients(g, dims));
+
+    // Token-target monitors — skip when targets absent (wave training)
+    let output_stats = targets.map(|t| crate::monitors::output_monitor::analyze_output(&cache.logits, t));
+    let iq_analysis = targets.map(|t| crate::monitors::iq_monitor::analyze_iq_batch(
+        &cache.post_ln_f, &model.wte, t,
+        n_bands, &model.output_corrector, &vec![1.0; n_bands], 10,
+    ));
+
+    BatchHealthData {
+        distortion, grad_flow, attn_stats, flow_stats,
+        output_stats, ode_dynamics, iq_analysis,
+    }
+}
+
 /// Write all health monitor data to JSONL at health intervals.
 pub fn write_health_monitors(
     log_writer: &mut std::io::LineWriter<std::fs::File>,

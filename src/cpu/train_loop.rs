@@ -347,71 +347,21 @@ pub fn run_training(config: TrainConfig) {
                     // Health monitors on first batch element only (before backward)
                     let is_health = measure_batch_distortion && batch_idx == 0;
 
-                    let distortion = if is_health {
-                        let mut layer_summaries = Vec::new();
-                        for (li, bc) in cache.block_caches.iter().enumerate() {
-                            if let Some(ref fc) = bc.ffn_backend_cache {
-                                if let Some(summary) = crate::common::ode_distortion::measure_layer(
-                                    &fc.precond, &fc.kerr_out, dims.n_bands, li,
-                                ) {
-                                    layer_summaries.push(summary);
-                                }
-                            }
-                        }
-                        if layer_summaries.is_empty() { None } else { Some(layer_summaries) }
-                    } else {
-                        None
-                    };
-
-                    // Attention head activity (#1)
-                    let attn_stats = if is_health {
-                        Some(crate::monitors::attn_monitor::analyze_attention(model_ref, &cache))
-                    } else {
-                        None
-                    };
-
-                    // Layer signal flow (#2)
-                    let flow_stats = if is_health {
-                        Some(crate::monitors::layer_flow_monitor::analyze_flow(&cache, dims))
-                    } else {
-                        None
-                    };
-
-                    // Output distribution (#5)
-                    let output_stats = if is_health {
-                        let targets_vec: Vec<usize> = target.to_vec();
-                        Some(crate::monitors::output_monitor::analyze_output(&cache.logits, &targets_vec))
-                    } else {
-                        None
-                    };
-
-                    // ODE dynamics deep (#6)
-                    let ode_dynamics = if is_health {
-                        Some(crate::monitors::ode_dynamics_monitor::analyze_ode_dynamics(&cache, dims))
-                    } else {
-                        None
-                    };
-
-                    // I/Q channel monitor — observation only, no learnable params
-                    let iq_analysis = if is_health {
-                        Some(crate::monitors::iq_monitor::analyze_iq_batch(
-                            &cache.post_ln_f, &model_ref.wte, target,
-                            dims.n_bands, &model_ref.output_corrector, &vec![1.0; dims.n_bands], 10,
-                        ))
-                    } else {
-                        None
-                    };
-
                     let (loss, grads) = backward(model_ref, &cache, target, dims, gpu_ref, pp_ref, fg_ref);
-                    // Gradient flow analysis on first batch element at health intervals
-                    let grad_flow = if is_health {
-                        Some(crate::monitors::gradient_monitor::analyze_gradients(&grads, dims))
+
+                    let health = if is_health {
+                        train_health::collect_batch_health(
+                            &cache, Some(&grads), model_ref, dims, Some(target), dims.n_bands,
+                        )
                     } else {
-                        None
+                        BatchHealthData {
+                            distortion: None, grad_flow: None, attn_stats: None,
+                            flow_stats: None, output_stats: None, ode_dynamics: None,
+                            iq_analysis: None,
+                        }
                     };
-                    (loss, flatten_grads_ex(&grads, dims.tied), BatchHealthData {
-                        distortion, grad_flow, attn_stats, flow_stats, output_stats, ode_dynamics, iq_analysis,
-                    })
+
+                    (loss, flatten_grads_ex(&grads, dims.tied), health)
                 })
             }).collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()

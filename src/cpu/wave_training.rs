@@ -167,6 +167,9 @@ pub fn run(config: &TrainConfig) {
     let mut loss_at_2000 = f32::MAX;
     let mut nan_skip_count = 0usize;
 
+    // Monitor state — shared between iterations for dyn-param drift tracking
+    let mut prev_dyn_snap: Option<crate::monitors::dyn_param_monitor::DynParamSnapshot> = None;
+
     println!("\nTraining for {} iterations (seq={}, lr={})",
         config.n_iters, seq_len, lr);
     println!("{:>6} {:>10} {:>10}  lr       gnorm    cos_sim  best_l2", "Iter", "L2_loss", "Time");
@@ -253,6 +256,24 @@ pub fn run(config: &TrainConfig) {
                 log_writer,
                 r#"{{"iter":{},"loss":{:.4},"lr":{:.6},"gnorm":{:.4},"cos_sim":{:.4},"nan_skips":{},"loss_mode":"wave_l2"}}"#,
                 iter, loss, current_lr, grad_norm, cos_sim, nan_skip_count,
+            );
+        }
+
+        // Health monitors — shared suite from train_health::collect_batch_health.
+        // Wave training passes targets: None, so token-dependent monitors (output,
+        // iq) skip themselves; attn, flow, ode_dynamics, distortion, grad_flow all run.
+        if config.health_interval > 0 && iter % config.health_interval == 0 && iter != start_iter {
+            let health = crate::cpu::train_health::collect_batch_health(
+                &cache, Some(&grads), &model, dims, None, n_bands,
+            );
+            let iters_into_run = iter - start_iter;
+            let iter_elapsed_secs = iter_start.elapsed().as_secs_f32();
+            crate::cpu::train_health::write_health_monitors(
+                &mut log_writer, iter, iters_into_run, &model, config, dims, &stencil,
+                &health.distortion, &health.grad_flow, &health.attn_stats,
+                &health.flow_stats, &health.output_stats, &health.ode_dynamics,
+                &health.iq_analysis, &mut prev_dyn_snap,
+                1, seq_len, iter_elapsed_secs, iter_elapsed_secs, 0.0,
             );
         }
 
