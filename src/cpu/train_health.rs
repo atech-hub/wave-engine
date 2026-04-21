@@ -250,7 +250,7 @@ pub fn first10_health_check(
 
 /// Write per-iteration JSONL telemetry line (compact every iter, detailed every 100).
 pub fn write_jsonl_telemetry(
-    log_writer: &mut std::io::BufWriter<std::fs::File>,
+    log_writer: &mut std::io::LineWriter<std::fs::File>,
     iter: usize,
     total_loss: f32,
     current_lr: f32,
@@ -375,7 +375,7 @@ pub struct BatchHealthData {
 
 /// Write all health monitor data to JSONL at health intervals.
 pub fn write_health_monitors(
-    log_writer: &mut std::io::BufWriter<std::fs::File>,
+    log_writer: &mut std::io::LineWriter<std::fs::File>,
     iter: usize,
     iters_into_run: usize,
     model: &WavePacketModel,
@@ -526,7 +526,7 @@ pub fn write_health_monitors(
 
 /// Write curriculum transition event to JSONL.
 pub fn write_curriculum_event(
-    log_writer: &mut std::io::BufWriter<std::fs::File>,
+    log_writer: &mut std::io::LineWriter<std::fs::File>,
     iter: usize,
     event: &crate::monitors::curriculum_monitor::CurriculumStats,
 ) {
@@ -540,7 +540,7 @@ pub fn write_curriculum_event(
 
 /// Write checkpoint drift event to JSONL.
 pub fn write_checkpoint_drift(
-    log_writer: &mut std::io::BufWriter<std::fs::File>,
+    log_writer: &mut std::io::LineWriter<std::fs::File>,
     iter: usize,
     drift: &crate::monitors::checkpoint_monitor::CheckpointDrift,
 ) {
@@ -554,7 +554,7 @@ pub fn write_checkpoint_drift(
 
 /// Write training summary to JSONL and console.
 pub fn write_training_summary(
-    log_writer: &mut std::io::BufWriter<std::fs::File>,
+    log_writer: &mut std::io::LineWriter<std::fs::File>,
     config: &TrainConfig,
     start_iter: usize,
     total_iters: usize,

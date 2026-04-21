@@ -286,7 +286,7 @@ pub mod train {
                 format!("training_log_{}.jsonl", stem)
             });
         let log_file = std::fs::File::create(&log_name).ok();
-        let mut log_writer = log_file.map(|f| std::io::BufWriter::new(f));
+        let mut log_writer = log_file.map(|f| std::io::LineWriter::new(f));
         println!("  Telemetry: {log_name}");
         let mut nan_skip_count = 0usize;
 
