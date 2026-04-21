@@ -367,6 +367,10 @@ pub struct GenerateArgs {
     #[command(flatten)]
     pub model: ModelArgs,
 
+    /// Training data file (for char vocabulary; ignored with --bpe)
+    #[arg(long, default_value = "data/input.txt")]
+    pub data: String,
+
     /// Prompt text
     #[arg(long, default_value = "The ")]
     pub prompt: String,

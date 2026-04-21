@@ -16,6 +16,7 @@ pub struct GenerateConfig {
     pub maestro_dim: usize,
     pub use_bpe: bool,
     pub tokenizer_path: String,
+    pub data_path: String,
     pub alpha: f32,
     pub beta: f32,
     pub temperature: f32,
@@ -40,15 +41,13 @@ pub fn run_generate(config: GenerateConfig) {
         (ids, ck_vocab, Box::new(move |id| tok2.decode(&[id])))
     } else {
         // Char-level: build vocab from training data file (same as training tokenizer)
-        let data_path = std::env::args().skip_while(|a| a != "--data").nth(1)
-            .unwrap_or_else(|| std::env::args().nth(1).unwrap_or("data/input.txt".to_string()));
-        let text = crate::common::data_loader::load_text_raw(&data_path);
+        let text = crate::common::data_loader::load_text_raw(&config.data_path);
         let mut chars: Vec<char> = text.chars().collect();
         chars.sort();
         chars.dedup();
         let vocab = chars.len().min(ck_vocab);
         let char_map: Vec<char> = chars[..vocab].to_vec();
-        eprintln!("  Char vocab: {} chars from {}", vocab, data_path);
+        eprintln!("  Char vocab: {} chars from {}", vocab, config.data_path);
         let ids: Vec<usize> = config.prompt.chars().filter_map(|c| char_map.iter().position(|&ch| ch == c)).collect();
         let cm2 = char_map.clone();
         (ids, vocab, Box::new(move |id| if id < cm2.len() { cm2[id].to_string() } else { "?".to_string() }))
@@ -289,14 +288,12 @@ pub fn run_wave_generate(config: GenerateConfig) {
         let tok2 = bpe::BpeTokenizer::from_file(&config.tokenizer_path);
         (ids, ck_vocab, Box::new(move |id| tok2.decode(&[id])))
     } else {
-        let data_path = std::env::args().skip_while(|a| a != "--data").nth(1)
-            .unwrap_or_else(|| std::env::args().nth(1).unwrap_or("data/input.txt".to_string()));
-        let text = crate::common::data_loader::load_text_raw(&data_path);
+        let text = crate::common::data_loader::load_text_raw(&config.data_path);
         let mut chars: Vec<char> = text.chars().collect();
         chars.sort(); chars.dedup();
         let vocab = chars.len().min(ck_vocab);
         let char_map: Vec<char> = chars[..vocab].to_vec();
-        eprintln!("  Char vocab: {} chars from {}", vocab, data_path);
+        eprintln!("  Char vocab: {} chars from {}", vocab, config.data_path);
         let ids: Vec<usize> = config.prompt.chars().filter_map(|c| char_map.iter().position(|&ch| ch == c)).collect();
         let cm2 = char_map.clone();
         (ids, vocab, Box::new(move |id| if id < cm2.len() { cm2[id].to_string() } else { "?".to_string() }))
