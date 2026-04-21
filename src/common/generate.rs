@@ -107,7 +107,7 @@ pub fn run_generate(config: GenerateConfig) {
     };
 
     // Generate all Dims variants systematically (most features → fewest).
-    // Each combination of phase_native × layer_scale × rk4_weights × harmonics.
+    // Each combination of phase_native × layer_scale × rk4_weights × harmonics × learnable_attn.
     let base = || Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
         .with_corrector(true).with_learnable_ode(true);
     let feature_combos: Vec<(bool, bool, bool, &str)> = vec![
@@ -122,26 +122,41 @@ pub fn run_generate(config: GenerateConfig) {
         (false, false, false, ""),
     ];
 
-    // Phase-native variants
-    for &(ls, rk4, harm, suffix) in &feature_combos {
-        if !loaded {
-            let d = base().with_layer_scale(ls).with_rk4_weights(rk4).with_dyn_harmonics(harm);
-            let label = if suffix.is_empty() { "phase-native".to_string() } else { format!("phase-native + {}", suffix) };
-            if let Some(m) = try_load(d, true, &label) {
-                mdl = m;
-                loaded = true;
+    // Try with learnable_attn on first (newer checkpoints), then off.
+    for learn_attn in &[true, false] {
+        let attn_tag = if *learn_attn { "+attn" } else { "" };
+
+        // Phase-native variants
+        for &(ls, rk4, harm, suffix) in &feature_combos {
+            if !loaded {
+                let d = base().with_layer_scale(ls).with_rk4_weights(rk4)
+                    .with_dyn_harmonics(harm).with_learnable_attn(*learn_attn);
+                let label = if suffix.is_empty() {
+                    format!("phase-native{}", attn_tag)
+                } else {
+                    format!("phase-native + {}{}", suffix, attn_tag)
+                };
+                if let Some(m) = try_load(d, true, &label) {
+                    mdl = m;
+                    loaded = true;
+                }
             }
         }
-    }
 
-    // Non-phase-native variants
-    for &(ls, rk4, harm, suffix) in &feature_combos {
-        if !loaded {
-            let d = base().with_layer_scale(ls).with_rk4_weights(rk4).with_dyn_harmonics(harm);
-            let label = if suffix.is_empty() { "ext".to_string() } else { format!("ext + {}", suffix) };
-            if let Some(m) = try_load(d, false, &label) {
-                mdl = m;
-                loaded = true;
+        // Non-phase-native variants
+        for &(ls, rk4, harm, suffix) in &feature_combos {
+            if !loaded {
+                let d = base().with_layer_scale(ls).with_rk4_weights(rk4)
+                    .with_dyn_harmonics(harm).with_learnable_attn(*learn_attn);
+                let label = if suffix.is_empty() {
+                    format!("ext{}", attn_tag)
+                } else {
+                    format!("ext + {}{}", suffix, attn_tag)
+                };
+                if let Some(m) = try_load(d, false, &label) {
+                    mdl = m;
+                    loaded = true;
+                }
             }
         }
     }
@@ -301,14 +316,13 @@ pub fn run_wave_generate(config: GenerateConfig) {
 
     let effective_vocab = vocab_size.max(ck_vocab);
 
-    // Build model — try multiple configurations to match checkpoint param count.
-    // Checkpoints may have been saved with learnable_ode=true (ODE params in vector)
-    // or learnable_ode=false. Try all 4 combinations: {ode, no-ode} × {corrector, no-corrector}.
-    let variants: [(bool, bool); 4] = [
-        (false, true),  // standard: no ODE, with corrector
-        (false, false), // no ODE, no corrector
-        (true, true),   // ODE params + corrector (wave training default)
-        (true, false),  // ODE params, no corrector
+    // Build model — try variants to match checkpoint param count.
+    // Three axes: learnable_ode × corrector × learnable_attn = 8 combinations.
+    let variants: [(bool, bool, bool); 8] = [
+        (false, true,  false), (false, false, false),
+        (true,  true,  false), (true,  false, false),
+        (false, true,  true ), (false, false, true ),
+        (true,  true,  true ), (true,  false, true ),
     ];
     let mut mdl = {
         let dims0 = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
@@ -320,15 +334,15 @@ pub fn run_wave_generate(config: GenerateConfig) {
 
     let mut dims = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS);
     let mut loaded = false;
-    for (use_ode, use_corr) in &variants {
+    for (use_ode, use_corr, use_attn) in &variants {
         let dims_try = Dims::from_cli(config.n_bands, config.n_head, config.maestro_dim, BLOCK_SIZE, RK4_STEPS)
-            .with_learnable_ode(*use_ode).with_corrector(*use_corr);
+            .with_learnable_ode(*use_ode).with_corrector(*use_corr).with_learnable_attn(*use_attn);
         let mut m = init_model(effective_vocab, 42, config.n_layers, config.out_proj_groups, dims_try, config.alpha, config.beta);
         m.phase_native = true;
         m.output_corrector = vec![0.0; config.n_bands];
         if params.len() == count_trainable_ex(&m, false) {
             unflatten_params_ex(&mut m, &params, false);
-            eprintln!("  [wave-generate] Loaded: ode={}, corrector={}", use_ode, use_corr);
+            eprintln!("  [wave-generate] Loaded: ode={}, corrector={}, learnable_attn={}", use_ode, use_corr, use_attn);
             mdl = m;
             dims = dims_try;
             loaded = true;
@@ -552,13 +566,18 @@ pub fn run_teacher_force(
     let n_embd = n_bands * 2;
 
     let (params, ck_vocab, ck_iter, _, _, _, _, _, _, _, _) = crate::wave_checkpoint::load_checkpoint(checkpoint_path);
-    let variants: [(bool, bool); 4] = [(false, true), (false, false), (true, true), (true, false)];
+    let variants: [(bool, bool, bool); 8] = [
+        (false, true,  false), (false, false, false),
+        (true,  true,  false), (true,  false, false),
+        (false, true,  true ), (false, false, true ),
+        (true,  true,  true ), (true,  false, true ),
+    ];
     let effective_vocab = vocab.max(ck_vocab);
     let mut dims = Dims::from_cli(n_bands, n_head, 16, 128, 16);
     let mut model = crate::init_model(effective_vocab, 42, n_layers, 1, dims, alpha, beta);
-    for (use_ode, use_corr) in &variants {
+    for (use_ode, use_corr, use_attn) in &variants {
         let d = Dims::from_cli(n_bands, n_head, 16, 128, 16)
-            .with_learnable_ode(*use_ode).with_corrector(*use_corr);
+            .with_learnable_ode(*use_ode).with_corrector(*use_corr).with_learnable_attn(*use_attn);
         let mut mdl = crate::init_model(effective_vocab, 42, n_layers, 1, d, alpha, beta);
         mdl.phase_native = true; mdl.output_corrector = vec![0.0; n_bands];
         if params.len() == count_trainable_ex(&mdl, false) {
