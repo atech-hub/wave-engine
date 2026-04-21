@@ -384,7 +384,7 @@ fn cmd_galaxy_scan(args: cli::GalaxyScanArgs) {
     let m = &args.model;
     common::galaxy_scan::run_galaxy_scan_cli(
         &args.checkpoint.resume, m.n_bands, m.n_head, m.layers,
-        m.out_proj_groups, m.alpha, m.beta, args.scan_corpus, args.m1, args.m2,
+        m.out_proj_groups, m.alpha, m.beta, args.data, args.scan_corpus, args.m1, args.m2,
     );
 }
 

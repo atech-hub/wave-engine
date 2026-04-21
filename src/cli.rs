@@ -529,7 +529,11 @@ pub struct GalaxyScanArgs {
     #[command(flatten)]
     pub model: ModelArgs,
 
-    /// Corpus file for scan positions
+    /// Training data file (for char vocab; ignored with --bpe)
+    #[arg(long, default_value = "data/input.txt")]
+    pub data: String,
+
+    /// Corpus file for scan positions (overrides --data for scan; default: same as --data)
     #[arg(long)]
     pub scan_corpus: Option<String>,
 

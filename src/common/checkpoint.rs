@@ -53,6 +53,7 @@ pub fn save_checkpoint(
     if dims.use_layer_scale { flags |= 1 << 1; }
     if dims.use_rk4_weights { flags |= 1 << 2; }
     if dims.use_dyn_harmonics { flags |= 1 << 3; }
+    if dims.learnable_attn  { flags |= 1 << 4; }
     // phase_native: detect from param count (no lm_head = phase_native)
     // We check if the save was phase_native by seeing if params count is smaller than non-phase
     f.write_all(&flags.to_le_bytes()).unwrap();
@@ -125,6 +126,7 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
     let has_layer_scale   = feature_flags & (1 << 1) != 0;
     let has_rk4_weights   = feature_flags & (1 << 2) != 0;
     let has_dyn_harmonics = feature_flags & (1 << 3) != 0;
+    let _has_learnable_attn = feature_flags & (1 << 4) != 0;
 
     // v4: chi (FWM strength) persisted in checkpoint
     let chi = if version >= 4 { read_f32_single(&mut f) } else { 0.0 };
@@ -196,25 +198,33 @@ pub fn load_checkpoint(path: &str) -> (Vec<f32>, usize, usize, f32, u64, usize, 
         n_base,
     ];
 
-    // Determine param count
+    // Determine param count from file size (authoritative).
+    //
+    // Data layout after header: adam_m[N] + adam_v[N] + params[N], so data_bytes = N × 12.
+    // This is robust to feature-flag gaps — e.g. legacy checkpoints saved with
+    // learnable_attn=true but without the corresponding flag bit (fixed in the same
+    // commit that added bit 1<<4) still load correctly because we trust file size.
     let n_params = if version >= 3 {
-        // v3: compute directly from feature flags — no ambiguity
-        let mut n = ck_layers * per_block + n_embd * 2; // blocks + ln_f
-        if has_learnable_ode {
-            n += ck_layers * (ck_bands + 1 + 1 + ck_bands); // gamma + alpha + beta + corrector
-        }
-        if has_layer_scale { n += ck_layers; }
-        if has_rk4_weights { n += ck_layers * 4; }
-        if has_dyn_harmonics { n += ck_layers * ck_head; }
-        // Detect phase-native from file size (lm_head present or not)
         // magic(4) + ver(4) + config(7×4=28) + flags(4) + chi_if_v4(4) + vocab(8) + iter(8) + lr(4) + rng(8) + adam_t(8)
         let header_size_v3 = 4 + 4 + 8*4 + 8 + 8 + 4 + 8 + 8 + if version >= 4 { 4 } else { 0 };
         let file_len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
         let data_bytes = file_len.saturating_sub(header_size_v3);
-        let n_with_lm = n + lm_head_params;
-        let n_with_oc = n + ck_bands; // output corrector instead of lm_head
+        let n_from_size = data_bytes / 12;
+
+        // Sanity: flag-based estimate (excluding learnable_attn, which adds per-head
+        // attention projections whose size depends on head layout). If the flag-based
+        // estimate matches file size exactly, use it verbatim; otherwise trust file size.
+        let mut n_flag = ck_layers * per_block + n_embd * 2;
+        if has_learnable_ode { n_flag += ck_layers * (ck_bands + 1 + 1 + ck_bands); }
+        if has_layer_scale   { n_flag += ck_layers; }
+        if has_rk4_weights   { n_flag += ck_layers * 4; }
+        if has_dyn_harmonics { n_flag += ck_layers * ck_head; }
+        let n_with_lm = n_flag + lm_head_params;
+        let n_with_oc = n_flag + ck_bands;
+
         if data_bytes == n_with_oc * 12 { n_with_oc }
-        else { n_with_lm }
+        else if data_bytes == n_with_lm * 12 { n_with_lm }
+        else { n_from_size }
     } else {
         // v1/v2: fall back to file-size detection across all variants
         let header_size = 4 + 4 + 7*4 + 8 + 8 + 4 + 8 + 8;

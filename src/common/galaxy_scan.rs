@@ -669,35 +669,16 @@ pub fn run_galaxy_scan_cli(
     checkpoint_path: &str,
     n_bands: usize, n_head: usize, n_layers: usize,
     out_proj_groups: usize, alpha: f32, beta: f32,
-    scan_corpus: Option<String>, m1: usize, m2: usize,
+    data_path: String, scan_corpus: Option<String>, m1: usize, m2: usize,
 ) {
-    let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = crate::wave_checkpoint::load_checkpoint(checkpoint_path);
-    let variants: [(bool, bool); 4] = [(false, true), (false, false), (true, true), (true, false)];
-    let mut dims = crate::Dims::from_cli(n_bands, n_head, 16, 128, 16);
-    let mut model = init_model(ck_vocab, 42, n_layers, out_proj_groups, dims, alpha, beta);
-    let mut loaded = false;
-    for (use_ode, use_corr) in &variants {
-        let d = crate::Dims::from_cli(n_bands, n_head, 16, 128, 16)
-            .with_learnable_ode(*use_ode).with_corrector(*use_corr);
-        let mut mdl = init_model(ck_vocab, 42, n_layers, out_proj_groups, d, alpha, beta);
-        mdl.phase_native = true;
-        mdl.output_corrector = vec![0.0; n_bands];
-        if params.len() == count_trainable_ex(&mdl, false) {
-            unflatten_params_ex(&mut mdl, &params, false);
-            eprintln!("  [galaxy-scan] Loaded: ode={}, corrector={}", use_ode, use_corr);
-            model = mdl; dims = d; loaded = true; break;
-        }
-        let mut m2_mdl = init_model(ck_vocab, 42, n_layers, out_proj_groups, d, alpha, beta);
-        if params.len() == count_trainable_ex(&m2_mdl, false) {
-            unflatten_params_ex(&mut m2_mdl, &params, false);
-            eprintln!("  [galaxy-scan] Loaded (non-PN): ode={}, corrector={}", use_ode, use_corr);
-            model = m2_mdl; dims = d; loaded = true; break;
-        }
-    }
-    if !loaded { panic!("Cannot match checkpoint param count {} to any model variant", params.len()); }
+    // Shared loader — tries learnable_ode / corrector / learnable_attn variants
+    // and picks the one whose param count matches the checkpoint.
+    let (model, dims) = crate::common::wave_model::load_checkpoint_auto(
+        checkpoint_path, n_bands, n_head, n_layers, out_proj_groups, alpha, beta,
+    );
 
-    let data_path = scan_corpus.unwrap_or("data/input.txt".to_string());
-    let (tokens, _) = super::data_loader::load_data(&data_path, false, None);
+    let scan_path = scan_corpus.unwrap_or(data_path);
+    let (tokens, _) = super::data_loader::load_data(&scan_path, false, None);
     let scan_len = tokens.len().min(200).min(128);
     let stencil = crate::fft_ode::StencilFft::new(n_bands * 2);
     let cache = crate::cpu::forward::forward_with_cache(

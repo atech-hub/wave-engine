@@ -233,24 +233,32 @@ pub fn load_checkpoint_auto(
     out_proj_groups: usize, alpha: f32, beta: f32,
 ) -> (WavePacketModel, crate::Dims) {
     let (params, ck_vocab, _, _, _, _, _, _, _, _, _) = crate::wave_checkpoint::load_checkpoint(checkpoint_path);
-    let variants: [(bool, bool); 4] = [(false, true), (false, false), (true, true), (true, false)];
-    for (use_ode, use_corr) in &variants {
+    // Try (learnable_ode, corrector, learnable_attn) combinations. Attention variants
+    // added so checkpoints trained with --learnable-attn load correctly — the 2-3×
+    // larger param count would otherwise fail to match any frozen-attention variant.
+    let variants: [(bool, bool, bool); 8] = [
+        (false, true,  false), (false, false, false),
+        (true,  true,  false), (true,  false, false),
+        (false, true,  true ), (false, false, true ),
+        (true,  true,  true ), (true,  false, true ),
+    ];
+    for (use_ode, use_corr, use_attn) in &variants {
         let d = crate::Dims::from_cli(n_bands, n_head, 16, 128, 16)
-            .with_learnable_ode(*use_ode).with_corrector(*use_corr);
+            .with_learnable_ode(*use_ode).with_corrector(*use_corr).with_learnable_attn(*use_attn);
         // Try phase-native
         let mut mdl = init_model(ck_vocab, 42, n_layers, out_proj_groups, d, alpha, beta);
         mdl.phase_native = true;
         mdl.output_corrector = vec![0.0; n_bands];
         if params.len() == count_trainable_ex(&mdl, false) {
             unflatten_params_ex(&mut mdl, &params, false);
-            eprintln!("  Loaded: ode={}, corrector={}, phase_native=true", use_ode, use_corr);
+            eprintln!("  Loaded: ode={}, corrector={}, learnable_attn={}, phase_native=true", use_ode, use_corr, use_attn);
             return (mdl, d);
         }
         // Try non-phase-native
         let mut mdl2 = init_model(ck_vocab, 42, n_layers, out_proj_groups, d, alpha, beta);
         if params.len() == count_trainable_ex(&mdl2, false) {
             unflatten_params_ex(&mut mdl2, &params, false);
-            eprintln!("  Loaded: ode={}, corrector={}, phase_native=false", use_ode, use_corr);
+            eprintln!("  Loaded: ode={}, corrector={}, learnable_attn={}, phase_native=false", use_ode, use_corr, use_attn);
             return (mdl2, d);
         }
     }
